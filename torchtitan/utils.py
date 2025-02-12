@@ -386,28 +386,34 @@ def clip_grad_norm_(
 
     """
     grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.nn.utils.get_total_norm(
-        grads, norm_type, error_if_nonfinite, foreach
-    )
+    if torch.__version__ >= "2.6":
+        total_norm = torch.nn.utils.get_total_norm(
+            grads, norm_type, error_if_nonfinite, foreach
+        )
 
-    # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
-    # We can simply reduce the DTensor to get the total norm in this tensor's process group
-    # and then convert it to a local tensor.
-    # NOTE: It has two purposes:
-    #       1. to make sure the total norm is computed correctly when PP is used (see below)
-    #       2. to return a reduced total_norm tensor whose .item() would return the correct value
-    if isinstance(total_norm, DTensor):
-        # Will reach here if any non-PP parallelism is used.
-        # If only using PP, total_norm will be a local tensor.
-        total_norm = total_norm.full_tensor()
+        # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
+        # We can simply reduce the DTensor to get the total norm in this tensor's process group
+        # and then convert it to a local tensor.
+        # NOTE: It has two purposes:
+        #       1. to make sure the total norm is computed correctly when PP is used (see below)
+        #       2. to return a reduced total_norm tensor whose .item() would return the correct value
+        if isinstance(total_norm, DTensor):
+            # Will reach here if any non-PP parallelism is used.
+            # If only using PP, total_norm will be a local tensor.
+            total_norm = total_norm.full_tensor()
 
-    if pp_mesh is not None:
-        if math.isinf(norm_type):
-            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
-        else:
-            total_norm **= norm_type
-            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
-            total_norm **= 1.0 / norm_type
+        if pp_mesh is not None:
+            if math.isinf(norm_type):
+                dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
+            else:
+                total_norm **= norm_type
+                dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
+                total_norm **= 1.0 / norm_type
 
-    torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
-    return total_norm
+        torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+        return total_norm
+    else:
+        torch.nn.utils.clip_grad_norm_(parameters,
+                                       max_norm,
+                                       norm_type,
+                                       foreach=foreach)

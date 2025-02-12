@@ -188,7 +188,8 @@ def build_metric_logger(
     should_log = has_logging_enabled
     if metrics_config.rank_0_only and should_log:
         metrics_rank = _get_metrics_rank(parallel_dims)
-        should_log = torch.distributed.get_rank() == metrics_rank
+        should_log = not parallel_dims.pp_enabled or torch.distributed.get_rank(
+        ) == metrics_rank
 
     logger.debug(
         f"Logging decision: has_logging_enabled={has_logging_enabled}, should_log={should_log}"

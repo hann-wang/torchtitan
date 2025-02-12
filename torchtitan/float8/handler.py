@@ -22,6 +22,8 @@ from torchtitan.config_manager import JobConfig
 from torchtitan.logging import logger
 from torchtitan.parallelisms import ParallelDims
 
+from .spectator import Spectator
+
 
 def _is_sm89_or_later():
     # Float8 is only supported on SM89 or later (H100+ GPUs)
@@ -102,6 +104,31 @@ class Float8Handler:
             "Swapped to Float8Linear layers with enable_fsdp_float8_all_gather="
             f"{self.config.enable_fsdp_float8_all_gather}"
         )
+
+        self._add_attention_spectator(model)
+        logger.info(
+            "Added FP8 Spectators to *FlashAttention2 modules."
+        )
+
+
+    def _add_attention_spectator(self, model: nn.Module):
+        for mod in model.children():
+            if mod.__class__.__name__.endswith("FlashAttention2"):
+                device = mod.q_proj.weight.device
+                mod.query_spectator = Spectator(watch_fw=True, watch_bw=False)
+                mod.key_spectator = Spectator(watch_fw=True, watch_bw=False)
+                mod.value_spectator = Spectator(watch_fw=True, watch_bw=False)
+                mod.backward_spectator = Spectator(watch_fw=False,
+                                                   watch_bw=True)
+
+                mod.query_spectator.create_buffers(self.config, device=device)
+                mod.key_spectator.create_buffers(self.config, device=device)
+                mod.value_spectator.create_buffers(self.config, device=device)
+                mod.backward_spectator.create_buffers(self.config,
+                                                      device=device)
+            else:
+                self._add_attention_spectator(mod)
+
 
     def precompute_float8_dynamic_scale_for_fsdp(
         self, model: Union[nn.Module, List[nn.Module]]
