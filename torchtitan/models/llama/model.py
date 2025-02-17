@@ -13,6 +13,9 @@ from typing import Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
+
 from torchtitan.models.norms import build_norm
 
 
@@ -214,6 +217,132 @@ class Attention(nn.Module):
         return self.wo(output)
 
 
+class AttentionFlashAttention2(nn.Module):
+    """
+    Multi-head attention module.
+
+    Args:
+        model_args (ModelArgs): Model configuration arguments.
+
+    Attributes:
+        n_kv_heads (int): Number of key and value heads.
+        n_heads (int): Number of query heads.
+        n_rep (int): Number of repetitions for local heads.
+        head_dim (int): Dimension size of each attention head.
+        wq (Linear): Linear transformation for queries.
+        wk (Linear): Linear transformation for keys.
+        wv (Linear): Linear transformation for values.
+        wo (Linear): Linear transformation for output.
+
+    """
+
+    def __init__(self, model_args: ModelArgs):
+        super().__init__()
+        self.n_heads = model_args.n_heads
+        self.n_kv_heads = (model_args.n_heads if model_args.n_kv_heads is None
+                           else model_args.n_kv_heads)
+        self.n_rep = self.n_heads // self.n_kv_heads
+        self.head_dim = model_args.dim // model_args.n_heads
+
+        self.wq = nn.Linear(model_args.dim,
+                            model_args.n_heads * self.head_dim,
+                            bias=False)
+        self.wk = nn.Linear(model_args.dim,
+                            self.n_kv_heads * self.head_dim,
+                            bias=False)
+        self.wv = nn.Linear(model_args.dim,
+                            self.n_kv_heads * self.head_dim,
+                            bias=False)
+        self.wo = nn.Linear(model_args.n_heads * self.head_dim,
+                            model_args.dim,
+                            bias=False)
+
+        self.descale_q = self.descale_k = self.descale_v = None
+        self.query_spectator = self.key_spectator = self.value_spectator = self.backward_spectator = None
+
+    def init_weights(self, init_std: float):
+        for linear in (self.wq, self.wk, self.wv):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+
+    @property
+    def q_proj(self):
+        return self.wq
+
+    @property
+    def k_proj(self):
+        return self.wk
+
+    @property
+    def v_proj(self):
+        return self.wv
+
+    @property
+    def o_proj(self):
+        return self.wo
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        bs, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
+        # local heads from sizes of xq, xk, and xv as TP may have sharded them
+        # after the above linear ops.
+        xq = xq.view(bs, seqlen, -1, self.head_dim)
+        xk = xk.view(bs, seqlen, -1, self.head_dim)
+        xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        # xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        # xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+
+        if self.query_spectator is not None and self.query_spectator is not None and self.query_spectator is not None:
+            xq = self.query_spectator(xq)
+            xk = self.key_spectator(xk)
+            xv = self.value_spectator(xv)
+
+            self.descale_q = self.query_spectator.get_input_scale()
+            self.descale_k = self.key_spectator.get_input_scale()
+            self.descale_v = self.value_spectator.get_input_scale()
+
+        output = _flash_attention_forward(
+            xq,
+            xk,
+            xv,
+            None,
+            seqlen,
+            descale_q=self.descale_q,
+            descale_k=self.descale_k,
+            descale_v=self.descale_v,
+            position_ids=None,
+            dropout=0.0,
+            sliding_window=None,
+            use_top_left_mask=False,
+            is_causal=True,
+        )
+
+        if self.backward_spectator is not None:
+            output = self.backward_spectator(output)
+
+        output = output.view(bs, seqlen, -1).contiguous()
+        return self.wo(output)
+
 class FeedForward(nn.Module):
     """
     FeedForward module
@@ -275,14 +404,15 @@ class TransformerBlock(nn.Module):
         layer_id (int): Identifier for the layer.
         attention_norm (RMSNorm): Layer normalization for attention output.
         ffn_norm (RMSNorm): Layer normalization for feedforward output.
-
+#
     """
 
     def __init__(self, layer_id: int, model_args: ModelArgs):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.attention = Attention(model_args)
+        #self.attention = Attention(model_args)
+        self.attention = AttentionFlashAttention2(model_args)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,

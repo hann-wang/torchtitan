@@ -27,12 +27,33 @@ class ToFloat8(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tensor):
-        return tensor._data
+    def forward(ctx, tensor, fp8_amax_input, fp8_amax_history_input,
+                fp8_scale_input, scale_fn_name, is_amax_initialized,
+                linear_mm_config, input_target_dtype):
+        _maybe_initialize_amaxes_scales_for_float8_cast(
+            tensor,
+            fp8_amax_input,
+            fp8_amax_history_input,
+            fp8_scale_input,
+            scale_fn_name,
+            input_target_dtype,
+            is_amax_initialized,
+            reduce_amax=True,
+        )
+        input_fp8 = hp_tensor_to_float8_delayed(
+            tensor,
+            fp8_scale_input,
+            input_target_dtype,
+            fp8_amax_input,
+            linear_mm_config=linear_mm_config,
+            gemm_input_role=GemmInputRole.INPUT,
+        )
+
+        return input_fp8._data
 
     @staticmethod
     def backward(ctx, g):
-        return g, None, None
+        return g, None, None, None, None, None, None, None
 
 
 @torch._dynamo.allow_in_graph
@@ -110,8 +131,7 @@ class Spectator(nn.Module):
     def forward(self, x):
         # this will record the input scale in forward
         if self.watch_fw:
-            fp8_tensor = self.cast_input_to_float8(x)
-            x = ToFloat8.apply(fp8_tensor)
+            x = self.cast_input_to_float8(x)
 
         # this will record the grad scale in backward
         if self.watch_bw:
@@ -136,25 +156,12 @@ class Spectator(nn.Module):
             autocast_dtype = torch.get_autocast_gpu_dtype()
             input = input.to(autocast_dtype)
 
-        scale_fn_name = self.config.delayed_scaling_config.scale_fn_name
-        _maybe_initialize_amaxes_scales_for_float8_cast(
-            input,
-            self.fp8_amax_input,
-            self.fp8_amax_history_input,
+        input_fp8 = ToFloat8.apply(
+            input, self.fp8_amax_input, self.fp8_amax_history_input,
             self.fp8_scale_input,
-            scale_fn_name,
-            self.input_target_dtype,
-            is_amax_initialized,
-            reduce_amax=True,
-        )
-        input_fp8 = hp_tensor_to_float8_delayed(
-            input,
-            self.fp8_scale_input,
-            self.input_target_dtype,
-            self.fp8_amax_input,
-            linear_mm_config=self.linear_mm_config,
-            gemm_input_role=GemmInputRole.INPUT,
-        )
+            self.config.delayed_scaling_config.scale_fn_name,
+            self.is_amax_initialized, self.linear_mm_config,
+            self.input_target_dtype)
 
         return input_fp8
 

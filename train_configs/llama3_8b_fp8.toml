@@ -2,11 +2,11 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./outputs"
-description = "Llama 3 8B training"
+dump_folder = "./llama3-8b-fp8-outputs"
+description = "Llama 3 8B FP8 training"
 
 [profiling]
-enable_profiling = true
+enable_profiling = false
 save_traces_folder = "profile_trace"
 profile_freq = 100
 
@@ -14,6 +14,7 @@ profile_freq = 100
 log_freq = 10
 enable_tensorboard = true
 save_tb_folder = "tb"
+enable_wandb = false
 
 [model]
 name = "llama3"
@@ -40,9 +41,10 @@ dataset = "c4"
 [experimental]
 context_parallel_degree = 1
 pipeline_parallel_degree = 1
+enable_async_tensor_parallel = false
 
 [checkpoint]
-enable_checkpoint = false
+enable_checkpoint = true
 folder = "checkpoint"
 interval_type = "steps"
 interval = 500
@@ -51,8 +53,8 @@ export_dtype = "float32"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = 'selective'  # ['none', 'selective', 'full']
+mode = 'none'  # ['none', 'selective', 'full']
 selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
-enable_float8_linear = false
+enable_float8_linear = true
