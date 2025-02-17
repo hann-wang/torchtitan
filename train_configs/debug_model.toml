@@ -21,15 +21,15 @@ save_tb_folder = "tb"
 enable_wandb = false
 
 [model]
-name = "llama3"
+name = "opt"
 flavor = "debugmodel"
-norm_type = "rmsnorm"  # layernorm / np_layernorm / rmsnorm / fused_rmsnorm
-# test tokenizer.model, for debug purpose only
-tokenizer_path = "./tests/assets/test_tiktoken.model"
+norm_type = "layernorm"  # layernorm / np_layernorm / rmsnorm / fused_rmsnorm
+path = "/workspace/hf_home/hub/models--facebook--opt-125m/snapshots/27dcfa74d334bc871f3234de431e71c6eeba5dd6"
+tokenizer_path = "/workspace/hf_home/hub/models--facebook--opt-125m/snapshots/27dcfa74d334bc871f3234de431e71c6eeba5dd6"
 
 [optimizer]
 name = "AdamW"
-lr = 8e-4
+lr = 6e-4
 
 [training]
 batch_size = 8
@@ -58,8 +58,8 @@ export_dtype = "float32"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = 'selective'  # ['none', 'selective', 'full']
+mode = 'none'  # ['none', 'selective', 'full']
 selective_ac_option = '2'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
-enable_float8_linear = true
+enable_float8_linear = false

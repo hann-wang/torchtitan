@@ -18,6 +18,7 @@ __all__ = [
 
 models_parallelize_fns = {
     "llama3": parallelize_llama,
+    "opt": parallelize_llama,
 }
 models_pipelining_fns = {
     "llama3": pipeline_llama,

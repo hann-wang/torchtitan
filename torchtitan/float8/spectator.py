@@ -3,15 +3,13 @@ import torch
 from torch import nn
 
 # torchao
-from torchao.float8.config import Float8LinearConfig, ScalingType
+from torchao.float8.config import Float8LinearConfig, ScalingType, e4m3_dtype, e5m2_dtype
 from torchao.float8.float8_tensor import GemmInputRole, LinearMMConfig, ScaledMMConfig
 from torchao.float8.float8_utils import (
     amax_history_to_scale,
     tensor_to_amax,
     tensor_to_scale,
     to_fp8_saturated,
-    e4m3_dtype,
-    e5m2_dtype,
 )
 from torchao.float8.float8_scaling_utils import (
     _maybe_initialize_amaxes_scales_for_float8_cast,

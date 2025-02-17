@@ -165,6 +165,12 @@ class JobConfig:
             help="Which model to train",
         )
         self.parser.add_argument(
+            "--model.path",
+            type=str,
+            default="",
+            help="HF model path",
+        )
+        self.parser.add_argument(
             "--model.flavor",
             type=str,
             default="debugmodel",

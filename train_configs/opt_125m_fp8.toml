@@ -2,8 +2,8 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./opt-125m-bf16-outputs"
-description = "OPT-125m BF16 training"
+dump_folder = "./opt-125m-fp8-outputs"
+description = "OPT-125m FP8 training"
 
 [profiling]
 enable_profiling = false
@@ -46,7 +46,7 @@ pipeline_parallel_degree = 1
 enable_async_tensor_parallel = false
 
 [checkpoint]
-enable_checkpoint = true
+enable_checkpoint = false
 folder = "checkpoint"
 interval_type = "steps"
 interval = 500
@@ -59,4 +59,4 @@ mode = 'none'  # ['none', 'selective', 'full']
 selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
-enable_float8_linear = false
+enable_float8_linear = true

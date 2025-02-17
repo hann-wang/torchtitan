@@ -267,7 +267,10 @@ def init_distributed(job_config):
 def get_num_params(model: torch.nn.Module, exclude_embedding: bool = False) -> int:
     num_params = sum(p.numel() for p in model.parameters())
     if exclude_embedding:
-        num_params -= model.tok_embeddings.weight.numel()
+        if hasattr(model, "tok_embeddings"):
+            num_params -= model.tok_embeddings.weight.numel()
+        else:
+            num_params -= model.model.decoder.embed_tokens.weight.numel()
     return num_params
 
 
@@ -417,3 +420,11 @@ def clip_grad_norm_(
                                        max_norm,
                                        norm_type,
                                        foreach=foreach)
+
+
+def reset_params(mod: torch.nn.Module):
+    if hasattr(mod, "reset_parameters"):
+        mod.reset_parameters()
+    else:
+        for cmod in mod.children():
+            reset_params(cmod)

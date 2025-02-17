@@ -12,6 +12,8 @@ import torch
 
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from transformers import AutoConfig
+
 from torchtitan import utils
 from torchtitan.checkpoint import CheckpointManager, TrainState
 from torchtitan.config_manager import JobConfig
@@ -20,6 +22,7 @@ from torchtitan.float8 import Float8Handler
 from torchtitan.logging import init_logger, logger
 from torchtitan.metrics import build_device_memory_monitor, build_metric_logger
 from torchtitan.models import model_name_to_cls, model_name_to_tokenizer, models_config
+from torchtitan.models.llama import ModelArgs
 from torchtitan.optimizer import build_lr_schedulers, build_optimizers
 from torchtitan.parallelisms import (
     models_parallelize_fns,
@@ -80,6 +83,7 @@ def main(job_config: JobConfig):
         world_mesh, device, job_config.training.seed, job_config.training.deterministic
     )
     model_name = job_config.model.name
+    model_path = job_config.model.path
 
     # build tokenizer
     tokenizer_type = model_name_to_tokenizer[model_name]
@@ -97,18 +101,33 @@ def main(job_config: JobConfig):
 
     # build model (using meta init)
     model_cls = model_name_to_cls[model_name]
-    model_config = models_config[model_name][job_config.model.flavor]
+    if model_name in models_config:
+        model_config = models_config[model_name][job_config.model.flavor]
+        hf_config = None
+        model_config.vocab_size = tokenizer.n_words
+    else:
+        assert model_path
+        hf_config = AutoConfig.from_pretrained(model_path)
+        model_config = ModelArgs(
+            dim=hf_config.hidden_size,
+            n_layers=hf_config.num_hidden_layers,
+            n_heads=hf_config.num_attention_heads,
+            n_kv_heads=hf_config.num_attention_heads,
+            vocab_size=hf_config.vocab_size,
+        )
     # set the model configs from training inputs:
     # 1. norm type to decide which norm layer to use
     # 2. vocab size from tokenizer
     # 3. max_seq_len base on inputs
     model_config.norm_type = job_config.model.norm_type
-    model_config.vocab_size = tokenizer.n_words
     model_config.max_seq_len = job_config.training.seq_len
 
     logger.info(f"Building {model_name} {job_config.model.flavor} with {model_config}")
     with torch.device("meta"):
-        model = model_cls.from_model_args(model_config)
+        if not model_path:
+            model = model_cls.from_model_args(model_config)
+        else:
+            model = model_cls(hf_config)
 
     # a no-op hander if float8 is not enabled
     float8_handler = Float8Handler(job_config, parallel_dims)
@@ -172,7 +191,12 @@ def main(job_config: JobConfig):
         models_parallelize_fns[model_name](model, world_mesh, parallel_dims, job_config)
         model.to_empty(device=init_device)
         with torch.no_grad():
-            model.init_weights(buffer_device=buffer_device)
+            if not model_path:
+                model.init_weights(buffer_device=buffer_device)
+            else:
+                utils.reset_params(model)
+                model.init_weights()
+            model.to(torch.bfloat16)
         model.train()
 
         model_parts = [model]
@@ -307,6 +331,8 @@ def main(job_config: JobConfig):
                 # Non-PP forward / backward
                 with train_context(optional_context_parallel_ctx):
                     pred = model(input_ids)
+                    if hasattr(pred, "logits"):
+                        pred = pred.logits
                     loss = loss_fn(pred, labels)
                     # pred.shape=(bs, seq_len, vocab_size)
                     # need to free to before bwd to avoid peaking memory
