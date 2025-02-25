@@ -258,7 +258,7 @@ class AttentionFlashAttention2(nn.Module):
                             bias=False)
 
         self.descale_q = self.descale_k = self.descale_v = None
-        self.query_spectator = self.key_spectator = self.value_spectator = self.backward_spectator = None
+        self.query_observer = self.key_observer = self.value_observer = self.backward_observer = None
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
@@ -312,14 +312,14 @@ class AttentionFlashAttention2(nn.Module):
         # xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         # xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        if self.query_spectator is not None and self.query_spectator is not None and self.query_spectator is not None:
-            xq = self.query_spectator(xq)
-            xk = self.key_spectator(xk)
-            xv = self.value_spectator(xv)
+        if self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
+            xq = self.query_observer(xq)
+            xk = self.key_observer(xk)
+            xv = self.value_observer(xv)
 
-            self.descale_q = self.query_spectator.get_input_scale()
-            self.descale_k = self.key_spectator.get_input_scale()
-            self.descale_v = self.value_spectator.get_input_scale()
+            self.descale_q = self.query_observer.get_input_scale()
+            self.descale_k = self.key_observer.get_input_scale()
+            self.descale_v = self.value_observer.get_input_scale()
 
         output = _flash_attention_forward(
             xq,
@@ -337,8 +337,8 @@ class AttentionFlashAttention2(nn.Module):
             is_causal=True,
         )
 
-        if self.backward_spectator is not None:
-            output = self.backward_spectator(output)
+        if self.backward_observer is not None:
+            output = self.backward_observer(output)
 
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)

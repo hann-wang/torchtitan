@@ -22,7 +22,7 @@ from torchtitan.config_manager import JobConfig
 from torchtitan.logging import logger
 from torchtitan.parallelisms import ParallelDims
 
-from .spectator import Spectator
+from .observer import Observer
 
 
 def _is_sm89_or_later():
@@ -105,29 +105,29 @@ class Float8Handler:
             f"{self.config.enable_fsdp_float8_all_gather}"
         )
 
-        self._add_attention_spectator(model)
+        self._add_attention_observer(model)
         logger.info(
-            "Added FP8 Spectators to *FlashAttention2 modules."
+            "Added FP8 Observers to *FlashAttention2 modules."
         )
 
 
-    def _add_attention_spectator(self, model: nn.Module):
+    def _add_attention_observer(self, model: nn.Module):
         for mod in model.children():
             if mod.__class__.__name__.endswith("FlashAttention2"):
                 device = mod.q_proj.weight.device
-                mod.query_spectator = Spectator(watch_fw=True, watch_bw=False)
-                mod.key_spectator = Spectator(watch_fw=True, watch_bw=False)
-                mod.value_spectator = Spectator(watch_fw=True, watch_bw=False)
-                mod.backward_spectator = Spectator(watch_fw=False,
+                mod.query_observer = Observer(watch_fw=True, watch_bw=False)
+                mod.key_observer = Observer(watch_fw=True, watch_bw=False)
+                mod.value_observer = Observer(watch_fw=True, watch_bw=False)
+                mod.backward_observer = Observer(watch_fw=False,
                                                    watch_bw=True)
 
-                mod.query_spectator.create_buffers(self.config, device=device)
-                mod.key_spectator.create_buffers(self.config, device=device)
-                mod.value_spectator.create_buffers(self.config, device=device)
-                mod.backward_spectator.create_buffers(self.config,
+                mod.query_observer.create_buffers(self.config, device=device)
+                mod.key_observer.create_buffers(self.config, device=device)
+                mod.value_observer.create_buffers(self.config, device=device)
+                mod.backward_observer.create_buffers(self.config,
                                                       device=device)
             else:
-                self._add_attention_spectator(mod)
+                self._add_attention_observer(mod)
 
 
     def precompute_float8_dynamic_scale_for_fsdp(

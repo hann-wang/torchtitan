@@ -117,10 +117,10 @@ class FromFloat8(torch.autograd.Function):
         return res, *empty_grads
         # return go.clone(), *empty_grads
 
-class Spectator(nn.Module):
+class Observer(nn.Module):
 
     def __init__(self, watch_fw=False, watch_bw=False):
-        super(Spectator, self).__init__()
+        super(Observer, self).__init__()
         self.always_float32_buffers = set()
         self.watch_fw = watch_fw
         self.watch_bw = watch_bw
