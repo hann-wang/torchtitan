@@ -74,7 +74,7 @@ def parallelize_llama(
                 "fused_rmsnorm is not compatible with torch.compile yet. "
                 "Please use rmsnorm or layernorm."
             )
-        apply_compile(model)
+        model = apply_compile(model)
 
     if (
         parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled
@@ -112,7 +112,7 @@ def parallelize_llama(
             enable_compile=job_config.training.compile,
             enable_compiled_autograd=job_config.experimental.enable_compiled_autograd,
         )
-        
+
     return model
 
 
@@ -306,6 +306,10 @@ def apply_compile(model: nn.Module):
         model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
+
+    # logger.info("Compiling the model with torch.compile")
+    # model = torch.compile(model, fullgraph=True)
+    return model
 
 
 def apply_fsdp(

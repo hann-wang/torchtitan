@@ -301,7 +301,7 @@ def get_peak_flops(device_name: str) -> int:
         filtered_lines = [
             line
             for line in result.stdout.splitlines()
-            if "NVIDIA" in line and "H100" in line
+            if ("NVIDIA" in line and "H100" in line) or ("AMD" in line and "Instinct" in line)
         ]
         # Join all filtered lines into a single string
         device_name = " ".join(filtered_lines) or device_name
@@ -322,6 +322,10 @@ def get_peak_flops(device_name: str) -> int:
     elif "H200" in device_name:
         # data from https://www.nvidia.com/en-us/data-center/h200/
         return 989e12
+    elif "MI300X" in device_name:
+        return 1307.4e12
+    elif "MI308X" in device_name:
+        return 344e12
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
         return 312e12

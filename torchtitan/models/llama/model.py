@@ -217,7 +217,7 @@ class Attention(nn.Module):
         return self.wo(output)
 
 
-class AttentionFlashAttention2(nn.Module):
+class AttentionFlashAttention2(Attention):
     """
     Multi-head attention module.
 
@@ -237,33 +237,10 @@ class AttentionFlashAttention2(nn.Module):
     """
 
     def __init__(self, model_args: ModelArgs):
-        super().__init__()
-        self.n_heads = model_args.n_heads
-        self.n_kv_heads = (model_args.n_heads if model_args.n_kv_heads is None
-                           else model_args.n_kv_heads)
-        self.n_rep = self.n_heads // self.n_kv_heads
-        self.head_dim = model_args.dim // model_args.n_heads
-
-        self.wq = nn.Linear(model_args.dim,
-                            model_args.n_heads * self.head_dim,
-                            bias=False)
-        self.wk = nn.Linear(model_args.dim,
-                            self.n_kv_heads * self.head_dim,
-                            bias=False)
-        self.wv = nn.Linear(model_args.dim,
-                            self.n_kv_heads * self.head_dim,
-                            bias=False)
-        self.wo = nn.Linear(model_args.n_heads * self.head_dim,
-                            model_args.dim,
-                            bias=False)
+        super().__init__(model_args)
 
         self.descale_q = self.descale_k = self.descale_v = None
         self.query_observer = self.key_observer = self.value_observer = self.backward_observer = None
-
-    def init_weights(self, init_std: float):
-        for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
 
     @property
     def q_proj(self):
@@ -311,15 +288,15 @@ class AttentionFlashAttention2(nn.Module):
 
         # xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         # xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        with torch.no_grad():
+            if self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
+                xq = self.query_observer(xq)
+                xk = self.key_observer(xk)
+                xv = self.value_observer(xv)
 
-        if self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
-            xq = self.query_observer(xq)
-            xk = self.key_observer(xk)
-            xv = self.value_observer(xv)
-
-            self.descale_q = self.query_observer.get_input_scale()
-            self.descale_k = self.key_observer.get_input_scale()
-            self.descale_v = self.value_observer.get_input_scale()
+                self.descale_q = self.query_observer.get_input_scale()
+                self.descale_k = self.key_observer.get_input_scale()
+                self.descale_v = self.value_observer.get_input_scale()
 
         output = _flash_attention_forward(
             xq,
