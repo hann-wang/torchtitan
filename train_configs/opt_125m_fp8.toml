@@ -60,3 +60,6 @@ selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac ba
 
 [float8]
 enable_float8_linear = true
+scaling_type_input = "delayed"
+scaling_type_weight = "delayed"
+scaling_type_grad_output = "delayed"

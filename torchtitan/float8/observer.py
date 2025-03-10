@@ -287,7 +287,7 @@ def sync_observer_amax_and_scale_history(model: torch.nn.Module,
 
     if len(fp8_observers) == 0:
         log.warning(
-            "Calling sync_float8_amax_and_scale_history on a module with no Float8Linear layers"
+            "Calling sync_observer_amax_and_scale_history on a module with no float8 observers"
         )
         return
 

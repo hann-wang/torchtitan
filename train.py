@@ -108,6 +108,7 @@ def main(job_config: JobConfig):
     else:
         assert model_path
         hf_config = AutoConfig.from_pretrained(model_path)
+        hf_config._attn_implementation = "flash_attention_2"
         model_config = ModelArgs(
             dim=hf_config.hidden_size,
             n_layers=hf_config.num_hidden_layers,
@@ -185,6 +186,7 @@ def main(job_config: JobConfig):
             m.to_empty(device=init_device)
             with torch.no_grad():
                 m.init_weights(buffer_device=buffer_device)
+                m.to(torch.bfloat16)
             m.train()
             model_parts[idx] = m
     else:

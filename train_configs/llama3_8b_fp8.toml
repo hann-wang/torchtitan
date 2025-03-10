@@ -27,7 +27,7 @@ name = "AdamW"
 lr = 3e-4
 
 [training]
-batch_size = 1
+batch_size = 4
 seq_len = 8192
 warmup_steps = 200  # lr scheduler warm up
 max_norm = 1.0  # grad norm clipping
@@ -58,3 +58,6 @@ selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac ba
 
 [float8]
 enable_float8_linear = true
+scaling_type_input = "delayed"
+scaling_type_weight = "delayed"
+scaling_type_grad_output = "delayed"
