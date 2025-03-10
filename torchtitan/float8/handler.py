@@ -155,6 +155,11 @@ class Float8Handler:
             return
 
         from torchao.float8 import sync_float8_amax_and_scale_history
+        from .observer import sync_observer_amax_and_scale_history
+
+        def sync_func(module):
+            sync_float8_amax_and_scale_history(module)
+            sync_observer_amax_and_scale_history(module)
 
         # TODO(vkuzo): see if precalculating the modules to sync over is going to
         # meaningfully help performance
@@ -162,12 +167,9 @@ class Float8Handler:
         if self._sync_float8_amax_and_scale_history is None:
             if self.compile:
                 self._sync_float8_amax_and_scale_history = torch.compile(
-                    sync_float8_amax_and_scale_history
-                )
+                    sync_func)
             else:
-                self._sync_float8_amax_and_scale_history = (
-                    sync_float8_amax_and_scale_history
-                )
+                self._sync_float8_amax_and_scale_history = (sync_func)
 
         models = [model] if isinstance(model, nn.Module) else model
         for m in models:

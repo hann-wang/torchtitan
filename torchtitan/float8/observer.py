@@ -1,6 +1,9 @@
 from typing import Optional
+import logging
 import torch
 from torch import nn
+import torch.distributed as dist
+from torch.distributed._functional_collectives import AsyncCollectiveTensor, all_reduce
 
 # torchao
 from torchao.float8.config import Float8LinearConfig, ScalingType, e4m3_dtype, e5m2_dtype
@@ -10,13 +13,16 @@ from torchao.float8.float8_utils import (
     tensor_to_amax,
     tensor_to_scale,
     to_fp8_saturated,
+    amax_history_to_scale_stack,
 )
 from torchao.float8.float8_scaling_utils import (
     _maybe_initialize_amaxes_scales_for_float8_cast,
     hp_tensor_to_float8_delayed, hp_tensor_to_float8_dynamic,
     hp_tensor_to_float8_static, hp_tensor_and_scale_to_float8
 )
+from torchao.float8.float8_linear_utils import _update_history_stack
 
+log = logging.getLogger(__name__)
 
 @torch._dynamo.allow_in_graph
 class ToFloat8(torch.autograd.Function):
@@ -147,7 +153,6 @@ class Observer(nn.Module):
         return self.fp8_scale_grad_output
 
     def cast_input_to_float8(self, input: torch.Tensor) -> torch.Tensor:
-        is_amax_initialized = self.is_amax_initialized
         # Duplicate the autocast logic for F.linear, so that the output
         # of our module has the right original precision
         if torch.is_autocast_enabled():
@@ -223,8 +228,7 @@ class Observer(nn.Module):
         history_len = self.config.delayed_scaling_config.history_len
         default_input = torch.finfo(
             self.input_target_dtype).max
-        default_weight = torch.finfo(
-            self.weight_target_dtype).max
+        default_weight = torch.finfo(self.weight_target_dtype).max
         default_grad_output = torch.finfo(
             self.grad_output_target_dtype).max
 
@@ -253,3 +257,136 @@ class Observer(nn.Module):
             torch.zeros(history_len, device=device))
         self.register_always_float32_buffer("fp8_scale_grad_output",
                                             torch.tensor([1.0], device=device))
+
+
+def get_float8_observers(model: torch.nn.Module):
+    """Iterates through the model and returns all the float8 observers.
+    Args:
+        model (torch.nn.Module): The model to look for float8 observers in.
+    """
+
+    fp8_observers = [
+        child for child in model.modules() if isinstance(child, Observer)
+    ]
+    if not torch.compiler.is_compiling():
+        for layer in fp8_observers:
+            for buf in layer.buffers():
+                torch._dynamo.mark_static_address(buf, guard=True)
+    return fp8_observers
+
+
+@torch.no_grad()
+def sync_observer_amax_and_scale_history(model: torch.nn.Module,
+                                       fp8_observers=None) -> None:
+    """
+    adapted from torchao.float8.sync_float8_amax_and_scale_history
+    """
+
+    if fp8_observers is None:
+        fp8_observers = get_float8_observers(model)
+
+    if len(fp8_observers) == 0:
+        log.warning(
+            "Calling sync_float8_amax_and_scale_history on a module with no Float8Linear layers"
+        )
+        return
+
+    def inner_func():
+
+        # Loop over all fp8 observers and grab the needed tensors
+        fp8_amax_input_tensor_list = [None] * len(fp8_observers)
+        fp8_amax_grad_output_tensor_list = [None] * len(fp8_observers)
+
+        fp8_input_amax_history_stack = [None] * len(fp8_observers)
+        fp8_grad_output_amax_history_stack = [None] * len(fp8_observers)
+
+        input_dtypes = set()
+        grad_output_dtypes = set()
+        scale_fn_recipes = set()
+
+        for idx, child in enumerate(fp8_observers):
+            fp8_amax_input_tensor_list[idx] = child.fp8_amax_input
+            fp8_amax_grad_output_tensor_list[idx] = child.fp8_amax_grad_output
+
+            fp8_input_amax_history_stack[idx] = child.fp8_amax_history_input
+            fp8_grad_output_amax_history_stack[
+                idx] = child.fp8_amax_history_grad_output
+
+            input_dtypes.add(child.config.cast_config_input.target_dtype)
+            grad_output_dtypes.add(
+                child.config.cast_config_grad_output.target_dtype)
+            scale_fn_recipes.add(
+                child.config.delayed_scaling_config.scale_fn_name)
+
+        (input_dtype, ) = input_dtypes
+        (grad_output_dtype, ) = grad_output_dtypes
+
+        if len(scale_fn_recipes) != 1:
+            raise ValueError(
+                f"All layers must have the same scale_fn recipe, got {scale_fn_recipes}"
+            )
+        scale_fn_recipe = next(iter(scale_fn_recipes))
+
+        assert (len(fp8_amax_input_tensor_list) ==
+                len(fp8_amax_grad_output_tensor_list)
+                ), "Mismatched lengths of amax tensors."
+
+        if dist.is_initialized():
+            all_amax_tensors = torch.cat(fp8_amax_input_tensor_list +
+                                         fp8_amax_grad_output_tensor_list)
+            all_reduced_amax_tensor = all_reduce(
+                all_amax_tensors, "MAX", list(range(dist.get_world_size())))
+            if isinstance(all_reduced_amax_tensor, AsyncCollectiveTensor):
+                all_reduced_amax_tensor = all_reduced_amax_tensor.wait()
+
+            (
+                reduced_fp8_amax_input_tensor,
+                reduced_fp8_amax_grad_output_tensor,
+            ) = torch.split(all_reduced_amax_tensor,
+                            len(fp8_amax_input_tensor_list))
+
+            for idx, child in enumerate(fp8_observers):
+                child.fp8_amax_input.copy_(reduced_fp8_amax_input_tensor[idx])
+                child.fp8_amax_grad_output.copy_(
+                    reduced_fp8_amax_grad_output_tensor[idx])
+
+        # We create two stacked tensor groups, one for the amax history and one for the current scales
+        fp8_amax_input_tensors = torch.vstack(fp8_amax_input_tensor_list)
+        fp8_amax_grad_output_tensors = torch.vstack(
+            fp8_amax_grad_output_tensor_list)
+
+        fp8_input_amax_history_stack = torch.vstack(
+            fp8_input_amax_history_stack)
+        fp8_grad_output_amax_history_stack = torch.vstack(
+            fp8_grad_output_amax_history_stack)
+
+        # Update the history stacks with the new amax values
+        _update_history_stack(fp8_amax_input_tensors,
+                              fp8_input_amax_history_stack)
+        _update_history_stack(fp8_amax_grad_output_tensors,
+                              fp8_grad_output_amax_history_stack)
+
+        # Calculate the new scales from the updated history stacks
+        new_input_scales = amax_history_to_scale_stack(
+            fp8_input_amax_history_stack, input_dtype, scale_fn_recipe)
+        new_grad_output_scales = amax_history_to_scale_stack(
+            fp8_grad_output_amax_history_stack, grad_output_dtype,
+            scale_fn_recipe)
+
+        # Iterate through the layers and update the scales
+        for idx, child in enumerate(fp8_observers):
+            child.fp8_scale_input.copy_(new_input_scales[idx])
+            child.fp8_scale_grad_output.copy_(new_grad_output_scales[idx])
+
+            child.fp8_amax_history_input.copy_(
+                fp8_input_amax_history_stack[idx])
+            child.fp8_amax_history_grad_output.copy_(
+                fp8_grad_output_amax_history_stack[idx])
+
+    # This allows for the compile to succeed on the inner func and fail on the graph breaks
+    # at the beginning and and of syncing
+    inner_func()
+
+    for child in fp8_observers:
+        # Set a flag to signal that initialization is done
+        child.is_amax_initialized = True
