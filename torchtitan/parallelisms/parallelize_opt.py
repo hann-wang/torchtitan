@@ -95,8 +95,14 @@ def apply_compile(model: nn.Module):
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    logger.info("Compiling the model with torch.compile")
-    model = torch.compile(model, fullgraph=True)
+
+    logger.info("Compiling each TransformerBlock with torch.compile")
+    for layer_id, transformer_block in enumerate(model.model.decoder.layers):
+        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        model.model.decoder.layers[layer_id] = transformer_block
+
+    # logger.info("Compiling the model with torch.compile")
+    # model = torch.compile(model, fullgraph=True)
     return model
 
 

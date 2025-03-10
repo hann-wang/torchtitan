@@ -109,6 +109,7 @@ def main(job_config: JobConfig):
         assert model_path
         hf_config = AutoConfig.from_pretrained(model_path)
         hf_config._attn_implementation = "flash_attention_2"
+        hf_config.pad_token_id = None
         model_config = ModelArgs(
             dim=hf_config.hidden_size,
             n_layers=hf_config.num_hidden_layers,
