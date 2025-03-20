@@ -45,6 +45,8 @@ def build_norm(norm_type: str, dim: int, eps: float = 1e-6):
         return RMSNorm(dim, eps=eps)
     elif norm_type == "fused_rmsnorm":
         return FusedRMSNorm(dim, eps=eps)
+    elif norm_type == "dynamic_tanh":
+        return DyT(dim, init_alpha=0.5)
     else:
         raise NotImplementedError(f"Unknown norm_type: '{norm_type}'")
 
@@ -103,6 +105,22 @@ class RMSNorm(nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)  # type: ignore
 
+class DyT(nn.Module):
+    def __init__(self, C, init_alpha):
+        super().__init__()
+        self.init_alpha = init_alpha
+        self.alpha = nn.Parameter(torch.ones(1) * init_alpha)
+        self.gamma = nn.Parameter(torch.ones(C))
+        self.beta = nn.Parameter(torch.zeros(C))
+
+    def forward(self, x):
+        x = torch.tanh(self.alpha * x)
+        return self.gamma * x + self.beta
+
+    def reset_parameters(self):
+        torch.nn.init.constant_(self.alpha, self.init_alpha)  # type: ignore
+        torch.nn.init.ones_(self.gamma)  # type: ignore
+        torch.nn.init.zeros_(self.beta)  # type: ignore
 
 # FusedRMSNorm in Triton
 

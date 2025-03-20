@@ -573,6 +573,11 @@ class JobConfig:
             default="dynamic",
             help="float8 scaling for input, dynamic (default) or delayed",
         )
+        self.parser.add_argument(
+            "--float8.use_current_scaling",
+            action="store_true",
+            help="Whether use current scaling in FA kernel",
+        )
 
         # communications library settings
         self.parser.add_argument(

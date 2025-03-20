@@ -81,6 +81,8 @@ class Float8Handler:
         self._sync_float8_amax_and_scale_history = None
         self.compile = job_config.training.compile
 
+        self.use_current_scaling = float8_config.use_current_scaling
+
         logger.info("Float8 training active")
 
     def convert_to_float8_training(self, model: nn.Module):
@@ -107,25 +109,27 @@ class Float8Handler:
 
         self._add_attention_observer(model)
         logger.info(
-            "Added FP8 Observers to *FlashAttention2 modules."
+            f"Added FP8 Observers to *FlashAttention2 modules with use_current_scaling={self.use_current_scaling}."
         )
 
 
     def _add_attention_observer(self, model: nn.Module):
         for mod in model.children():
             if mod.__class__.__name__.endswith("FlashAttention2"):
-                device = mod.q_proj.weight.device
-                mod.query_observer = Observer(watch_fw=True, watch_bw=False)
-                mod.key_observer = Observer(watch_fw=True, watch_bw=False)
-                mod.value_observer = Observer(watch_fw=True, watch_bw=False)
-                mod.backward_observer = Observer(watch_fw=False,
-                                                   watch_bw=True)
+                mod.use_current_scaling = self.use_current_scaling
+                if not self.use_current_scaling:
+                    device = mod.q_proj.weight.device
+                    mod.query_observer = Observer(watch_fw=True, watch_bw=False)
+                    mod.key_observer = Observer(watch_fw=True, watch_bw=False)
+                    mod.value_observer = Observer(watch_fw=True, watch_bw=False)
+                    mod.backward_observer = Observer(watch_fw=False,
+                                                    watch_bw=True)
 
-                mod.query_observer.create_buffers(self.config, device=device)
-                mod.key_observer.create_buffers(self.config, device=device)
-                mod.value_observer.create_buffers(self.config, device=device)
-                mod.backward_observer.create_buffers(self.config,
-                                                      device=device)
+                    mod.query_observer.create_buffers(self.config, device=device)
+                    mod.key_observer.create_buffers(self.config, device=device)
+                    mod.value_observer.create_buffers(self.config, device=device)
+                    mod.backward_observer.create_buffers(self.config,
+                                                        device=device)
             else:
                 self._add_attention_observer(mod)
 
@@ -159,7 +163,8 @@ class Float8Handler:
 
         def sync_func(module):
             sync_float8_amax_and_scale_history(module)
-            sync_observer_amax_and_scale_history(module)
+            if not self.use_current_scaling:
+                sync_observer_amax_and_scale_history(module)
 
         # TODO(vkuzo): see if precalculating the modules to sync over is going to
         # meaningfully help performance

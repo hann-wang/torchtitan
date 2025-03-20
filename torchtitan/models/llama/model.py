@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from transformers.triton_hadamard_transform import hadamard_transform
 
 from torchtitan.models.norms import build_norm
 
@@ -241,6 +242,7 @@ class AttentionFlashAttention2(Attention):
 
         self.descale_q = self.descale_k = self.descale_v = None
         self.query_observer = self.key_observer = self.value_observer = self.backward_observer = None
+        self.use_current_scaling = False
 
     @property
     def q_proj(self):
@@ -286,10 +288,13 @@ class AttentionFlashAttention2(Attention):
 
         xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
+        # xq = hadamard_transform(xq)
+        # xk = hadamard_transform(xk)
+
         # xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         # xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         with torch.no_grad():
-            if self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
+            if not self.use_current_scaling and self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
                 xq = self.query_observer(xq)
                 xk = self.key_observer(xk)
                 xv = self.value_observer(xv)
@@ -312,6 +317,7 @@ class AttentionFlashAttention2(Attention):
             sliding_window=None,
             use_top_left_mask=False,
             is_causal=True,
+            use_current_scaling=self.use_current_scaling,
         )
 
         if self.backward_observer is not None:
