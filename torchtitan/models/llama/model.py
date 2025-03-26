@@ -285,14 +285,14 @@ class AttentionFlashAttention2(Attention):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
-        
+
         if self.use_fp8:
             freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
             freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
             assert freqs_cis.shape == (
                 1, seqlen, xq.shape[-1]
             ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
-        
+
             xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
                 xq, xk, freqs_cis.real, freqs_cis.imag, 64)
         else:
@@ -314,24 +314,35 @@ class AttentionFlashAttention2(Attention):
             else:
                 descale_v = None
 
-        output = _flash_attention_forward(
-            xq_hp,
-            xk_hp,
-            xv_hp,
-            xq,
-            xk,
-            xv,
-            None,
-            seqlen,
-            descale_q=descale_q,
-            descale_k=descale_k,
-            descale_v=descale_v,
-            position_ids=None,
-            dropout=0.0,
-            sliding_window=None,
-            use_top_left_mask=False,
-            is_causal=True,
-        )
+        if self.use_fp8:
+            output = _flash_attention_forward(
+                xq_hp,
+                xk_hp,
+                xv_hp,
+                xq,
+                xk,
+                xv,
+                None,
+                seqlen,
+                descale_q=descale_q,
+                descale_k=descale_k,
+                descale_v=descale_v,
+                position_ids=None,
+                dropout=0.0,
+                sliding_window=None,
+                use_top_left_mask=False,
+                is_causal=True,
+            )
+        else:
+            xk = repeat_kv(xk, self.n_rep)
+            xv = repeat_kv(xv, self.n_rep)
+            output = F.scaled_dot_product_attention(
+                xq.transpose(1, 2),
+                xk.transpose(1, 2),
+                xv.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=True,
+            ).transpose(1, 2)
 
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)
