@@ -285,13 +285,14 @@ class AttentionFlashAttention2(Attention):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
-        freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
-        freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
-        assert freqs_cis.shape == (
-            1, seqlen, xq.shape[-1]
-        ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
-
+        
         if self.use_fp8:
+            freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
+            freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
+            assert freqs_cis.shape == (
+                1, seqlen, xq.shape[-1]
+            ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
+        
             xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
                 xq, xk, freqs_cis.real, freqs_cis.imag, 64)
         else:
