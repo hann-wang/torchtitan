@@ -16,6 +16,7 @@ from torch import nn
 
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.triton_hadamard_transform import hadamard_transform
+from transformers.triton_rope import rope_with_scaling_qk
 
 from torchtitan.models.norms import build_norm
 
@@ -241,8 +242,7 @@ class AttentionFlashAttention2(Attention):
         super().__init__(model_args)
 
         self.descale_q = self.descale_k = self.descale_v = None
-        self.query_observer = self.key_observer = self.value_observer = self.backward_observer = None
-        self.use_current_scaling = False
+        self.use_fp8 = False
 
     @property
     def q_proj(self):
@@ -285,43 +285,52 @@ class AttentionFlashAttention2(Attention):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
+        freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
+        freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
+        assert freqs_cis.shape == (
+            1, seqlen, xq.shape[-1]
+        ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        if self.use_fp8:
+            xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
+                xq, xk, freqs_cis.real, freqs_cis.imag, 64)
+        else:
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+            xq_hp = xq
+            xk_hp = xk
+            descale_q = None
+            descale_k = None
 
         # xq = hadamard_transform(xq)
         # xk = hadamard_transform(xk)
 
-        # xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        # xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+        xv_hp = xv
         with torch.no_grad():
-            if not self.use_current_scaling and self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
-                xq = self.query_observer(xq)
-                xk = self.key_observer(xk)
-                xv = self.value_observer(xv)
-
-                self.descale_q = self.query_observer.get_input_scale()
-                self.descale_k = self.key_observer.get_input_scale()
-                self.descale_v = self.value_observer.get_input_scale()
+            if self.use_fp8:
+                descale_v = 240. / xv_hp.max()
+                xv = torch.clamp((xv_hp * descale_v), -240.,
+                                 240.).to(torch.float8_e4m3fnuz)
+            else:
+                descale_v = None
 
         output = _flash_attention_forward(
+            xq_hp,
+            xk_hp,
+            xv_hp,
             xq,
             xk,
             xv,
             None,
             seqlen,
-            descale_q=self.descale_q,
-            descale_k=self.descale_k,
-            descale_v=self.descale_v,
+            descale_q=descale_q,
+            descale_k=descale_k,
+            descale_v=descale_v,
             position_ids=None,
             dropout=0.0,
             sliding_window=None,
             use_top_left_mask=False,
             is_causal=True,
-            use_current_scaling=self.use_current_scaling,
         )
-
-        if self.backward_observer is not None:
-            output = self.backward_observer(output)
 
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)

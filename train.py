@@ -32,6 +32,11 @@ from torchtitan.parallelisms import (
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
 from torchtitan.utils import device_module, device_type
 
+@torch.no_grad
+def convert_model_to_bfloat16(model: torch.nn.Module) -> None:
+    ori_device = model.freqs_cis.device
+    model.to(torch.bfloat16)
+    model.freqs_cis = model._precompute_freqs_cis().to(ori_device)
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
 @record
@@ -200,7 +205,7 @@ def main(job_config: JobConfig):
             else:
                 utils.reset_params(model)
                 model.init_weights()
-            model.to(torch.bfloat16)
+            convert_model_to_bfloat16(model)
         model.train()
 
         model_parts = [model]
