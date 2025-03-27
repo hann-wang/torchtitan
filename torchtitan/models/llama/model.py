@@ -293,12 +293,12 @@ class AttentionFlashAttention2(Attention):
 
         # xk = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
         # xv = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        with torch.no_grad():
-            if not self.use_current_scaling and self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
-                xq = self.query_observer(xq)
-                xk = self.key_observer(xk)
-                xv = self.value_observer(xv)
-
+        
+        if not self.use_current_scaling and self.query_observer is not None and self.query_observer is not None and self.query_observer is not None:
+            xq = self.query_observer(xq)
+            xk = self.key_observer(xk)
+            xv = self.value_observer(xv)
+            with torch.no_grad():
                 self.descale_q = self.query_observer.get_input_scale()
                 self.descale_k = self.key_observer.get_input_scale()
                 self.descale_v = self.value_observer.get_input_scale()
