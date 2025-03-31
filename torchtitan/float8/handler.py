@@ -59,6 +59,7 @@ class Float8Handler:
         scaling_type_grad_output = ScalingType(float8_config.scaling_type_grad_output)
         self.config = Float8LinearConfig(
             enable_fsdp_float8_all_gather=enable_fsdp_float8_all_gather,
+            force_recompute_fp8_weight_in_bwd=float8_config.force_recompute_fp8_weight_in_bwd,
             cast_config_input=CastConfig(scaling_type=scaling_type_input),
             cast_config_weight=CastConfig(scaling_type=scaling_type_weight),
             cast_config_grad_output=CastConfig(scaling_type=scaling_type_grad_output),

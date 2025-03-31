@@ -555,6 +555,16 @@ class JobConfig:
             help="Whether precompute float8 scales dynamically for FSDP",
         )
         self.parser.add_argument(
+            "--float8.force_recompute_fp8_weight_in_bwd",
+            action="store_true",
+            help="""
+            Whether to force the recomputation of FP8 weights during backward pass.
+            When using FSDP with tensorwise scaling, it is recommended to enable
+            `force_recompute_fp8_weight_in_bwd` to prevent saving unsharded FP8 weights
+            for backward computation.
+            """,
+        )
+        self.parser.add_argument(
             "--float8.scaling_type_input",
             type=str,
             default="dynamic",
