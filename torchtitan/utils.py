@@ -429,6 +429,5 @@ def clip_grad_norm_(
 def reset_params(mod: torch.nn.Module):
     if hasattr(mod, "reset_parameters"):
         mod.reset_parameters()
-    else:
-        for cmod in mod.children():
-            reset_params(cmod)
+    for cmod in mod.children():
+        reset_params(cmod)

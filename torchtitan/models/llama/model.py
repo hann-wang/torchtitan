@@ -17,9 +17,12 @@ from torch import nn
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.triton_hadamard_transform import hadamard_transform
 from transformers.triton_rope import rope_with_scaling_qk
+from transformers.outlier_clipping import clip_outlier
 
 from torchtitan.models.norms import build_norm
 
+USE_CLIP = True
+get_quantile = torch.compiler.allow_in_graph(torch.quantile)
 
 @dataclass
 class ModelArgs:
@@ -240,6 +243,8 @@ class AttentionFlashAttention2(Attention):
 
     def __init__(self, model_args: ModelArgs):
         super().__init__(model_args)
+        self.alpha = torch.nn.Parameter(torch.ones((1, ),
+                                                   dtype=torch.bfloat16))
 
         self.descale_q = self.descale_k = self.descale_v = None
         self.use_fp8 = False
@@ -285,6 +290,11 @@ class AttentionFlashAttention2(Attention):
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        if USE_CLIP:
+            xq = clip_outlier(xq, self.alpha)
+            xk = clip_outlier(xk, self.alpha)
+            xv = clip_outlier(xv, self.alpha)
 
         if self.use_fp8:
             freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
@@ -346,6 +356,10 @@ class AttentionFlashAttention2(Attention):
 
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)
+
+    def init_weights(self, init_std: float):
+        super().init_weights(init_std)
+        torch.nn.init.ones_(self.alpha)
 
 class FeedForward(nn.Module):
     """

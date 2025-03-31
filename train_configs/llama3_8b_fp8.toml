@@ -2,7 +2,7 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./llama3-8b-fp8-lr1e-4-outputs"
+dump_folder = "./llama3-8b-fp8-clip-lr3e-4-outputs"
 description = "Llama 3 8B FP8 training"
 
 [profiling]
@@ -24,7 +24,7 @@ tokenizer_path = "./torchtitan/datasets/tokenizer/original/tokenizer.model"
 
 [optimizer]
 name = "AdamW"
-lr = 1e-4
+lr = 3e-4
 
 [training]
 batch_size = 3
@@ -62,6 +62,6 @@ use_current_scaling = false
 scaling_type_input = "dynamic"
 scaling_type_weight = "dynamic"
 scaling_type_grad_output = "dynamic"
-enable_fsdp_float8_all_gather = true
-precompute_float8_dynamic_scale_for_fsdp = true
-force_recompute_fp8_weight_in_bwd = true
+enable_fsdp_float8_all_gather = false
+precompute_float8_dynamic_scale_for_fsdp = false
+force_recompute_fp8_weight_in_bwd = false
