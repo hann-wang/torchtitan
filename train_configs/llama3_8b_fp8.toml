@@ -62,3 +62,6 @@ use_current_scaling = false
 scaling_type_input = "dynamic"
 scaling_type_weight = "dynamic"
 scaling_type_grad_output = "dynamic"
+enable_fsdp_float8_all_gather = true
+precompute_float8_dynamic_scale_for_fsdp = true
+force_recompute_fp8_weight_in_bwd = true
