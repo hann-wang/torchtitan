@@ -18,11 +18,11 @@ from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.triton_hadamard_transform import hadamard_transform
 from transformers.triton_rope import rope_with_scaling_qk
 from transformers.outlier_clipping import clip_outlier
+from transformers.triton_flash_attention_fp8_block import block_scaling_node
 
 from torchtitan.models.norms import build_norm
 
-USE_CLIP = True
-get_quantile = torch.compiler.allow_in_graph(torch.quantile)
+USE_CLIP = False
 
 @dataclass
 class ModelArgs:
@@ -297,14 +297,21 @@ class AttentionFlashAttention2(Attention):
             xv = clip_outlier(xv, self.alpha)
 
         if self.use_fp8:
-            freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
-            freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
-            assert freqs_cis.shape == (
-                1, seqlen, xq.shape[-1]
-            ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
+            # freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
+            # freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
+            # assert freqs_cis.shape == (
+            #     1, seqlen, xq.shape[-1]
+            # ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
 
-            xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
-                xq, xk, freqs_cis.real, freqs_cis.imag, 64)
+            # xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
+            #     xq, xk, freqs_cis.real, freqs_cis.imag, 64)
+            
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+            xq_hp = xq
+            xk_hp = xk
+            with torch.no_grad():
+                xq, descale_q = block_scaling_node(xq)
+                xk, descale_k = block_scaling_node(xk)
         else:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
             xq_hp = xq

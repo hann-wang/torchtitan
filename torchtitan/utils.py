@@ -325,7 +325,7 @@ def get_peak_flops(device_name: str) -> int:
     elif "MI300X" in device_name:
         return 1307.4e12
     elif "MI308X" in device_name:
-        return 344e12
+        return 203e12
     else:  # for other GPU types, assume A100
         logger.warning(f"Peak flops undefined for: {device_name}, fallback to A100")
         return 312e12
