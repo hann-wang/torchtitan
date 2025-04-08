@@ -243,9 +243,6 @@ class AttentionFlashAttention2(Attention):
 
     def __init__(self, model_args: ModelArgs):
         super().__init__(model_args)
-        self.alpha = torch.nn.Parameter(torch.ones((1, ),
-                                                   dtype=torch.bfloat16))
-
         self.descale_q = self.descale_k = self.descale_v = None
         self.use_fp8 = False
 
@@ -291,11 +288,6 @@ class AttentionFlashAttention2(Attention):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        if USE_CLIP:
-            xq = clip_outlier(xq, self.alpha)
-            xk = clip_outlier(xk, self.alpha)
-            xv = clip_outlier(xv, self.alpha)
-
         if self.use_fp8:
             # freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
             # freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
@@ -307,6 +299,11 @@ class AttentionFlashAttention2(Attention):
             #     xq, xk, freqs_cis.real, freqs_cis.imag, 64)
             
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+            if USE_CLIP:
+                xq = clip_outlier(xq)
+                xk = clip_outlier(xk)
+                xv = clip_outlier(xv)
+
             xq_hp = xq
             xk_hp = xk
             with torch.no_grad():
@@ -364,9 +361,6 @@ class AttentionFlashAttention2(Attention):
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)
 
-    def init_weights(self, init_std: float):
-        super().init_weights(init_std)
-        torch.nn.init.ones_(self.alpha)
 
 class FeedForward(nn.Module):
     """

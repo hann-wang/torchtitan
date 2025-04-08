@@ -2,7 +2,7 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./llama3-8b-bf16-lr1e-4-outputs"
+dump_folder = "./llama3-8b-bf16-lr3e-4-outputs"
 description = "Llama 3 8B BF16 training"
 
 [profiling]
@@ -24,7 +24,7 @@ tokenizer_path = "./torchtitan/datasets/tokenizer/original/tokenizer.model"
 
 [optimizer]
 name = "AdamW"
-lr = 1e-4
+lr = 3e-4
 
 [training]
 batch_size = 3

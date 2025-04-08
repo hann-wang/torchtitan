@@ -2,7 +2,7 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./llama3-8b-fp8-nofuserope-lr3e-4-outputs"
+dump_folder = "./llama3-8b-fp8-nofuserope-dorescale-lr3e-4-outputs"
 description = "Llama 3 8B FP8 training"
 
 [profiling]
@@ -44,10 +44,10 @@ pipeline_parallel_degree = 1
 enable_async_tensor_parallel = false
 
 [checkpoint]
-enable_checkpoint = false
+enable_checkpoint = true
 folder = "checkpoint"
 interval_type = "steps"
-interval = 500
+interval = 87
 model_weights_only = false
 export_dtype = "float32"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
