@@ -23,6 +23,7 @@ from transformers.triton_flash_attention_fp8_block import block_scaling_node
 from torchtitan.models.norms import build_norm
 
 USE_CLIP = False
+USE_HADAMARD = False
 
 @dataclass
 class ModelArgs:
@@ -297,12 +298,16 @@ class AttentionFlashAttention2(Attention):
 
             # xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
             #     xq, xk, freqs_cis.real, freqs_cis.imag, 64)
-            
+
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
             if USE_CLIP:
                 xq = clip_outlier(xq)
                 xk = clip_outlier(xk)
                 xv = clip_outlier(xv)
+
+            if USE_HADAMARD:
+                xq = hadamard_transform(xq)
+                xk = hadamard_transform(xk)
 
             xq_hp = xq
             xk_hp = xk
@@ -315,9 +320,6 @@ class AttentionFlashAttention2(Attention):
             xk_hp = xk
             descale_q = None
             descale_k = None
-
-        # xq = hadamard_transform(xq)
-        # xk = hadamard_transform(xk)
 
         xv_hp = xv
         with torch.no_grad():
