@@ -123,7 +123,7 @@ class Float8Converter(ModelConverter):
             if mod.__class__.__name__.endswith("FlashAttention2"):
                 mod.use_fp8 = True
                 logger.info(
-                    f"Added FP8 Observers to {mod.__class__.__name__}.")
+                    f"Enable FP8 kernel for {mod.__class__.__name__}.")
             else:
                 self._add_attention_observer(mod)
 

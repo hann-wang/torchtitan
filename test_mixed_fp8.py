@@ -8,8 +8,8 @@ import triton
 import triton.language as tl
 import torch
 
-USE_FP8: tl.constexpr = True
-USE_B8_F8: tl.constexpr = True
+USE_FP8 = True
+USE_B8_F8 = True
 
 
 @triton.jit
@@ -26,6 +26,8 @@ def matmul_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    USE_FP8: tl.constexpr,
+    USE_B8_F8: tl.constexpr,
 ):
 
     pid_m = tl.program_id(0)
@@ -112,6 +114,8 @@ def matmul(A, C):
         BLOCK_M=M,
         BLOCK_N=N,
         BLOCK_K=K,
+        USE_FP8=USE_FP8,
+        USE_B8_F8=USE_B8_F8,
     )
     return C
 
