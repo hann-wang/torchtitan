@@ -29,6 +29,13 @@ from transformers.triton_flash_attention_fp8_block import block_scaling_node
 USE_CLIP = False
 USE_HADAMARD = False
 USE_SDPA = True
+USE_BLOCK_SCALES = True
+
+def check_and_convert(t, scale):
+    float8_fw = torch.float8_e4m3fnuz
+    finfo = torch.finfo(float8_fw)
+    return ((t * scale).clamp(min=finfo.min, max=finfo.max).to(
+        dtype=float8_fw) if t.dtype != float8_fw else t)
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -353,8 +360,15 @@ class AttentionFlashAttention2(Attention):
             xq_hp = xq
             xk_hp = xk
             with torch.no_grad():
-                xq, descale_q = block_scaling_node(xq)
-                xk, descale_k = block_scaling_node(xk)
+                if USE_BLOCK_SCALES:
+                    xq, descale_q = block_scaling_node(xq)
+                    xk, descale_k = block_scaling_node(xk)
+                else:
+                    descale_q = 240. / xq_hp.abs().max()
+                    xq = check_and_convert(xq_hp, descale_q)
+                    descale_k = 240. / xk_hp.abs().max()
+                    xk = check_and_convert(xk_hp, descale_k)
+
         else:
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
             xq_hp = xq
@@ -365,9 +379,8 @@ class AttentionFlashAttention2(Attention):
         xv_hp = xv
         with torch.no_grad():
             if self.use_fp8:
-                descale_v = 240. / xv_hp.max()
-                xv = torch.clamp((xv_hp * descale_v), -240.,
-                                 240.).to(torch.float8_e4m3fnuz)
+                descale_v = 240. / xv_hp.abs().max()
+                xv = check_and_convert(xv_hp, descale_v)
             else:
                 descale_v = None
 
@@ -389,6 +402,7 @@ class AttentionFlashAttention2(Attention):
                 sliding_window=None,
                 use_top_left_mask=False,
                 is_causal=True,
+                use_fp8_perblock=USE_BLOCK_SCALES,
             )
         else:
             if USE_SDPA:
