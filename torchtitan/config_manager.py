@@ -720,6 +720,22 @@ class JobConfig:
             Example: --float8.module_filter_fqns "attention.wq,attention.wk,attention.wv,output"
             """,
         )
+        self.parser.add_argument(
+            "--float8.enable_fp8_fa",
+            action="store_true",
+            help="""
+            Whether to use FP8 FlashAttention Triton kernel.
+            """,
+        )
+        self.parser.add_argument(
+            "--float8.fp8_fa_granularity",
+            type=str,
+            default="blockwise",
+            choices=["tensorwise", "blockwise"],
+            help="""
+            Scale granularity for Q, K. (V is always tensorwise scaled)
+            """,
+        )
 
         # communications library settings
         self.parser.add_argument(

@@ -29,7 +29,6 @@ from transformers.triton_flash_attention_fp8_block import block_scaling_node
 USE_CLIP = False
 USE_HADAMARD = False
 USE_SDPA = True
-USE_BLOCK_SCALES = True
 
 def check_and_convert(t, scale):
     float8_fw = torch.float8_e4m3fnuz
@@ -294,6 +293,7 @@ class AttentionFlashAttention2(Attention):
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__(model_args)
         self.use_fp8 = False
+        self.use_fp8_fa_block_scales = True
 
     @property
     def q_proj(self):
@@ -360,7 +360,7 @@ class AttentionFlashAttention2(Attention):
             xq_hp = xq
             xk_hp = xk
             with torch.no_grad():
-                if USE_BLOCK_SCALES:
+                if self.use_fp8_fa_block_scales:
                     xq, descale_q = block_scaling_node(xq)
                     xk, descale_k = block_scaling_node(xk)
                 else:
@@ -402,7 +402,7 @@ class AttentionFlashAttention2(Attention):
                 sliding_window=None,
                 use_top_left_mask=False,
                 is_causal=True,
-                use_fp8_perblock=USE_BLOCK_SCALES,
+                use_fp8_perblock=self.use_fp8_fa_block_scales,
             )
         else:
             if USE_SDPA:

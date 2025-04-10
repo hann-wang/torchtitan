@@ -58,6 +58,8 @@ class Float8Converter(ModelConverter):
 
         self.enabled = True
         self.filter_fqns = float8_config.filter_fqns
+        self.enable_fp8_fa = float8_config.enable_fp8_fa
+        self.use_fp8_fa_block_scales = float8_config.fp8_fa_granularity == "blockwise"
 
         if float8_config.recipe_name is not None:
             assert (
@@ -116,14 +118,17 @@ class Float8Converter(ModelConverter):
             "Swapped to Float8Linear layers with enable_fsdp_float8_all_gather="
             f"{self.config.enable_fsdp_float8_all_gather}"
         )
-        self._add_attention_observer(model)
+        if self.enable_fp8_fa:
+            self._add_attention_observer(model)
 
     def _add_attention_observer(self, model: nn.Module):
         for mod in model.children():
             if mod.__class__.__name__.endswith("FlashAttention2"):
                 mod.use_fp8 = True
+                mod.use_fp8_fa_block_scales = self.use_fp8_fa_block_scales
                 logger.info(
-                    f"Enable FP8 kernel for {mod.__class__.__name__}.")
+                    f"Enable FP8 kernel for {mod.__class__.__name__} with use_fp8_fa_block_scales={self.use_fp8_fa_block_scales}."
+                )
             else:
                 self._add_attention_observer(mod)
 
