@@ -5,6 +5,7 @@ __pycache__
 build
 *outputs/
 dist/*
+.vscode
 
 # data
 data
@@ -12,6 +13,8 @@ out
 wandb
 
 torchtitan/datasets/**/*.model
+assets/**/*.model
+torchtitan/experiments/**/assets/*
 
 # temp files
 *.log

@@ -12,7 +12,7 @@ set -ex
 # NGPU=4 ./run_memory_estimation.sh
 NGPU=${NGPU:-"8"}
 NNODES=${NNODES:-"1"}
-CONFIG_FILE=${CONFIG_FILE:-"./train_configs/debug_model.toml"}
+CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/models/llama3/train_configs/debug_model.toml"}
 
 overrides=""
 if [ $# -ne 0 ]; then
@@ -23,4 +23,4 @@ fi
 # Export WORLD_SIZE and LOCAL_RANK
 export WORLD_SIZE=$((NGPU * NNODES))
 export LOCAL_RANK=0
-python scripts/estimate/estimation.py --job.config_file ${CONFIG_FILE} --memory_estimation.enabled $overrides
+python -m scripts.estimate.estimation --job.config_file ${CONFIG_FILE} --memory_estimation.enabled $overrides

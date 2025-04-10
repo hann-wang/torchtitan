@@ -8,25 +8,16 @@
 # This software may be used and distributed in accordance with the terms of the Llama 3 Community License Agreement.
 
 import os
+from collections.abc import Collection, Iterator, Sequence, Set as AbstractSet
 from pathlib import Path
-from typing import (
-    AbstractSet,
-    cast,
-    Collection,
-    Dict,
-    Iterator,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Union,
-)
+from typing import cast, Literal
 
 import tiktoken
 from tiktoken.load import load_tiktoken_bpe
 
-from torchtitan.datasets.tokenizer.tokenizer import Tokenizer
-from torchtitan.logging import logger
+from torchtitan.components.tokenizer import Tokenizer
+from torchtitan.config_manager import JobConfig
+from torchtitan.tools.logging import logger
 
 
 class TikTokenizer(Tokenizer):
@@ -37,14 +28,17 @@ class TikTokenizer(Tokenizer):
         model_path (str): The path to the Tiktoken model file.
     """
 
-    special_tokens: Dict[str, int]
+    special_tokens: dict[str, int]
 
     num_reserved_special_tokens = 256
 
     pat_str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"  # noqa: E501, B950
 
     def __init__(self, model_path: str):
-        super().__init__(model_path)
+        super().__init__()
+        assert os.path.exists(
+            model_path
+        ), f"The tokenizer path does not exist: {model_path}"
         assert os.path.isfile(model_path), model_path
 
         mergeable_ranks = load_tiktoken_bpe(model_path)
@@ -93,9 +87,9 @@ class TikTokenizer(Tokenizer):
         *,
         bos: bool,
         eos: bool,
-        allowed_special: Optional[Union[Literal["all"], AbstractSet[str]]] = None,
-        disallowed_special: Optional[Union[Literal["all"], Collection[str]]] = None,
-    ) -> List[int]:
+        allowed_special: Literal["all"] | AbstractSet[str] | None = None,
+        disallowed_special: Literal["all"] | Collection[str] | None = None,
+    ) -> list[int]:
         """
         Encodes a string into a list of token IDs.
 
@@ -137,7 +131,7 @@ class TikTokenizer(Tokenizer):
                 s[i : i + TIKTOKEN_MAX_ENCODE_CHARS], MAX_NO_WHITESPACES_CHARS
             )
         )
-        t: List[int] = []
+        t: list[int] = []
         for substr in substrs:
             t.extend(
                 self.model.encode(
@@ -163,7 +157,7 @@ class TikTokenizer(Tokenizer):
             str: The decoded string.
         """
         # Typecast is safe here. Tiktoken doesn't do anything list-related with the sequence.
-        return self.model.decode(cast(List[int], t))
+        return self.model.decode(cast(list[int], t))
 
     @staticmethod
     def _split_whitespaces_or_nonwhitespaces(
@@ -190,3 +184,7 @@ class TikTokenizer(Tokenizer):
                     slice_start = i
                     current_slice_len = 1
         yield s[slice_start:]
+
+
+def build_tiktoken_tokenizer(job_config: JobConfig) -> TikTokenizer:
+    return TikTokenizer(job_config.model.tokenizer_path)

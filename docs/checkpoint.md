@@ -5,7 +5,7 @@ An example script for converting the original Llama3 checkpoints into the expect
 
 The script expects a path to the original checkpoint files, and a path to an output directory:
 ```bash
-python3 scripts/convert_llama_to_dcp.py <input_dir> <output_dir>
+python -m scripts.convert_llama_to_dcp <input_dir> <output_dir>
 ```
 
 
@@ -20,7 +20,6 @@ In your torchtitan training config, ensure that `enable_checkpoint` is set to Tr
 [checkpoint]
 enable_checkpoint = true
 folder = "checkpoint"
-interval_type = "steps"
 interval = 500
 ```
 
@@ -47,7 +46,6 @@ export_dtype = "bfloat16"
 [checkpoint]
 enable_checkpoint = true
 folder = "checkpoint"
-interval_type = "steps"
 interval = 10
 load_step = 5
 model_weights_only = true
@@ -64,6 +62,15 @@ Finally, once you have obtained the last checkpoint, you can use the following c
 python -m torch.distributed.checkpoint.format_utils dcp_to_torch torchtitan/outputs/checkpoint/step-1000 checkpoint.pt
 ```
 
+7. EXCLUDING SPECIFIC KEYS FROM CHECKPOINT LOADING
+In some cases, you may want to partially load from a previous-trained checkpoint and modify certain settings, such as the number of GPUs or the current step. To achieve this, you can use the `exclude_from_loading` parameter to specify which keys should be excluded from loading.
+This parameter takes a comma-separated list of keys that should be excluded from loading.
+```
+[checkpoint]
+enable_checkpoint = true
+exclude_from_loading = "data_loader,lr_scheduler"
+```
+
 That's it. You have now successfully converted a sharded torchtitan checkpoint for use in torchtune.
 
 
@@ -75,5 +82,5 @@ A seed checkpoint does initialization of the model on a single CPU, and can be l
 To create a seed checkpoint, use the same model config as you use for training.
 e.g.
 ```bash
-NGPU=1 CONFIG=<path_to_model_config> ./run_llama_train.sh --checkpoint.enable_checkpoint --checkpoint.create_seed_checkpoint --training.data_parallel_replicate_degree 1 --training.data_parallel_shard_degree 1 --training.tensor_parallel_degree 1 --experimental.pipeline_parallel_degree 1 --experimental.context_parallel_degree 1
+NGPU=1 CONFIG=<path_to_model_config> ./run_train.sh --checkpoint.enable_checkpoint --checkpoint.create_seed_checkpoint --parallelism.data_parallel_replicate_degree 1 --parallelism.data_parallel_shard_degree 1 --parallelism.tensor_parallel_degree 1 --parallelism.pipeline_parallel_degree 1 --parallelism.context_parallel_degree 1
 ```

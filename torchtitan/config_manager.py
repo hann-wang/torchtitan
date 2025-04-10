@@ -5,6 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
+import importlib
+import inspect
+import os
 import sys
 from collections import defaultdict
 from typing import Tuple, Union
@@ -16,7 +19,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 
-from torchtitan.logging import logger
+from torchtitan.tools.logging import logger
 
 TORCH_DTYPE_MAP = {
     "float16": torch.float16,
@@ -26,7 +29,20 @@ TORCH_DTYPE_MAP = {
 
 
 def string_list(raw_arg):
-    return raw_arg.split(",")
+    """Comma-separated string list argument."""
+    return [s.strip() for s in raw_arg.split(",") if s.strip()]
+
+
+def check_string_list_argument(args_dict: dict[str, any], fullargname: str):
+    section, name = fullargname.split(".")
+    # Split string list which are still raw strings.
+    if (
+        section in args_dict
+        and name in args_dict[section]
+        and isinstance(args_dict[section][name], str)
+    ):
+        sec = args_dict[section]
+        sec[name] = string_list(sec[name])
 
 
 class JobConfig:
@@ -140,15 +156,15 @@ class JobConfig:
             default="tb",
             help="Folder to dump TensorBoard states",
         )
-        # TODO: store_true & default=True make impossible for cmd to set it to False
         self.parser.add_argument(
-            "--metrics.rank_0_only",
+            "--metrics.save_for_all_ranks",
             action="store_true",
-            default=True,
+            default=False,
             help="""
-                Whether to save TensorBoard metrics only for rank 0 or for all ranks.
-                When pipeline_parallel_degree is > 1, this option uses the 0th rank of the last stage pipeline group,
-                which is the only stage that computes loss metrics.
+                Whether to save TensorBoard/Wandb metrics only for rank 0 or for all ranks.
+                When this option is False and pipeline_parallel_degree is > 1, the metrics
+                component uses the 0th rank of the last stage pipeline group, which is the
+                only stage that computes loss metrics.
             """,
         )
         self.parser.add_argument(
@@ -161,7 +177,7 @@ class JobConfig:
         self.parser.add_argument(
             "--model.name",
             type=str,
-            default="llama",
+            default="llama3",
             help="Which model to train",
         )
         self.parser.add_argument(
@@ -180,13 +196,54 @@ class JobConfig:
             "--model.norm_type",
             type=str,
             default="rmsnorm",
-            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, fused_rmsnorm]",
+            choices=["layernorm", "np_layernorm", "rmsnorm"],
+            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm]",
+        )
+        self.parser.add_argument(
+            "--model.use_flex_attn",
+            action="store_true",
+            help="""
+                Whether to use Flex Attention.
+                Mixed usage of SDPA and FlexAttention is not upported yet.
+            """,
+        )
+        self.parser.add_argument(
+            "--model.attn_mask_type",
+            type=str,
+            default="causal",
+            choices=["causal", "block_causal"],
+            help="""
+                Specifies the type of bias/mask used for attention. If SDPA is used,
+                only the causal mask is supported by default. If FlexAttention is used,
+                both causal and block_causal masks are supported.
+            """,
         )
         self.parser.add_argument(
             "--model.tokenizer_path",
             type=str,
-            default="./torchtitan/datasets/tokenizer/tokenizer.model",
+            default="./assets/tokenizer/original/tokenizer.model",
             help="Tokenizer path",
+        )
+        self.parser.add_argument(
+            "--model.converters",
+            type=string_list,
+            nargs="+",
+            default=[],
+            help="""
+                Comma separated list of converters to apply to the model.
+
+                For instance, the `float8` converter swaps `torch.nn.Linear`
+                with `Float8Linear`. This feature requires you to install 'torchao'
+                which can be found here: https://github.com/pytorch/ao
+            """,
+        )
+        self.parser.add_argument(
+            "--model.print_after_conversion",
+            action="store_true",
+            help="""
+            If true, model definition will be printed to stdout after all model
+            converters have been applied.
+            """,
         )
 
         # optimizer configs
@@ -197,9 +254,20 @@ class JobConfig:
             "--optimizer.lr", type=float, default=8e-4, help="Learning rate to use"
         )
         self.parser.add_argument(
-            "--optimizer.fused",
-            action="store_true",
-            help="Whether the fused implementation(CUDA only) is used.",
+            "--optimizer.eps", type=float, default=1e-8, help="Epsilon value to use"
+        )
+        self.parser.add_argument(
+            "--optimizer.implementation",
+            type=str,
+            default="fused",
+            choices=["for-loop", "foreach", "fused"],
+            help="""
+            Specify which optimizer implementation to use:
+            - 'fused': Use fused implementation (CUDA only) for best performance.
+            - 'foreach': Use some horizontal fusion of tensors for better performance.
+            - 'for-loop': Use the default implementation for the optimizer (slowest).
+            - more info: https://pytorch.org/docs/stable/optim.html
+            """,
         )
         self.parser.add_argument(
             "--optimizer.early_step_in_backward",
@@ -210,9 +278,54 @@ class JobConfig:
             register_post_accumulate_grad_hook after the optimizer is built.""",
         )
 
+        # lr scheduler configs
+        self.parser.add_argument(
+            "--lr_scheduler.warmup_steps",
+            type=int,
+            default=200,
+            help="Steps for lr scheduler warmup, normally 1/5 of --training.steps",
+        )
+        self.parser.add_argument(
+            "--lr_scheduler.decay_ratio",
+            type=float,
+            default=None,
+            help="""
+            Controls the proportion of the training steps allocated to the learning rate decay phase.
+
+            If `None`, the learning rate will begin decaying immediately after the warmup period.
+            Otherwise, the learning rate will remain stable after the warmup period and
+            only start decaying during the last `decay_ratio` portion of the total training steps.
+
+            This is known as the Warmup-Stable-Decay (WSD) schedule, as described in https://arxiv.org/abs/2404.06395.
+            """,
+        )
+        self.parser.add_argument(
+            "--lr_scheduler.decay_type",
+            type=str,
+            default="linear",
+            choices=["linear", "sqrt", "cosine"],
+            help="""
+            Learning rate decay type to use during training:
+            - 'linear': linearly decays learning rate from initial to final value
+            - 'sqrt': decays learning rate following a 1 minus square root curve
+            - 'cosine': smoothly decays learning rate following a cosine curve
+            """,
+        )
+        self.parser.add_argument(
+            "--lr_scheduler.lr_min",
+            type=float,
+            default=0.0,
+            help="""
+            Min lr ratio for lr scheduler.
+
+            If provided, the range of decay factor is scaled from 1 to `lr_min`
+            to ensure the learning rate does not drop below `optimizer.lr * lr_scheduler.lr_min`.
+            """,
+        )
+
         # training configs
         self.parser.add_argument(
-            "--training.dataset", type=str, default="c4_mini", help="Dataset to use"
+            "--training.dataset", type=str, default="c4_test", help="Dataset to use"
         )
         self.parser.add_argument(
             "--training.dataset_path",
@@ -228,12 +341,6 @@ class JobConfig:
             "--training.seq_len", type=int, default=2048, help="Sequence length"
         )
         self.parser.add_argument(
-            "--training.warmup_steps",
-            type=int,
-            default=200,
-            help="Steps for lr scheduler warmup, normally 1/5 of --training.steps",
-        )
-        self.parser.add_argument(
             "--training.max_norm",
             type=Union[float, int],
             default=1.0,
@@ -246,140 +353,10 @@ class JobConfig:
             help="How many train steps to run",
         )
         self.parser.add_argument(
-            "--training.data_parallel_replicate_degree",
-            type=int,
-            default=1,
-            help="""
-            The `data_parallel_replicate_degree` argument specifies the degree of
-            data parallelism for weight replication. When this value is greater
-            than 1, weights will be replicated across `data_parallel_replicate_degree`
-            ranks. If `data_parallel_shard_degree` is also greater than 1, the parallelism
-            method used is HSDP (Hybrid Sharded Data Parallelism). Otherwise, the
-            parallelism method used is DDP (Distributed Data Parallelism).
-            1 means disabled.""",
-        )
-        self.parser.add_argument(
-            "--training.data_parallel_shard_degree",
-            type=int,
-            default=-1,
-            help="""
-            The `data_parallel_shard_degree` argument specifies the degree of data
-            parallelism for weight sharding. When this value is greater than 1, weights
-            will be sharded across `data_parallel_shard_degree` ranks. If
-            `data_parallel_replicate_degree` is also greater than 1, the parallelism
-            method used is HSDP (Hybrid Sharded Data Parallelism).  Otherwise, the
-            parallelism method used is FSDP (Fully Sharded Data Parallelism).
-
-            -1 means leftover ranks will be used (After DP_REPLICATE/SP/PP). Note that
-            only `data_parallel_shard_degree` can be negative. 1 means disabled.""",
-        )
-        self.parser.add_argument(
             "--training.enable_cpu_offload",
             action="store_true",
             help="""
             Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP""",
-        )
-        self.parser.add_argument(
-            "--training.tensor_parallel_degree",
-            type=int,
-            default=1,
-            help="Tensor Parallelism degree. 1 means disabled.",
-        )
-        self.parser.add_argument(
-            "--training.disable_loss_parallel",
-            action="store_true",
-            help="Whether to apply loss parallel when sequence parallel is enabled",
-        )
-        self.parser.add_argument(
-            "--experimental.enable_async_tensor_parallel",
-            action="store_true",
-            help="Whether to apply async tensor parallel (currently only effective when compile is enabled)",
-        )
-        self.parser.add_argument(
-            "--experimental.pipeline_parallel_degree",
-            type=int,
-            default=1,
-            help="""
-                Pipeline Parallelism degree, or number of ranks. 1 means disabled.
-                If using looped schedules, this still specifies the number of physical ranks, not the number
-                of stages.  Stages per rank are inferred from split points degree, and schedule.""",
-        )
-        self.parser.add_argument(
-            "--experimental.pipeline_parallel_split_points",
-            type=string_list,
-            nargs="+",
-            default=[],
-            help="""
-                Specify comma-separated names of modules to use as the beginning of a split point.
-
-                e.g. "layers.0,layers.2" will cause the model to be split into 3 stages,
-                the first containing all the layers up to layers.0,
-                the second containing layers.0 and up to layers.2,
-                the third containing layers.2 and all the remaining layers.
-
-                Note: fully-automated splitting may be enabled in the future,
-                but currently the split points must be specified manually.""",
-        )
-        self.parser.add_argument(
-            "--experimental.pipeline_parallel_schedule",
-            type=str,
-            default="1F1B",
-            help="""
-                Specify the Pipeline Parallel schedule to use. The supported schedules are:
-                https://github.com/pytorch/pytorch/blob/de4c2a3b4e89d96334dc678d1c3f2ae51a6630a0/torch/distributed/pipelining/schedules.py#L2161.
-                The schedule must be compatible with the split points and stages_per_rank.
-
-                Looped schedules (e.g. Interleaved1F1B) require specifying pipeline_parallel_degree = number of ranks,
-                and split_points = number of stages - 1
-                """,
-        )
-        self.parser.add_argument(
-            "--experimental.pipeline_parallel_schedule_csv",
-            type=str,
-            default="",
-            help="""
-                Specify the path to the pipeline parallel schedule csv file to use.
-                The pipeline_parallel_schedule argument must be either
-                PipelineScheduleSingle, PipelineScheduleMulti, or _PipelineScheduleRuntime.
-            """,
-        )
-
-        self.parser.add_argument(
-            "--experimental.pipeline_parallel_microbatches",
-            type=int,
-            default=None,
-            help="""
-                How many microbatches to split the global training batch into when using pipeline parallelism.
-
-                The global training batch size must be evenly divisible by the number of microbatches.
-
-                The default value will be the number of pipeline stages, if unspecified.
-            """,
-        )
-        self.parser.add_argument(
-            "--experimental.enable_compiled_autograd",
-            action="store_true",
-            help="Enable CompiledAutograd to compile the backward.",
-        )
-        self.parser.add_argument(
-            "--experimental.context_parallel_degree",
-            type=int,
-            default=1,
-            help="Context parallelism degree. 1 means disabled.",
-        )
-        self.parser.add_argument(
-            "--experimental.context_parallel_rotate_method",
-            type=str,
-            default="allgather",
-            help="""
-                The collective to use in context parallel SDPA for kv shards exchange.
-
-                'allgather' means to all-gather all kv shards on ranks after the first sub-SDPA computation,
-
-                'alltoall' means to all-to-all shuffle the kv shards.
-
-                The default value is 'allgather'.
-            """,
         )
         self.parser.add_argument(
             "--training.mixed_precision_param",
@@ -423,6 +400,165 @@ class JobConfig:
             action="store_true",
             help="Use deterministic algorithms wherever possible, may be slower",
         )
+
+        # parallelism configs
+        self.parser.add_argument(
+            "--parallelism.data_parallel_replicate_degree",
+            type=int,
+            default=1,
+            help="""
+            The `data_parallel_replicate_degree` argument specifies the degree of
+            data parallelism for weight replication. When this value is greater
+            than 1, weights will be replicated across `data_parallel_replicate_degree`
+            ranks. If `data_parallel_shard_degree` is also greater than 1, the parallelism
+            method used is HSDP (Hybrid Sharded Data Parallelism). Otherwise, the
+            parallelism method used is DDP (Distributed Data Parallelism).
+            1 means disabled.""",
+        )
+        self.parser.add_argument(
+            "--parallelism.enable_compiled_autograd",
+            action="store_true",
+            help="Enable CompiledAutograd to compile the backward.",
+        )
+        self.parser.add_argument(
+            "--parallelism.data_parallel_shard_degree",
+            type=int,
+            default=-1,
+            help="""
+            The `data_parallel_shard_degree` argument specifies the degree of data
+            parallelism for weight sharding. When this value is greater than 1, weights
+            will be sharded across `data_parallel_shard_degree` ranks. If
+            `data_parallel_replicate_degree` is also greater than 1, the parallelism
+            method used is HSDP (Hybrid Sharded Data Parallelism).  Otherwise, the
+            parallelism method used is FSDP (Fully Sharded Data Parallelism).
+
+            -1 means leftover ranks will be used (After DP_REPLICATE/SP/PP). Note that
+            only `data_parallel_shard_degree` can be negative. 1 means disabled.""",
+        )
+        self.parser.add_argument(
+            "--parallelism.fsdp_reshard_after_forward",
+            type=str,
+            default="default",
+            choices=["default", "always", "never"],
+            help="""
+            `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
+            within an FSDP setup. `reshard_after_forward` controls parameter behavior after forward,
+            trading off memory and communication. See torch's `fully_shard` API for more documentation
+            on `reshard_after_forward`.
+            The supported policies include "default", "always" and "never":
+            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal
+              scenarios.
+            - "always" will enable `reshard_after_forward` for all forward passes.
+            - "never" will disable `reshard_after_forward` for all forward passes.
+            """,
+        )
+        self.parser.add_argument(
+            "--parallelism.tensor_parallel_degree",
+            type=int,
+            default=1,
+            help="Tensor Parallelism degree. 1 means disabled.",
+        )
+        self.parser.add_argument(
+            "--parallelism.disable_loss_parallel",
+            action="store_true",
+            help="Whether to apply loss parallel when sequence parallel is enabled",
+        )
+        self.parser.add_argument(
+            "--parallelism.enable_async_tensor_parallel",
+            action="store_true",
+            help="Whether to apply async tensor parallel (currently only effective when compile is enabled)",
+        )
+        self.parser.add_argument(
+            "--parallelism.pipeline_parallel_degree",
+            type=int,
+            default=1,
+            help="""
+                Pipeline Parallelism degree, or number of ranks. 1 means disabled.
+                If using looped schedules, this still specifies the number of physical ranks, not the number
+                of stages.  Stages per rank are inferred from split points degree, and schedule.""",
+        )
+        self.parser.add_argument(
+            "--parallelism.pipeline_parallel_split_points",
+            type=string_list,
+            nargs="+",
+            default=[],
+            help="""
+                Specify comma-separated names of modules to use as the beginning of a split point.
+
+                e.g. "layers.0,layers.2" will cause the model to be split into 3 stages,
+                the first containing all the layers up to layers.0,
+                the second containing layers.0 and up to layers.2,
+                the third containing layers.2 and all the remaining layers.
+
+                Note: fully-automated splitting may be enabled in the future,
+                but currently the split points must be specified manually.""",
+        )
+        self.parser.add_argument(
+            "--parallelism.pipeline_parallel_layers_per_stage",
+            type=int,
+            default=None,
+            help="""
+                The number of layers per stage. If specified, the split points will be calculated from
+                the number of layers and pipeline_parallel_degree. If not specified, the layers per stage will
+                be inferred from the model, schedule, and pipeline_parallel_degree.""",
+        )
+        self.parser.add_argument(
+            "--parallelism.pipeline_parallel_schedule",
+            type=str,
+            default="1F1B",
+            help="""
+                Specify the Pipeline Parallel schedule to use. The supported schedules are:
+                https://github.com/pytorch/pytorch/blob/de4c2a3b4e89d96334dc678d1c3f2ae51a6630a0/torch/distributed/pipelining/schedules.py#L2161.
+                The schedule must be compatible with the split points and stages_per_rank.
+
+                Looped schedules (e.g. Interleaved1F1B) require specifying pipeline_parallel_degree = number of ranks,
+                and split_points = number of stages - 1
+                """,
+        )
+        self.parser.add_argument(
+            "--parallelism.pipeline_parallel_schedule_csv",
+            type=str,
+            default="",
+            help="""
+                Specify the path to the pipeline parallel schedule csv file to use.
+                The pipeline_parallel_schedule argument must be either
+                PipelineScheduleSingle, PipelineScheduleMulti, or _PipelineScheduleRuntime.
+            """,
+        )
+        self.parser.add_argument(
+            "--parallelism.pipeline_parallel_microbatch_size",
+            type=int,
+            default=1,
+            help="""
+                The size of each pipeline parallel microbatch (default 1).
+
+                This value is used to compute the total number of microbatches by dividing batch_size with
+                pipeline_parallel_microbatch_size.
+
+                The global training batch size must be evenly divisible by pipeline_parallel_microbatch_size.
+            """,
+        )
+        self.parser.add_argument(
+            "--parallelism.context_parallel_degree",
+            type=int,
+            default=1,
+            help="Context parallelism degree. 1 means disabled.",
+        )
+        self.parser.add_argument(
+            "--parallelism.context_parallel_rotate_method",
+            type=str,
+            default="allgather",
+            help="""
+                The collective to use in context parallel SDPA for kv shards exchange.
+
+                'allgather' means to all-gather all kv shards on ranks after the first sub-SDPA computation,
+
+                'alltoall' means to all-to-all shuffle the kv shards.
+
+                The default value is 'allgather'.
+            """,
+        )
+
         # checkpointing configs
         self.parser.add_argument(
             "--checkpoint.enable_checkpoint",
@@ -439,16 +575,10 @@ class JobConfig:
             """,
         )
         self.parser.add_argument(
-            "--checkpoint.interval_type",
-            type=str,
-            default="steps",
-            help="Checkpointing interval unit of measurement ['step', 'seconds']",
-        )
-        self.parser.add_argument(
             "--checkpoint.interval",
             type=int,
             default=500,
-            help="Checkpointing interval, in steps or seconds depending on --checkpoint.interval_type",
+            help="Checkpointing interval in steps.",
         )
         self.parser.add_argument(
             "--checkpoint.model_weights_only",
@@ -505,10 +635,12 @@ class JobConfig:
         self.parser.add_argument(
             "--checkpoint.keep_latest_k",
             type=int,
-            default=0,
+            default=10,
             help="""
                 Keeps only the latest k checkpoints, and purging older ones. If 0, keep all checkpoints.
-                0 is the default value.
+                K cannot be 1 as the last one may be in the process of being saved. As a result,
+                the metadata of the last one may not be ready yet. The default value is 10 to avoid
+                filling up the disk.
             """,
         )
         self.parser.add_argument(
@@ -517,6 +649,18 @@ class JobConfig:
             default=-1,
             help="Load the checkpoint at the specified step. If -1, load the latest checkpoint.",
         )
+        self.parser.add_argument(
+            "--checkpoint.exclude_from_loading",
+            type=string_list,
+            nargs="*",
+            default=[],
+            help="""
+                Exclude specific keys from being loaded from the checkpoint.
+                Provide a comma-separated list of keys to exclude, e.g. 'optimizer,lr_scheduler,dataloader'.
+                This will load the model only, excluding the specified keys.
+            """,
+        )
+
         # activation checkpointing configs
         self.parser.add_argument(
             "--activation_checkpoint.mode",
@@ -536,23 +680,14 @@ class JobConfig:
 
         # float8 configs
         self.parser.add_argument(
-            "--float8.enable_float8_linear",
-            action="store_true",
-            help="""
-                If true, swaps `torch.nn.Linear` with `Float8Linear`.
-                This feature requires you to install 'torchao' which can be found
-                here: https://github.com/pytorch/ao
-            """,
-        )
-        self.parser.add_argument(
             "--float8.enable_fsdp_float8_all_gather",
             action="store_true",
-            help="Whether enable float8 all-gather in FSDP",
+            help="Whether enable float8 all-gather in FSDP, recommended for tensorwise scaling",
         )
         self.parser.add_argument(
             "--float8.precompute_float8_dynamic_scale_for_fsdp",
             action="store_true",
-            help="Whether precompute float8 scales dynamically for FSDP",
+            help="Whether precompute float8 scales dynamically for FSDP, recommended for tensorwise scaling",
         )
         self.parser.add_argument(
             "--float8.force_recompute_fp8_weight_in_bwd",
@@ -565,28 +700,25 @@ class JobConfig:
             """,
         )
         self.parser.add_argument(
-            "--float8.scaling_type_input",
+            "--float8.recipe_name",
             type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-            choices=["dynamic", "delayed"],
+            default=None,
+            choices=["tensorwise", "rowwise", "rowwise_with_gw_hp"],
+            help="""
+            If specified, creates float8 config from recipe name, valid choices are
+            `tensorwise`, `rowwise` and `rowwise_with_gw_hp`.
+            """,
         )
         self.parser.add_argument(
-            "--float8.scaling_type_weight",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_grad_output",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-        )
-        self.parser.add_argument(
-            "--float8.use_current_scaling",
-            action="store_true",
-            help="Whether use current scaling in FA kernel",
+            "--float8.filter_fqns",
+            type=string_list,
+            default=[],
+            nargs="+",
+            help="""
+            Comma-separated list of fully qualified names of modules to skip applying float8 training to.
+            nn.Linear modules with any dim size not divisible by 16 are always skipped due to hardware requirements.
+            Example: --float8.module_filter_fqns "attention.wq,attention.wk,attention.wv,output"
+            """,
         )
 
         # communications library settings
@@ -612,7 +744,7 @@ class JobConfig:
             help="Flight recorder ring buffer size, >0 means recording by default, 0 means disabled",
         )
 
-        # memory estimation settings
+        # memory estimation configs
         self.parser.add_argument(
             "--memory_estimation.enabled",
             help="Whether to estimate memory usage for FSDP",
@@ -625,10 +757,103 @@ class JobConfig:
             action="store_true",
         )
 
+        self.parser.add_argument(
+            "--fault_tolerance.enable",
+            action="store_true",
+            help="""
+                Enable TorchFT integration. When TorchFT is enabled, HSDP will be used.
+                And --fault_tolerance.data_parallel_replicate_degree should be 1 and
+                --fault_tolerance.group_size will be used to control the maximum
+                replicate group size as the replicate group size is dynamic.
+
+                Note that this is still an experimental feature.
+            """,
+        )
+
+        # torchft configs
+        self.parser.add_argument(
+            "--fault_tolerance.replica_id",
+            type=int,
+            default=0,
+            help="The TorchFT replica ID of this run.",
+        )
+        self.parser.add_argument(
+            "--fault_tolerance.group_size",
+            type=int,
+            default=0,
+            help="""
+                The number of TorchFT replicate groups. This number will be used for
+                dataloader to split the dataset across the replicate groups and FSDP
+                dimension
+            """,
+        )
+        self.parser.add_argument(
+            "--fault_tolerance.min_replica_size",
+            type=int,
+            default=1,
+            help="The minimum number of FT replica for each step.",
+        )
+
+        self.parser.add_argument(
+            "--experimental.custom_import",
+            type=str,
+            default="",
+            help="""
+            This option enables the importation of external modules.
+            Currently, it only supports dotted import modules (e.g., some_package.model_x).
+            It is the user's responsibility to ensure that the specified path can be
+            successfully imported. One method to achieve this, you can place your module
+            inside the ``torchtitan/torchtitan`` folder and execute ``pip install -e .`` to
+            make it available for import.
+            """,
+        )
+
+        self.parser.add_argument(
+            "--experimental.custom_args_module",
+            type=str,
+            default="",
+            help="""
+                This option allows users to extend TorchTitan's existing JobConfig by importing
+                a customized module. Similar to ``--experimental.custom_model_path``, the user
+                needs to ensure that the path can be imported. The module should contain exactly
+                one public function and the function has the signature
+                ``def func(parser: argparse.ArgumentParser) -> None:``. The user can use the
+                given parser to add new argument by calling``parser.add_argument``, as wish.
+            """,
+        )
+
+        self._is_parsed = False
+        self._allow_unkown_args = False
+
+    def maybe_add_custom_args(self) -> None:
+        """Add custom arguments to the parser if --experimental.custom_args_module is set.
+
+        Note: This function should be called before the parser is used to parse arguments.
+        """
+        if self._is_parsed:
+            raise RuntimeError(
+                "JobConfig has already been parsed. We could not add new arguments."
+            )
+
+        self._allow_unkown_args = True
+        self.parse_args(sys.argv[1:])
+        self._allow_unkown_args = False
+
+        if self.experimental.custom_args_module:
+            module = importlib.import_module(self.experimental.custom_args_module)
+            public_functions = [
+                name
+                for name, func in inspect.getmembers(module)
+                if inspect.isfunction(func) and not name.startswith("_")
+            ]
+            func = getattr(module, public_functions[0])
+            func(self.parser)
+
     def to_dict(self):
         return self.args_dict
 
     def parse_args(self, args_list: list = sys.argv[1:]):
+        self._is_parsed = True
         args, cmd_args = self.parse_args_from_command_line(args_list)
         config_file = getattr(args, "job.config_file", None)
         # build up a two level dict
@@ -646,18 +871,11 @@ class JobConfig:
                 logger.exception(f"Error details: {str(e)}")
                 raise e
 
+        # Checking string-list arguments are properly split into a list
         # if split-points came from 'args' (from cmd line) it would have already been parsed into a list by that parser
-        if (
-            "experimental" in args_dict
-            and "pipeline_parallel_split_points" in args_dict["experimental"]
-            and isinstance(
-                args_dict["experimental"]["pipeline_parallel_split_points"], str
-            )
-        ):
-            exp = args_dict["experimental"]
-            exp["pipeline_parallel_split_points"] = string_list(
-                exp["pipeline_parallel_split_points"]
-            )
+        string_list_argnames = self._get_string_list_argument_names()
+        for n in string_list_argnames:
+            check_string_list_argument(args_dict, n)
 
         # override args dict with cmd_args
         cmd_args_dict = self._args_to_two_level_dict(cmd_args)
@@ -680,10 +898,28 @@ class JobConfig:
         return args_dict
 
     def _validate_config(self) -> None:
-        # TODO: Add more mandatory validations
-        assert self.model.name
-        assert self.model.flavor
-        assert self.model.tokenizer_path
+        # TODO: temporary mitigation of BC breaking change in
+        #       tokenizer default path, need to remove later
+        if not os.path.exists(self.model.tokenizer_path):
+            logger.warning(
+                f"Tokenizer path {self.model.tokenizer_path} does not exist!"
+            )
+            old_tokenizer_path = (
+                "torchtitan/datasets/tokenizer/original/tokenizer.model"
+            )
+            if os.path.exists(old_tokenizer_path):
+                self.model.tokenizer_path = old_tokenizer_path
+                logger.warning(
+                    f"Temporarily switching to previous default tokenizer path {old_tokenizer_path}. "
+                    "Please update your config."
+                )
+
+    def _get_string_list_argument_names(self) -> list[str]:
+        """Get the parser argument names of type `string_list`."""
+        string_list_args = [
+            v.dest for v in self.parser._actions if v.type is string_list
+        ]
+        return string_list_args
 
     def parse_args_from_command_line(
         self, args_list
@@ -691,7 +927,11 @@ class JobConfig:
         """
         Parse command line arguments and return the parsed args and the command line only args
         """
-        args = self.parser.parse_args(args_list)
+        if self._allow_unkown_args:
+            args, _ = self.parser.parse_known_args(args_list)
+        else:
+            args = self.parser.parse_args(args_list)
+        string_list_argnames = set(self._get_string_list_argument_names())
 
         # aux parser to parse the command line only args, with no defaults from main parser
         aux_parser = argparse.ArgumentParser(argument_default=argparse.SUPPRESS)
@@ -700,7 +940,7 @@ class JobConfig:
                 aux_parser.add_argument(
                     "--" + arg, action="store_true" if val else "store_false"
                 )
-            elif arg == "experimental.pipeline_parallel_split_points":
+            elif arg in string_list_argnames:
                 # without this special case, type inference breaks here,
                 # since the inferred type is just 'list' and it ends up flattening
                 # e.g. from ["layers.0", "layers.1"] into ["l", "a", "y", "e", "r", "s", ".0", ...]

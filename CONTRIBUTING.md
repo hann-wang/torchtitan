@@ -39,13 +39,15 @@ under the LICENSE file in the root directory of this source tree.
 
 ## Contributing Guidelines
 
+Note: To accelerate contributions to and innovations around `torchtitan`, we are adding a new, experimental folder [`torchtitan/experiments`](torchtitan/experiments/), which has its own [Contributing Guidelines](torchtitan/experiments/README.md#contributing-guidelines). The content below is for the core portions of `torchtitan`.
+
 ### Principles of contribution
 
 - Apply PyTorch-native training techniques.
-  - The technique should be of general interests for distributed training.
+  - The technique should be of general interest for distributed training.
   - A technique with moderate to large complexity should be sitting in the proper repo (e.g. pytorch/pytorch for a new parallelism, or pytorch/data for a new data loader) instead of `torchtitan`.
-  - The main branch of `torchtitan` should have minimal dependency on non-PyTorch libraries. Interesting models/techniques that depend on external libraries can be demonstrated in forks of `torchtitan`.
-- Aim for minimum (if not zero) code change to the model. For the Llama model in `torchtitan`, if one has to make (justifiable) model change:
+  - The main branch of `torchtitan` should have minimal dependencies on non-PyTorch libraries. Interesting models/techniques that depend on external libraries can be demonstrated in the `experiments` folder, or in forks of `torchtitan`.
+- Aim for minimal (if not zero) code change to the model. For the Llama model in `torchtitan`, if one has to make justifiable model change(s):
   - After the model change, it should still load the original checkpoint correctly.
   - Document the reasons for the code change, similar to [composability.md](docs/composability.md).
 - Keep code modularized, especially for [train.py](train.py), so that it remains easy to copy-paste into a minimal code example. If necessary:
@@ -73,7 +75,7 @@ When appropriate, one should consider
 
 - Adding CPU/GPU unit/integration tests.
   - To add a unit test, put it in the [tests](tests/) folder and follow the existing test files.
-  - To add a GPU integration test, create a new `OverrideDefinitions` in [integration_tests.py](tests/integration_tests.py). It will override the default config to run on the [debug model](train_configs/debug_model.toml).
+  - To add a GPU integration test, create a new `OverrideDefinitions` in [integration_tests.py](tests/integration_tests.py). It will override the default config to run on the Llama 3 [debug model](torchtitan/models/llama/train_configs/debug_model.toml).
 - Updating [README](README.md) and writing a new note in the [docs](docs/) folder on installation and usage, similar to [float8.md](docs/float8.md).
 - Updating [performance.md](docs/performance.md) with new performance results.
 - Creating GitHub issues for things that cannot be addressed at the moment.
