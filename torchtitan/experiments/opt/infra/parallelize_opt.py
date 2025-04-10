@@ -32,8 +32,8 @@ from torch.distributed.tensor.parallel import (
 )
 
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
-from torchtitan.logging import logger
-from torchtitan.parallelisms.parallel_dims import ParallelDims
+from torchtitan.tools.logging import logger
+from torchtitan.distributed import ParallelDims
 
 
 def parallelize_opt(
@@ -45,7 +45,7 @@ def parallelize_opt(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if job_config.training.compile:
-        model = apply_compile(model)
+        apply_compile(model)
 
     if (parallel_dims.dp_shard_enabled or parallel_dims.cp_enabled
         ):  # apply FSDP or HSDP, potentially with Context Parallel
@@ -100,10 +100,6 @@ def apply_compile(model: nn.Module):
     for layer_id, transformer_block in enumerate(model.model.decoder.layers):
         transformer_block = torch.compile(transformer_block, fullgraph=True)
         model.model.decoder.layers[layer_id] = transformer_block
-
-    # logger.info("Compiling the model with torch.compile")
-    # model = torch.compile(model, fullgraph=True)
-    return model
 
 
 def apply_fsdp(

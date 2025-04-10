@@ -6,3 +6,4 @@
 
 import torchtitan.experiments.llama4  # noqa: F401
 import torchtitan.experiments.simple_fsdp  # noqa: F401
+import torchtitan.experiments.opt  # noqa: F401

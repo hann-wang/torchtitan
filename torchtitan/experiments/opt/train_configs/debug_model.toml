@@ -1,26 +1,29 @@
 # torchtitan Config.toml
-# NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./opt-125m-fp8-outputs"
-description = "OPT-125m FP8 training"
+dump_folder = "./outputs"
+description = "OPT-125m debug training"
+print_args = false
+use_for_integration_test = true
 
 [profiling]
 enable_profiling = false
 save_traces_folder = "profile_trace"
-profile_freq = 100
+profile_freq = 10
+enable_memory_snapshot = false
+save_memory_snapshot_folder = "memory_snapshot"
 
 [metrics]
-log_freq = 10
+log_freq = 1
 disable_color_printing = false
-enable_tensorboard = true
+enable_tensorboard = false
 save_tb_folder = "tb"
 enable_wandb = false
 
 [model]
 name = "opt"
 flavor = "125m"
-norm_type = "layernorm"  # layernorm / np_layernorm / rmsnorm / fused_rmsnorm
+norm_type = "dynamic_tanh"  # layernorm / np_layernorm / rmsnorm / fused_rmsnorm / dynamic_tanh
 path = "/workspace/hf_home/hub/models--facebook--opt-125m/snapshots/27dcfa74d334bc871f3234de431e71c6eeba5dd6"
 tokenizer_path = "/workspace/hf_home/hub/models--facebook--opt-125m/snapshots/27dcfa74d334bc871f3234de431e71c6eeba5dd6"
 converters = "float8"
@@ -28,19 +31,21 @@ converters = "float8"
 [optimizer]
 name = "AdamW"
 lr = 8e-4
+eps = 1e-8
+
+[lr_scheduler]
+warmup_steps = 2  # lr scheduler warm up, normally 20% of the train steps
+decay_ratio = 0.8  # lr scheduler decay ratio, 80% of the train steps
+decay_type = "linear"
+lr_min = 0.0
 
 [training]
-batch_size = 32
+batch_size = 8
 seq_len = 2048
-warmup_steps = 200  # lr scheduler warm up
 max_norm = 1.0  # grad norm clipping
-steps = 1000
-data_parallel_replicate_degree = 1
-data_parallel_shard_degree = -1
-tensor_parallel_degree = 1
+steps = 10
 compile = true
-dataset = "c4"
-converters = "float8"
+dataset = "c4_test"  # supported datasets: c4_test (2K), c4 (177M)
 
 [parallelism]
 data_parallel_replicate_degree = 1
@@ -54,15 +59,14 @@ context_parallel_degree = 1
 [checkpoint]
 enable_checkpoint = false
 folder = "checkpoint"
-interval_type = "steps"
-interval = 500
+interval = 10
 model_weights_only = false
 export_dtype = "float32"
-async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
+async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
 mode = 'none'  # ['none', 'selective', 'full']
-selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
+selective_ac_option = '2'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
 enable_fsdp_float8_all_gather = false

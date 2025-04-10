@@ -217,7 +217,7 @@ class AttentionFlashAttention2(Attention):
 
     """
 
-    def __init__(self, model_args: ModelArgs):
+    def __init__(self, model_args: TransformerModelArgs):
         super().__init__(model_args)
         self.descale_q = self.descale_k = self.descale_v = None
         self.use_fp8 = False

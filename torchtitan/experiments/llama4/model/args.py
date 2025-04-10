@@ -6,7 +6,7 @@
 
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Iterable
 
 from torch import nn
 from torchtitan.components.tokenizer import Tokenizer
@@ -14,7 +14,6 @@ from torchtitan.config_manager import JobConfig
 
 from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
-
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):

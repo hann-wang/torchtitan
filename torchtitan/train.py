@@ -13,6 +13,8 @@ from typing import Any, Generator, Iterable, Optional
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
+from transformers import AutoConfig
+
 import torchtitan.components.ft as ft
 import torchtitan.protocols.train_spec as train_spec_module
 
@@ -31,12 +33,6 @@ from torchtitan.tools.profiling import (
     maybe_enable_profiling,
 )
 
-
-@torch.no_grad
-def convert_model_to_bfloat16(model: torch.nn.Module) -> None:
-    ori_device = model.freqs_cis.device
-    model.to(torch.bfloat16)
-    model.freqs_cis = model._precompute_freqs_cis().to(ori_device)
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     job_config: JobConfig
@@ -81,13 +77,19 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.gc_handler = utils.GarbageCollection(gc_freq=job_config.training.gc_freq)
 
         device_module, device_type = utils.device_module, utils.device_type
-        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+        self.is_distributed = 'LOCAL_RANK' in os.environ and 'WORLD_SIZE' in os.environ
+
+        if self.is_distributed:
+            self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
+            world_size = int(os.environ["WORLD_SIZE"])
+        else:
+            self.device = torch.device(f"{device_type}:0")
+            world_size = 1
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
         ft_manager = ft.init_ft_manager(job_config)
 
         # init distributed
-        world_size = int(os.environ["WORLD_SIZE"])
         parallelism_config = job_config.parallelism
         if not ft_manager.enabled:
             self.parallel_dims = parallel_dims = ParallelDims(
@@ -110,10 +112,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 enable_loss_parallel=not parallelism_config.disable_loss_parallel,
                 ft_manager=ft_manager,
             )
-        dist_utils.init_distributed(job_config)
+        if self.is_distributed:
+            dist_utils.init_distributed(job_config)
 
-        # build meshes
-        self.world_mesh = world_mesh = parallel_dims.build_mesh(device_type=device_type)
+            # build meshes
+            self.world_mesh = world_mesh = parallel_dims.build_mesh(device_type=device_type)
+        else:
+            self.world_mesh = world_mesh = None
+
         if parallel_dims.dp_enabled:
             dp_mesh = world_mesh["dp"]
             dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
@@ -152,14 +158,26 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # build model (using meta init)
         model_cls = self.train_spec.cls
         model_args = self.train_spec.config[job_config.model.flavor]
-        # set the model args from training job configs
-        model_args.update_from_config(job_config, tokenizer)
+        if not job_config.model.path:
+            # set the model args from training job configs
+            model_args.update_from_config(job_config, tokenizer)
+            logger.info(
+                f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
+            )
+            with torch.device("meta"):
+                model = model_cls.from_model_args(model_args)
 
-        logger.info(
-            f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
-        )
-        with torch.device("meta"):
-            model = model_cls.from_model_args(model_args)
+        else:
+            logger.info(
+                f"Building HF Transformers model with {job_config.model.path}"
+            )
+            hf_config = AutoConfig.from_pretrained(job_config.model.path)
+            hf_config._attn_implementation = "flash_attention_2"
+            hf_config.pad_token_id = None
+            hf_config.torch_dtype = torch.bfloat16
+            model_args.update_from_config(hf_config)
+            with torch.device("meta"):
+                model = model_cls(hf_config)
 
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
@@ -230,7 +248,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 m.to_empty(device=init_device)
                 with torch.no_grad():
                     m.init_weights(buffer_device=buffer_device)
-                    convert_model_to_bfloat16(model)
+                    utils.convert_model_to_bfloat16(model)
                 m.train()
 
             # confirm that user will be able to view loss metrics on the console
@@ -243,8 +261,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             model.to_empty(device=init_device)
             with torch.no_grad():
-                model.init_weights(buffer_device=buffer_device)
-                convert_model_to_bfloat16(model)
+                if not job_config.model.path:
+                    model.init_weights(buffer_device=buffer_device)
+                else:
+                    utils.reset_params(model)
+                    model.init_weights()
+                utils.convert_model_to_bfloat16(model)
             model.train()
 
             self.model_parts = [model]
@@ -369,6 +391,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
                 pred = model_parts[0](inputs)
+                if hasattr(pred, "logits"):
+                    pred = pred.logits
                 loss = self.loss_fn(pred, labels)
                 # need to free to before bwd to avoid peaking memory
                 del pred
@@ -433,7 +457,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)
-                if self.step == 1:
+                if self.is_distributed and self.step == 1:
                     dist_utils.set_pg_timeouts(
                         timeout=timedelta(
                             seconds=job_config.comm.train_timeout_seconds
@@ -441,7 +465,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         world_mesh=self.world_mesh,
                     )
 
-        if torch.distributed.get_rank() == 0:
+        if not self.is_distributed or torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
             time.sleep(2)
 

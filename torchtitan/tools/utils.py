@@ -143,3 +143,19 @@ def check_if_feature_in_pytorch(
             f"{min_nightly_version}. Please upgrade a newer version to include the "
             f"change in ({pull_request_link}) for correct {feature_name}."
         )
+
+
+def reset_params(mod: torch.nn.Module):
+    if hasattr(mod, "reset_parameters"):
+        mod.reset_parameters()
+    for cmod in mod.children():
+        reset_params(cmod)
+
+
+@torch.no_grad
+def convert_model_to_bfloat16(model: torch.nn.Module) -> None:
+    if hasattr(model, "freqs_cis"):
+        ori_device = model.freqs_cis.device
+    model.to(torch.bfloat16)
+    if hasattr(model, "freqs_cis"):
+        model.freqs_cis = model._precompute_freqs_cis().to(ori_device)
