@@ -28,6 +28,7 @@ from transformers.triton_flash_attention_fp8_block import block_scaling_node
 
 USE_CLIP = False
 USE_HADAMARD = False
+USE_SDPA = True
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -390,15 +391,35 @@ class AttentionFlashAttention2(Attention):
                 is_causal=True,
             )
         else:
-            xk = repeat_kv(xk, self.n_rep)
-            xv = repeat_kv(xv, self.n_rep)
-            output = F.scaled_dot_product_attention(
-                xq.transpose(1, 2),
-                xk.transpose(1, 2),
-                xv.transpose(1, 2),
-                dropout_p=0.0,
-                is_causal=True,
-            ).transpose(1, 2)
+            if USE_SDPA:
+                xk = repeat_kv(xk, self.n_rep)
+                xv = repeat_kv(xv, self.n_rep)
+                output = F.scaled_dot_product_attention(
+                    xq.transpose(1, 2),
+                    xk.transpose(1, 2),
+                    xv.transpose(1, 2),
+                    dropout_p=0.0,
+                    is_causal=True,
+                ).transpose(1, 2)
+            else:
+                output = _flash_attention_forward(
+                    xq_hp,
+                    xk_hp,
+                    xv_hp,
+                    xq,
+                    xk,
+                    xv,
+                    None,
+                    seqlen,
+                    descale_q=descale_q,
+                    descale_k=descale_k,
+                    descale_v=descale_v,
+                    position_ids=None,
+                    dropout=0.0,
+                    sliding_window=None,
+                    use_top_left_mask=False,
+                    is_causal=True,
+                )
 
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)
