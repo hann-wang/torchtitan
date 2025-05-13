@@ -2,7 +2,7 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./llama3-8b-fp8-refactor-outputs"
+dump_folder = "./llama3-8b-fp8-splitdqdkdv-outputs"
 description = "Llama 3 8B training"
 
 [profiling]

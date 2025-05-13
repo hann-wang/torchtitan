@@ -24,7 +24,7 @@ from transformers.modeling_flash_attention_utils import _flash_attention_forward
 from transformers.triton_hadamard_transform import hadamard_transform
 from transformers.triton_rope import rope_with_scaling_qk
 from transformers.outlier_clipping import clip_outlier
-from transformers.triton_flash_attention_fp8_block import block_scaling_node
+from transformers.triton_flash_attention_fp8_block import block_scaling_node, FIXED_BLOCK_M, FIXED_BLOCK_N
 
 USE_CLIP = False
 USE_HADAMARD = False
@@ -361,8 +361,8 @@ class AttentionFlashAttention2(Attention):
             xk_hp = xk
             with torch.no_grad():
                 if self.use_fp8_fa_block_scales:
-                    xq, descale_q = block_scaling_node(xq)
-                    xk, descale_k = block_scaling_node(xk)
+                    xq, descale_q = block_scaling_node(xq, FIXED_BLOCK_M)
+                    xk, descale_k = block_scaling_node(xk, FIXED_BLOCK_N)
                 else:
                     descale_q = 240. / xq_hp.abs().max()
                     xq = check_and_convert(xq_hp, descale_q)

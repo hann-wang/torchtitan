@@ -2,16 +2,16 @@
 # NOTE: this toml config is a preset for 64 A100 GPUs.
 
 [job]
-dump_folder = "./outputs"
+dump_folder = "./llama3-70b-bf16-splitdqdkdv-tp2-outputs"
 description = "Llama 3 70B training"
 
 [profiling]
-enable_profiling = true
+enable_profiling = false
 save_traces_folder = "profile_trace"
 profile_freq = 100
 
 [metrics]
-log_freq = 10
+log_freq = 1
 enable_tensorboard = true
 save_tb_folder = "tb"
 
@@ -31,7 +31,7 @@ eps = 1e-8
 warmup_steps = 200  # lr scheduler warm up, normally 20% of the train steps
 
 [training]
-batch_size = 8
+batch_size = 3
 seq_len = 8192
 max_norm = 1.0  # grad norm clipping
 steps = 1000
@@ -41,20 +41,21 @@ dataset = "c4"
 [parallelism]
 data_parallel_replicate_degree = 1
 data_parallel_shard_degree = -1
-tensor_parallel_degree = 8  # 8-way TP
+tensor_parallel_degree = 2
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
 
 [checkpoint]
-enable_checkpoint = false
+enable_checkpoint = true
 folder = "checkpoint"
-interval = 500
+interval = 300
 model_weights_only = false
 export_dtype = "bfloat16"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = 'full'
+mode = 'selective'  # ['none', 'selective', 'full']
+selective_ac_option = '1'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
 enable_fsdp_float8_all_gather = false
