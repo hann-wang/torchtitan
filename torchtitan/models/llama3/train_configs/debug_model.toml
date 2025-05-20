@@ -23,10 +23,9 @@ enable_wandb = false
 [model]
 name = "llama3"
 flavor = "debugmodel"
-norm_type = "rmsnorm"  # layernorm / np_layernorm / rmsnorm
 # test tokenizer.model, for debug purpose only
 tokenizer_path = "./tests/assets/test_tiktoken.model"
-converters = "float8"
+# converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
@@ -71,6 +70,6 @@ selective_ac_option = '2'  # 'int' = ac every positive int layer or 'op', ac bas
 [float8]
 enable_fsdp_float8_all_gather = false
 precompute_float8_dynamic_scale_for_fsdp = false
-filter_fqns = "output"
+filter_fqns = ["output"]
 enable_fp8_fa = true
 fp8_fa_granularity = "blockwise"

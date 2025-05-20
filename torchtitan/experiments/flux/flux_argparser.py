@@ -4,39 +4,53 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import argparse
-
-import torch
+from dataclasses import dataclass, field
 
 
-def extend_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--training.guidance",
-        type=float,
-        default=3.5,
-        help="guidance value used for guidance distillation",
+@dataclass
+class Training:
+    classifer_free_guidance_prob: float = 0.0
+    """Classifier-free guidance with probability p to dropout the text conditioning"""
+    img_size: int = 256
+    """Image width to sample"""
+
+
+@dataclass
+class Encoder:
+    t5_encoder: str = "google/t5-v1_1-small"
+    """T5 encoder to use, HuggingFace model name. This field could be either a local folder path,
+        or a Huggingface repo name."""
+    clip_encoder: str = "openai/clip-vit-large-patch14"
+    """Clip encoder to use, HuggingFace model name. This field could be either a local folder path,
+        or a Huggingface repo name."""
+    autoencoder_path: str = (
+        "torchtitan/experiments/flux/assets/autoencoder/ae.safetensors"
     )
-    parser.add_argument(
-        "--encoder.t5_encoder",
-        type=str,
-        default="google/t5-v1_1-small",
-        help="T5 encoder to use, HuggingFace model name.",
-    )
-    parser.add_argument(
-        "--encoder.clip_encoder",
-        type=str,
-        default="openai/clip-vit-large-patch14",
-        help="Clip encoder to use, HuggingFace model name.",
-    )
-    parser.add_argument(
-        "--encoder.encoder_dtype",
-        type=torch.dtype,
-        default=torch.bfloat16,
-        help="Which dtype to load for autoencoder. ",
-    )
-    parser.add_argument(
-        "--encoder.max_t5_encoding_len",
-        type=int,
-        default=512,
-        help="Maximum length of the T5 encoding.",
-    )
+    """Autoencoder checkpoint path to load. This should be a local path referring to a safetensors file."""
+    max_t5_encoding_len: int = 512
+    """Maximum length of the T5 encoding."""
+
+
+@dataclass
+class Eval:
+    enable_classifer_free_guidance: bool = False
+    """Whether to use classifier-free guidance during sampling"""
+    classifier_free_guidance_scale: float = 5.0
+    """Classifier-free guidance scale when sampling"""
+    denoising_steps: int = 50
+    """How many denoising steps to sample when generating an image"""
+    eval_freq: int = 100
+    """Frequency of evaluation/sampling during training"""
+    save_img_folder: str = "img"
+    """Directory to save image generated/sampled from the model"""
+
+
+@dataclass
+class JobConfig:
+    """
+    Extend the tyro parser with custom config classe for Flux model.
+    """
+
+    training: Training = field(default_factory=Training)
+    encoder: Encoder = field(default_factory=Encoder)
+    eval: Eval = field(default_factory=Eval)

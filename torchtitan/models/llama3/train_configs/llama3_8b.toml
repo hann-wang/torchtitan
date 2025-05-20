@@ -19,9 +19,8 @@ enable_wandb = false
 [model]
 name = "llama3"
 flavor = "8B"
-norm_type = "rmsnorm"  # layernorm / np_layernorm / rmsnorm
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
-converters = "float8"
+# converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
@@ -61,6 +60,6 @@ selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac ba
 [float8]
 enable_fsdp_float8_all_gather = false
 precompute_float8_dynamic_scale_for_fsdp = false
-filter_fqns = "output"
+filter_fqns = ["output"]
 enable_fp8_fa = true
 fp8_fa_granularity = "blockwise"
