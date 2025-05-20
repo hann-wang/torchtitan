@@ -111,18 +111,24 @@ def pipeline_llama_manual_split(
             model.tok_embeddings = None
 
         drop_layers = start_layer is not None
-        for name in list(model.layers.keys()):
+        layers = model.layers if hasattr(model,
+                                         "layers") else model.model.layers
+        for name in list(layers.keys()):
             # we keep layers in a contiguous region between start (inclusive) and stop (exclusive)
             if f"layers.{name}" == start_layer:
                 drop_layers = False
             if f"layers.{name}" == stop_layer:
                 drop_layers = True
             if drop_layers:
-                del model.layers[name]
+                del layers[name]
 
         if not is_last:
-            model.norm = None
-            model.output = None
+            if hasattr(model, "norm"):
+                model.norm = None
+            if hasattr(model, "output"):
+                model.output = None
+            if hasattr(model, "lm_head"):
+                model.lm_head = None
 
         stage = PipelineStage(
             model,
