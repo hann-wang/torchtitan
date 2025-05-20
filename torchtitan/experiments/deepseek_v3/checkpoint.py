@@ -24,6 +24,7 @@ PARAM_MAPPING = {
     r"\.mlp\.router\.gate\.weight$": ".mlp.gate.weight",
     # r"\.mlp\.expert_bias": ".mlp.gate.e_score_correction_bias",
     ".shared_expert.": ".shared_experts.",
+    r"^model.tok_embeddings": "model.embed_tokens",
 }
 
 EXPERT_WEIGHT_MAPPING = {

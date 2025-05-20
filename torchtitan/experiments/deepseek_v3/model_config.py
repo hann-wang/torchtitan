@@ -187,12 +187,12 @@ class ModelArgs(BaseModelArgs):
         nparams_dense = 0
 
         for name, p in model.named_parameters():
-            if "embed" in name:
+            if "embedding" in name:
                 nparams_embedding += p.numel()
                 nparams_dense += p.numel()
-            elif "mlp.shared_experts" in name:
+            elif "mlp.shared_expert" in name:
                 nparams_shared_expert += p.numel()
-            elif "mlp.gate" in name:
+            elif "mlp.router" in name:
                 nparams_moe_router += p.numel()
             elif "mlp.experts" in name:
                 nparams_experts += p.numel()

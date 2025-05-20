@@ -291,9 +291,10 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
 
 def apply_ac(model: nn.Module, ac_config):
     """Apply activation checkpointing to the model."""
-    for layer_id, transformer_block in model.layers.named_children():
+    layers = model.layers if hasattr(model, "layers") else model.model.layers
+    for layer_id, transformer_block in layers.named_children():
         transformer_block = _apply_ac_to_transformer_block(transformer_block, ac_config)
-        model.layers.register_module(layer_id, transformer_block)
+        layers.register_module(layer_id, transformer_block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
 
@@ -303,9 +304,10 @@ def apply_compile(model: nn.Module):
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    for layer_id, transformer_block in model.layers.named_children():
+    layers = model.layers if hasattr(model, "layers") else model.model.layers
+    for layer_id, transformer_block in layers.named_children():
         transformer_block = torch.compile(transformer_block, fullgraph=True)
-        model.layers.register_module(layer_id, transformer_block)
+        layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
 
@@ -341,7 +343,8 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    for layer_id, transformer_block in model.layers.items():
+    layers = model.layers if hasattr(model, "layers") else model.model.layers
+    for layer_id, transformer_block in layers.items():
         if reshard_after_forward_policy == "always":
             reshard_after_forward = True
         elif reshard_after_forward_policy == "never":
@@ -354,7 +357,7 @@ def apply_fsdp(
             else:
                 # As an optimization, do not reshard after forward for the last
                 # transformer block since FSDP would prefetch it immediately
-                reshard_after_forward = int(layer_id) < len(model.layers) - 1
+                reshard_after_forward = int(layer_id) < len(layers) - 1
         else:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."

@@ -40,15 +40,8 @@ from torch import nn
 import torch.distributed as dist
 
 from torchtitan.experiments.llama4.model.moe import MoE as Llama4MoE, GroupedExperts, TokenChoiceTopKRouter
-from attn_mask_utils import _prepare_4d_causal_attention_mask
-from model_config import ModelArgs
-
-
-# Get model parallel subgroup by name:
-# e.g. "pp", "ep", None
-def get_group(dim_name: Optional[str] = None) -> dist.ProcessGroup:
-    glob = torch.distributed.device_mesh._mesh_resources.get_current_mesh()
-    return glob.get_group(dim_name)
+from torchtitan.experiments.deepseek_v3.attn_mask_utils import _prepare_4d_causal_attention_mask
+from torchtitan.experiments.deepseek_v3.model_config import ModelArgs
 
 
 class MoE(Llama4MoE):
@@ -66,10 +59,14 @@ class MoE(Llama4MoE):
             num_experts=num_experts,
             use_grouped_mm=self.use_grouped_mm,
         )
+        assert model_args.scoring_func in ["sigmoid", "softmax"]
         self.router = TokenChoiceTopKRouter(
             dim=dim,
             num_experts=num_experts,
             top_k=model_args.num_experts_per_tok,
+            use_sigmoid=model_args.scoring_func == "sigmoid",
+            norm_topk_prob=model_args.norm_topk_prob,
+            routed_scaling_factor=model_args.routed_scaling_factor,
         )
         # self.shared_expert = (GroupedExperts(
         #     dim=dim,
@@ -103,20 +100,6 @@ class MoE(Llama4MoE):
         #       would conflict with activation checkpointing
         if self.load_balance_coeff is not None and self.load_balance_coeff > 0:
             self.register_full_backward_hook(self._update_expert_bias)
-
-class RMSNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(self, hidden_states):
-        input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -394,6 +377,9 @@ class MLP(nn.Module):
         down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
         return down_proj
 
+    def init_weights(self, *args, **kwargs):
+        pass
+
 
 class Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
@@ -425,7 +411,7 @@ class Attention(nn.Module):
             self.q_a_proj = nn.Linear(
                 self.hidden_size, config.q_lora_rank, bias=config.attention_bias
             )
-            self.q_a_layernorm = RMSNorm(config.q_lora_rank)
+            self.q_a_layernorm = nn.RMSNorm(config.q_lora_rank)
             self.q_b_proj = nn.Linear(
                 config.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
             )
@@ -435,7 +421,7 @@ class Attention(nn.Module):
             config.kv_lora_rank + config.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank)
+        self.kv_a_layernorm = nn.RMSNorm(config.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
             config.kv_lora_rank,
             self.num_heads
@@ -599,10 +585,11 @@ class DecoderLayer(nn.Module):
             )
             else MLP(config)
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
+        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self.weight_init_std = config.initializer_range
 
     def forward(
         self,
@@ -728,7 +715,7 @@ class DeepseekModel(torch.nn.Module):
         ), f"Stage {config.stage_idx} is not in the model"
         print(f"Creating model stage {config.stage_idx} of {config.num_stages}")
 
-        self.embed_tokens = (
+        self.tok_embeddings = (
             nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
             if config.stage_idx == 0
             else None
@@ -751,7 +738,7 @@ class DeepseekModel(torch.nn.Module):
             self.layers[str(layer_id)] = DecoderLayer(config, layer_id)
 
         self.norm = (
-            RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             if config.stage_idx == config.num_stages - 1
             else None
         )
@@ -769,6 +756,10 @@ class DeepseekModel(torch.nn.Module):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, MoE):
+            module.init_weights(std)
+        elif hasattr(module, "reset_parameters"):
+            module.reset_parameters()
 
     def forward(
         self,
@@ -778,7 +769,7 @@ class DeepseekModel(torch.nn.Module):
     ) -> torch.Tensor:
         # Embedding
         hidden_states = (
-            self.embed_tokens(tokens) if self.embed_tokens is not None else tokens
+            self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         )
 
         # decoder layers
@@ -909,3 +900,49 @@ class DeepseekForCausalLM(torch.nn.Module):
                 ),
             )
         return reordered_past
+
+    @classmethod
+    def from_model_args(cls,
+                        model_args: ModelArgs) -> "DeepseekForCausalLM":
+        """
+        Initialize a DeepseekForCausalLM model from a ModelArgs object.
+
+        Args:
+            model_args (ModelArgs): Model configuration arguments.
+
+        Returns:
+            DeepseekForCausalLM: DeepseekForCausalLM model.
+
+        """
+        return cls(model_args)
+
+    def init_weights(
+        self,
+        buffer_device: torch.device | None = None,
+    ):
+        """
+        [Note: On ``init_weights`` vs. ``reset_parameters``]
+        Modules may define ``reset_parameters`` to initialize parameter values.
+        ``reset_parameters`` is meant to only initialize directly owned
+        parameters/buffers, not those of their child modules, and it can be
+        used to give the initial values for these tensors.
+        Separately, users may want custom initialization for their modules,
+        different from that in ``reset_parameters``. For this, we define
+        ``init_weights``. We only call it in the constructor of this
+        ``Transformer`` root module to avoid reinitializing tensors.
+        """
+
+        buffer_device = buffer_device or next(self.parameters()).device
+        if self.model.tok_embeddings is not None:
+            nn.init.normal_(self.model.tok_embeddings.weight)
+        self.model.apply(self.model._init_weights)
+        final_out_std = self.lm_head.weight.shape[-1]**-0.5
+        cutoff_factor = 3
+        if self.lm_head is not None:
+            nn.init.trunc_normal_(
+                self.lm_head.weight,
+                mean=0.0,
+                std=final_out_std,
+                a=-cutoff_factor * final_out_std,
+                b=cutoff_factor * final_out_std,
+            )

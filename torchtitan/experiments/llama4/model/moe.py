@@ -112,12 +112,16 @@ class TokenChoiceTopKRouter(nn.Module):
         num_experts: int,
         top_k: int,
         use_sigmoid: bool = False,
+        norm_topk_prob: bool = False,
+        routed_scaling_factor: float | None = None,
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.num_experts = num_experts
         self.top_k = top_k
         self.use_sigmoid = use_sigmoid
+        self.norm_topk_prob = norm_topk_prob
+        self.routed_scaling_factor = routed_scaling_factor
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor = None
@@ -152,6 +156,13 @@ class TokenChoiceTopKRouter(nn.Module):
             dim=1,
         )
         top_scores = scores.gather(dim=1, index=selected_experts_indices)
+
+        # norm gate to sum 1
+        if self.top_k > 1 and self.norm_topk_prob:
+            denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
+            top_scores = top_scores / denominator
+        if self.routed_scaling_factor is not None:
+            top_scores = top_scores * self.routed_scaling_factor
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         num_local_tokens_per_expert = torch.histc(
@@ -338,12 +349,15 @@ class MoE(nn.Module):
     def init_weights(
         self,
         init_std: float,
-        buffer_device: torch.device,
+        buffer_device: torch.device | None = None,
     ):
         self.experts.init_weights(init_std)
         self.router.init_weights(init_std)
         if self.shared_expert is not None:
             self.shared_expert.init_weights(init_std)
+            
+        if buffer_device is None:
+            buffer_device = next(self.router.parameters()).device
 
         with torch.device(buffer_device):
             self.expert_bias = torch.zeros(
