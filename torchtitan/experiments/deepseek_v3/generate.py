@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 from torchtitan.tools.utils import Color
 
 # Uncomment the model you want to run.
-model_id, mesh_shape = "deepseek-ai/DeepSeek-V2-Lite-Chat", (1, 4)
+model_id, mesh_shape = "deepseek-ai/DeepSeek-V2-Lite-Chat", (1, 1)
 # model_id, mesh_shape = "deepseek-ai/deepseek-v3", (8, 4)
 
 
@@ -131,18 +131,22 @@ def create_model(dist_config: DistConfig):
 
     with dist_config.device, dist_config.mesh:
         model = DeepseekForCausalLM(model_args)
+        model.to(torch.bfloat16)
     load_weights_from_hf(model, model_id, dist_config.device)
     model.eval()
-    model.setup_symm_mem(torch.bfloat16, dist_config.device)
+    #model.setup_symm_mem(torch.bfloat16, dist_config.device)
 
-    stage = PipelineStage(
-        model,
-        dist_config.pp_rank,
-        dist_config.pp_size,
-        dist_config.device,
-        group=dist_config.pp_mesh.get_group(),
-    )
-    pp_schedule = ScheduleGPipe(stage, dist_config.pp_size)
+    if dist_config.pp_size > 1:
+        stage = PipelineStage(
+            model,
+            dist_config.pp_rank,
+            dist_config.pp_size,
+            dist_config.device,
+            group=dist_config.pp_mesh.get_group(),
+        )
+        pp_schedule = ScheduleGPipe(stage, dist_config.pp_size)
+    else:
+        pp_schedule = None
     return model, pp_schedule
 
 
@@ -153,12 +157,12 @@ def create_dist_config(mesh: DeviceMesh):
 
     dist_config = DistConfig(
         mesh=mesh,
-        pp_mesh=mesh["pp"],
-        ep_mesh=mesh["ep"],
-        pp_rank=mesh["pp"].get_local_rank(),
-        pp_size=mesh["pp"].size(),
-        ep_size=mesh["ep"].size(),
-        ep_rank=mesh["ep"].get_local_rank(),
+        pp_mesh=None,
+        ep_mesh=None,
+        pp_rank=0,
+        pp_size=1,
+        ep_size=1,
+        ep_rank=0,
         device=device,
     )
     return dist_config
@@ -375,7 +379,7 @@ if __name__ == "__main__":
     ]
 
     generate(model, pp_schedule, tokenizer, dist_config, messages)
-    generate_with_cuda_graph(model, tokenizer, dist_config, messages)
+    #generate_with_cuda_graph(model, tokenizer, dist_config, messages)
 
     if rank == 0:
         print(f"\n{color.yellow}Closing inference mesh...{color.reset}")

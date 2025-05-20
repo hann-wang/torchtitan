@@ -147,7 +147,9 @@ class TokenChoiceTopKRouter(nn.Module):
         # NOTE: The expert_bias is only used for routing. The gating value
         #       top_scores is still derived from the original scores.
         _, selected_experts_indices = torch.topk(
-            scores + expert_bias, k=self.top_k, dim=1
+            scores + expert_bias,
+            k=self.top_k,
+            dim=1,
         )
         top_scores = scores.gather(dim=1, index=selected_experts_indices)
 
@@ -172,8 +174,14 @@ class TokenChoiceTopKRouter(nn.Module):
 
 
 class MoE(nn.Module):
-    def __init__(self, model_args: TransformerModelArgs):
+
+    def __init__(
+        self,
+        model_args: TransformerModelArgs,
+        scoring_before_experts: bool = True,
+    ):
         super().__init__()
+        self.scoring_before_experts = scoring_before_experts
         dim = model_args.dim
         hidden_dim = 4 * model_args.dim
         ffn_dim_multiplier = model_args.ffn_dim_multiplier
@@ -271,9 +279,10 @@ class MoE(nn.Module):
             dim=0,
             index=token_indices,
         )
-        routed_input = (routed_input.to(torch.float32) * top_scores.reshape(-1, 1)).to(
-            x.dtype
-        )
+        if self.scoring_before_experts:
+            routed_input = (routed_input.to(torch.float32) * top_scores.reshape(-1, 1)).to(
+                x.dtype
+            )
 
         if self.use_grouped_mm:
             # NOTE: In order to use torch._grouped_mm, we need to make sure
@@ -306,10 +315,13 @@ class MoE(nn.Module):
             routed_input = routed_input[permuted_indices, :]
         else:
             # NOTE: this would incur a synchronization between device and host
-            num_local_tokens_per_expert = num_local_tokens_per_expert.tolist()
+            if num_local_tokens_per_expert is not None:
+                num_local_tokens_per_expert = num_local_tokens_per_expert.tolist()
 
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(routed_input, num_local_tokens_per_expert)
+        if not self.scoring_before_experts:
+            routed_output = (routed_output * top_scores.reshape(-1, 1)).to(x.dtype)
 
         # shared expert
         if self.shared_expert is not None:

@@ -5,10 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-
+from torch import nn
+from torchtitan.components.tokenizer import Tokenizer
+from torchtitan.config_manager import JobConfig
+from torchtitan.protocols.train_spec import BaseModelArgs
+from torchtitan.tools.logging import logger
 
 @dataclass
-class ModelArgs:
+class ModelArgs(BaseModelArgs):
     r"""
     This is the configuration class to store the configuration of a [`DeepseekV3Model`]. It is used to instantiate an DeepSeek
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -156,6 +160,74 @@ class ModelArgs:
     # Added for pipeline parallel
     num_stages: int = 1
     stage_idx: int = 0
+    use_grouped_mm: bool = False
+    load_balance_coeff: float | None = 1e-3
+
+    def update_from_config(self, job_config: JobConfig,
+                           tokenizer: Tokenizer) -> None:
+        self.vocab_size = tokenizer.n_words
+        self.max_seq_len = job_config.training.seq_len
+        self.eos_id = tokenizer.eos_id
+
+        if job_config.activation_checkpoint.mode == "selective" and self.use_flex_attn:
+            raise ValueError(
+                "FlexAttention is not compatible with selective AC yet. "
+                "See https://github.com/pytorch/pytorch/issues/147879")
+
+        if job_config.parallelism.context_parallel_degree > 1 and self.use_flex_attn:
+            raise ValueError("FlexAttention is not compatible with CP yet. "
+                             "We are still working on this.")
+
+    def get_nparams_and_flops(self, model: nn.Module,
+                              seq_len: int) -> tuple[int, float]:
+        nparams_embedding = 0
+        nparams_moe_router = 0
+        nparams_shared_expert = 0
+        nparams_experts = 0
+        nparams_dense = 0
+
+        for name, p in model.named_parameters():
+            if "embed" in name:
+                nparams_embedding += p.numel()
+                nparams_dense += p.numel()
+            elif "mlp.shared_experts" in name:
+                nparams_shared_expert += p.numel()
+            elif "mlp.gate" in name:
+                nparams_moe_router += p.numel()
+            elif "mlp.experts" in name:
+                nparams_experts += p.numel()
+            else:
+                nparams_dense += p.numel()
+
+        nparams_sparse = nparams_moe_router + nparams_shared_expert + nparams_experts
+        nparams = nparams_dense + nparams_sparse
+        nparams_sparse_active = (
+            nparams_moe_router + nparams_shared_expert +
+            nparams_experts * self.num_experts_per_tok // self.n_routed_experts)
+
+        logger.info(
+            f"Total parameter count: dense {nparams_dense:,}, "
+            f"sparse {nparams_sparse:,}, active {nparams_dense + nparams_sparse_active:,}"
+        )
+
+        l, h, q, t = (
+            self.num_hidden_layers,
+            self.num_attention_heads,
+            self.hidden_size // self.num_attention_heads,
+            seq_len,
+        )
+        # Reasoning behind the factor of 12 for the self-attention part of the formula:
+        # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
+        # 2. the flash attention does 1 more matmul recomputation in the backward
+        #    but recomputation should not be counted in calculating MFU           (+0)
+        # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
+        # 4. we follow the convention and do not account for sparsity in causal attention
+        num_flops_per_token = (
+            6 * (nparams_dense - nparams_embedding + nparams_sparse_active) +
+            12 * l * h * q * t)
+
+        return nparams, num_flops_per_token
+
 
 
 # This is the configuration for deepseek-ai/DeepSeek-V2-Lite.
