@@ -120,8 +120,7 @@ def combine_expert_weights(
                 w = state_dict[sd_key]
                 w.data[expert_id, :, :] = expert_weights[k].T
         updated_states.add(key)
-        updated_states.add(f"{sd_key_prefix}.tokens_per_expert")
-        updated_states.add(f"{sd_key_prefix}.expert_bias")
+
 
 def load_safetensor_weights(
     model: torch.nn.Module,

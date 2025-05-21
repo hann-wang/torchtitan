@@ -161,7 +161,7 @@ class ModelArgs(BaseModelArgs):
     num_stages: int = 1
     stage_idx: int = 0
     use_grouped_mm: bool = False
-    load_balance_coeff: float | None = 1e-3
+    load_balance_coeff: float | None = None
 
     @property
     def n_layers(self) -> int:

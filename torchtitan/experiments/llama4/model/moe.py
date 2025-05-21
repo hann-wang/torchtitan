@@ -114,6 +114,7 @@ class TokenChoiceTopKRouter(nn.Module):
         use_sigmoid: bool = False,
         norm_topk_prob: bool = False,
         routed_scaling_factor: float | None = None,
+        topk_method: str = "balanced",
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
@@ -122,6 +123,7 @@ class TokenChoiceTopKRouter(nn.Module):
         self.use_sigmoid = use_sigmoid
         self.norm_topk_prob = norm_topk_prob
         self.routed_scaling_factor = routed_scaling_factor
+        self.topk_method = topk_method
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor = None
@@ -147,15 +149,26 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             scores = F.softmax(scores.to(torch.float32), dim=1)
 
-        # top scores shape (bs*slen, top_k)
-        # NOTE: The expert_bias is only used for routing. The gating value
-        #       top_scores is still derived from the original scores.
-        _, selected_experts_indices = torch.topk(
-            scores + expert_bias,
-            k=self.top_k,
-            dim=1,
-        )
-        top_scores = scores.gather(dim=1, index=selected_experts_indices)
+        match self.topk_method:
+            case "greedy":
+                top_scores, selected_experts_indices = torch.topk(
+                    scores,
+                    k=self.top_k,
+                    dim=1,
+                )
+            case "balanced":
+                _, selected_experts_indices = torch.topk(
+                    scores + expert_bias,
+                    k=self.top_k,
+                    dim=1,
+                )
+                # top scores shape (bs*slen, top_k)
+                # NOTE: The expert_bias is only used for routing. The gating value
+                #       top_scores is still derived from the original scores.
+                top_scores = scores.gather(dim=1, index=selected_experts_indices)
+            case _:
+                raise ValueError(f"Unknown topk method: {self.topk_method}")
+
 
         # norm gate to sum 1
         if self.top_k > 1 and self.norm_topk_prob:
@@ -201,6 +214,7 @@ class MoE(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
 
         num_experts = model_args.num_experts
+        self.topk_method = model_args.topk_method
 
         hidden_dim_denom = 1
         if model_args.auto_scale_hidden_dim:
@@ -218,7 +232,10 @@ class MoE(nn.Module):
             use_grouped_mm=self.use_grouped_mm,
         )
         self.router = TokenChoiceTopKRouter(
-            dim=dim, num_experts=num_experts, top_k=model_args.top_k
+            dim=dim,
+            num_experts=num_experts,
+            top_k=model_args.top_k,
+            topk_method=self.topk_method,
         )
         self.shared_expert = (
             GroupedExperts(
@@ -233,23 +250,26 @@ class MoE(nn.Module):
 
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
-        # the fields below are defined even when load_balance_coeff is None
-        # to make initialization and checkpointing code simpler
-        self.register_buffer(
-            "expert_bias",
-            torch.zeros(num_experts, dtype=torch.float32),
-            persistent=True,
-        )
-        self.register_buffer(
-            "tokens_per_expert",
-            torch.zeros(num_experts, dtype=torch.float32),
-            persistent=True,
-        )
+        if self.topk_method == "balanced":
+            # the fields below are defined even when load_balance_coeff is None
+            # to make initialization and checkpointing code simpler
+            self.register_buffer(
+                "expert_bias",
+                torch.zeros(num_experts, dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "tokens_per_expert",
+                torch.zeros(num_experts, dtype=torch.float32),
+                persistent=True,
+            )
 
-        # NOTE: forward hook, forward pre hook, or backward pre hook
-        #       would conflict with activation checkpointing
-        if self.load_balance_coeff is not None and self.load_balance_coeff > 0:
-            self.register_full_backward_hook(self._update_expert_bias)
+            # NOTE: forward hook, forward pre hook, or backward pre hook
+            #       would conflict with activation checkpointing
+            if self.load_balance_coeff is not None and self.load_balance_coeff > 0:
+                self.register_full_backward_hook(self._update_expert_bias)
+        else:
+            self.expert_bias = None
 
     def _update_expert_bias(self, *_):
         expert_bias_delta = self.load_balance_coeff * torch.sign(
@@ -278,8 +298,9 @@ class MoE(nn.Module):
             num_local_tokens_per_expert,
         ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
 
-        # will be used to update the expert bias for load balancing
-        self.tokens_per_expert += num_local_tokens_per_expert
+        if self.topk_method == "balanced":
+            # will be used to update the expert bias for load balancing
+            self.tokens_per_expert += num_local_tokens_per_expert
 
         # shape (bs*slen*top_k, dim)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
@@ -355,14 +376,15 @@ class MoE(nn.Module):
         self.router.init_weights(init_std)
         if self.shared_expert is not None:
             self.shared_expert.init_weights(init_std)
-            
+
         if buffer_device is None:
             buffer_device = next(self.router.parameters()).device
 
         with torch.device(buffer_device):
-            self.expert_bias = torch.zeros(
-                self.experts.num_experts, dtype=torch.float32
-            )
-            self.tokens_per_expert = torch.zeros(
-                self.experts.num_experts, dtype=torch.float32
-            )
+            if self.topk_method == "balanced":
+                self.expert_bias = torch.zeros(
+                    self.experts.num_experts, dtype=torch.float32
+                )
+                self.tokens_per_expert = torch.zeros(
+                    self.experts.num_experts, dtype=torch.float32
+                )

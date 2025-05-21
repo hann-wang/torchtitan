@@ -56,6 +56,7 @@ class TransformerModelArgs(BaseModelArgs):
     top_k: int = 1
     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
     load_balance_coeff: float | None = 1e-3
+    topk_method: str = "balanced"
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         self.vocab_size = tokenizer.n_words
