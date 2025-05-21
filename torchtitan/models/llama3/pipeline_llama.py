@@ -108,7 +108,10 @@ def pipeline_llama_manual_split(
     ) -> tuple[PipelineStage, nn.Module]:
         model = copy.deepcopy(whole_model)
         if not is_first:
-            model.tok_embeddings = None
+            if hasattr(model, "tok_embeddings"):
+                model.tok_embeddings = None
+            else:
+                model.model.tok_embeddings = None
 
         drop_layers = start_layer is not None
         layers = model.layers if hasattr(model,
@@ -125,6 +128,8 @@ def pipeline_llama_manual_split(
         if not is_last:
             if hasattr(model, "norm"):
                 model.norm = None
+            else:
+                model.model.norm = None
             if hasattr(model, "output"):
                 model.output = None
             if hasattr(model, "lm_head"):

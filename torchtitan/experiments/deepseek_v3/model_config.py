@@ -163,6 +163,10 @@ class ModelArgs(BaseModelArgs):
     use_grouped_mm: bool = False
     load_balance_coeff: float | None = 1e-3
 
+    @property
+    def n_layers(self) -> int:
+        return self.num_hidden_layers
+
     def update_from_config(self, job_config: JobConfig,
                            tokenizer: Tokenizer) -> None:
         self.vocab_size = tokenizer.n_words
