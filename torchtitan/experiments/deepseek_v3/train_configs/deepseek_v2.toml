@@ -69,6 +69,6 @@ mode = "full"  # ['none', 'selective', 'full']
 [float8]
 enable_fsdp_float8_all_gather = false
 precompute_float8_dynamic_scale_for_fsdp = false
-filter_fqns = ["lm_head", "router.gate"]
+filter_fqns = ["output", "router.gate", "self_attn.q_a_proj", "self_attn.q_b_proj", "self_attn.kv_a_proj_with_mqa", "self_attn.kv_b_proj"]
 enable_fp8_fa = true
 fp8_fa_granularity = "blockwise"

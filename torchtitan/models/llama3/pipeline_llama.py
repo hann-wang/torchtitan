@@ -130,10 +130,7 @@ def pipeline_llama_manual_split(
                 model.norm = None
             else:
                 model.model.norm = None
-            if hasattr(model, "output"):
-                model.output = None
-            if hasattr(model, "lm_head"):
-                model.lm_head = None
+            model.output = None
 
         stage = PipelineStage(
             model,

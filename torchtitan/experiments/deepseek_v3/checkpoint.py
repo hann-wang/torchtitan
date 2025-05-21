@@ -21,10 +21,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SAFETENSOR_FILE_NAME = "model.safetensors.index.json"
 
 PARAM_MAPPING = {
-    r"\.mlp\.router\.gate\.weight$": ".mlp.gate.weight",
-    # r"\.mlp\.expert_bias": ".mlp.gate.e_score_correction_bias",
-    ".shared_expert.": ".shared_experts.",
+    r"\.moe\.router\.gate\.weight$": ".mlp.gate.weight",
+    # r"\.mlp\.expert_bias": ".mlp.gate.e_score_correction_bias","
+    "moe.shared_expert.w1": "mlp.shared_experts.gate_proj.weight",
+    "moe.shared_expert.w2": "mlp.shared_experts.down_proj.weight",
+    "moe.shared_expert.w3": "mlp.shared_experts.up_proj.weight",
+    ".moe.": ".mlp.",
+    ".feed_forward.": ".mlp.",
     r"^model.tok_embeddings": "model.embed_tokens",
+    r"^output": "lm_head",
 }
 
 EXPERT_WEIGHT_MAPPING = {
@@ -101,21 +106,22 @@ def combine_expert_weights(
 ) -> None:
     for key in state_dict.keys():
         try:
-            key_prefix = re.search(r"^(.+?)\.experts\.", key).group(1)
+            sd_key_prefix = re.search(r"^(.+?)\.experts\.", key).group(1)
+            hf_key_prefix = sd_key_prefix.replace(".moe", ".mlp")
         except AttributeError:
             continue
         for k in expert_weights.keys():
-            if k.startswith(key_prefix):
+            if k.startswith(hf_key_prefix):
                 k_splitted = k.split(".")
                 expert_id = int(k_splitted[5])
                 weight_name = k_splitted[-2]
                 sd_weight_name = EXPERT_WEIGHT_MAPPING[weight_name]
-                sd_key = f"{key_prefix}.experts.{sd_weight_name}"
+                sd_key = f"{sd_key_prefix}.experts.{sd_weight_name}"
                 w = state_dict[sd_key]
                 w.data[expert_id, :, :] = expert_weights[k].T
         updated_states.add(key)
-        updated_states.add(f"{key_prefix}.tokens_per_expert")
-        updated_states.add(f"{key_prefix}.expert_bias")
+        updated_states.add(f"{sd_key_prefix}.tokens_per_expert")
+        updated_states.add(f"{sd_key_prefix}.expert_bias")
 
 def load_safetensor_weights(
     model: torch.nn.Module,
@@ -147,7 +153,9 @@ def load_safetensor_weights(
                 replaced = True
                 break
         if re.search(".experts.", param):
-            key_prefix = re.search(r"^(.+?)\.experts\.", param).group(0)
+            hf_param_name = param.replace(".moe.", ".mlp.")
+            key_prefix = re.search(r"^(.+?)\.experts\.",
+                                   hf_param_name).group(0)
             for k in weight_map.keys():
                 if k.startswith(key_prefix):
                     hf_keys.append(k)
@@ -175,12 +183,15 @@ def load_safetensor_weights(
                 continue
             sd_key = param_key_reverse_mapping.get(key, key)
             # Check shape
-            if model_state_dict[sd_key].shape != checkpoint[key].shape:
+            hf_tensor = checkpoint[key]
+            if ".shared_experts." in key:
+                hf_tensor = hf_tensor.T.unsqueeze(0).contiguous()
+            if model_state_dict[sd_key].shape != hf_tensor.shape:
                 raise ValueError(
                     f"Shape mismatch for {key}: "
                     f"model needs {model_state_dict[sd_key].shape}, but "
-                    f"checkpoint has {checkpoint[key].shape}")
-            model_state_dict[sd_key] = checkpoint[key].to(device)
+                    f"checkpoint has {hf_tensor.shape}")
+            model_state_dict[sd_key] = hf_tensor.to(device)
             updated_states.add(sd_key)
 
     combine_expert_weights(

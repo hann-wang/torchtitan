@@ -7,6 +7,15 @@
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor.parallel import (
+    parallelize_module,
+    PrepareModuleInputOutput,
+    PrepareModuleInput,
+    ColwiseParallel,
+    RowwiseParallel,
+    SequenceParallel,
+)
 
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
@@ -16,7 +25,6 @@ from torchtitan.models.llama3.parallelize_llama import (
     apply_compile,
     apply_ddp,
     apply_fsdp,
-    apply_tp,
 )
 from torchtitan.tools.logging import logger
 
@@ -128,12 +136,12 @@ def parallelize_deepseek(
                                          group=dp_mesh.get_group())
 
         for transformer_block in model.model.layers.values():
-            if isinstance(transformer_block.mlp, MoE):
-                load_balance_coeff = transformer_block.mlp.load_balance_coeff
+            if transformer_block.moe is not None:
+                load_balance_coeff = transformer_block.moe.load_balance_coeff
                 if load_balance_coeff is not None and load_balance_coeff > 0:
                     # prepend=True so that the sync runs before
                     # the _update_expert_bias hook in MoE
-                    transformer_block.mlp.register_full_backward_hook(
+                    transformer_block.moe.register_full_backward_hook(
                         _sync_tokens_per_expert, prepend=True)
                 else:
                     break
@@ -145,19 +153,13 @@ def apply_moe_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
 ):
-    from torch.distributed.tensor import Partial, Replicate, Shard
-    from torch.distributed.tensor.parallel import (
-        parallelize_module,
-        PrepareModuleInputOutput,
-    )
-
     from torchtitan.experiments.llama4.infra.expert_parallel import NoParallel, TensorParallel
 
     for transformer_block in model.model.layers.values():
         moe_layer_plan = {
             # input / output sharding on the seqlen dim
             # all-gather for input, reduce-scatter for output
-            "mlp":
+            "moe":
             PrepareModuleInputOutput(
                 input_layouts=(Shard(1), ),
                 desired_input_layouts=(Replicate(), ),
@@ -166,12 +168,12 @@ def apply_moe_tp(
                 desired_output_layouts=(Shard(1), ),
             ),
             # replicate computation for the router
-            "mlp.router.gate":
+            "moe.router.gate":
             NoParallel(),
             # input Replicate, output Partial
-            "mlp.experts":
+            "moe.experts":
             TensorParallel(output_layout=Partial()),
-            "mlp.shared_expert":
+            "moe.shared_expert":
             TensorParallel(output_layout=Partial()),
         }
         parallelize_module(
@@ -179,3 +181,122 @@ def apply_moe_tp(
             device_mesh=tp_mesh,
             parallelize_plan=moe_layer_plan,
         )
+
+
+def apply_tp(
+    model: nn.Module,
+    tp_mesh: DeviceMesh,
+    loss_parallel: bool,
+    enable_float8_tensorwise_tp: bool,
+    enable_async_tp: bool,
+):
+    """Apply tensor parallelism."""
+    # 1. Parallelize the embedding and shard its outputs (which are the first
+    # transformer block's inputs)
+    # 2. Parallelize the root norm layer over the sequence dim
+    # 3. Parallelize the final linear output layer
+
+    from torchtitan.experiments.llama4.infra.expert_parallel import NoParallel, TensorParallel
+
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "model.tok_embeddings":
+            RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "model.norm":
+            SequenceParallel(),
+            "output":
+            ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1) if loss_parallel else Replicate(),
+                use_local_output=not loss_parallel,
+            ),
+        },
+    )
+
+    # Parallel styles used for transformer block linear weights and their
+    # inputs may be different for float8 linears with tensorwise scaling.
+    if enable_float8_tensorwise_tp:
+        # TODO(vkuzo): add the items below to __init__.py of torchao.float8 and import from there
+        from torchao.float8.float8_tensor_parallel import (
+            Float8ColwiseParallel,
+            Float8RowwiseParallel,
+            PrepareFloat8ModuleInput,
+        )
+
+        rowwise_parallel, colwise_parallel, prepare_module_input = (
+            Float8RowwiseParallel,
+            Float8ColwiseParallel,
+            PrepareFloat8ModuleInput,
+        )
+    else:
+        rowwise_parallel, colwise_parallel, prepare_module_input = (
+            RowwiseParallel,
+            ColwiseParallel,
+            PrepareModuleInput,
+        )
+
+    # Apply tensor + sequence parallelism to every transformer block
+    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
+    #       by folding (and unfolding) the batch dimension and the sequence dimension.
+    #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
+    layers = model.layers if hasattr(model, "layers") else model.model.layers
+    for transformer_block in layers.values():
+        layer_plan = {
+            "input_layernorm":
+            SequenceParallel(),
+            "post_attention_layernorm":
+            SequenceParallel(),
+            "self_attn":
+            prepare_module_input(
+                input_layouts=(Shard(1), None, None),
+                desired_input_layouts=(Replicate(), None, None),
+            ),
+            "self_attn.q_proj":
+            colwise_parallel(),
+            "self_attn.q_a_proj":
+            NoParallel(),
+            "self_attn.q_a_layernorm":
+            NoParallel(),
+            "self_attn.q_b_proj":
+            ColwiseParallel(),
+            "self_attn.kv_a_proj_with_mqa":
+            NoParallel(),
+            "self_attn.kv_a_layernorm":
+            NoParallel(),
+            "self_attn.kv_b_proj":
+            ColwiseParallel(),
+            "self_attn.o_proj":
+            rowwise_parallel(output_layouts=Shard(1)),
+            "feed_forward":
+            prepare_module_input(
+                input_layouts=(Shard(1), ),
+                desired_input_layouts=(Replicate(), ),
+            ),
+            "feed_forward.gate_proj":
+            colwise_parallel(),
+            "feed_forward.down_proj":
+            rowwise_parallel(output_layouts=Shard(1)),
+            "feed_forward.up_proj":
+            colwise_parallel(),
+        }
+
+        parallelize_module(
+            module=transformer_block,
+            device_mesh=tp_mesh,
+            parallelize_plan=layer_plan,
+        )
+
+    if enable_async_tp:
+        from torch.distributed._symmetric_memory import enable_symm_mem_for_group
+
+        torch._inductor.config._micro_pipeline_tp = True
+        enable_symm_mem_for_group(tp_mesh.get_group().group_name)
+
+    logger.info(
+        f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}{'Async ' if enable_async_tp else ''}"
+        "Tensor Parallelism to the model")

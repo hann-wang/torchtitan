@@ -236,7 +236,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 m.to_empty(device=init_device)
                 with torch.no_grad():
                     m.init_weights(buffer_device=buffer_device)
-                    utils.convert_model_to_bfloat16(model)
+                    utils.convert_model_to_bfloat16(m)
                 m.train()
 
             # confirm that user will be able to view loss metrics on the console

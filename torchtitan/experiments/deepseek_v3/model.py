@@ -68,18 +68,13 @@ class MoE(Llama4MoE):
             norm_topk_prob=model_args.norm_topk_prob,
             routed_scaling_factor=model_args.routed_scaling_factor,
         )
-        # self.shared_expert = (GroupedExperts(
-        #     dim=dim,
-        #     hidden_dim=hidden_dim,
-        #     num_experts=model_args.n_shared_experts,
-        #     use_grouped_mm=self.use_grouped_mm,
-        # ) if model_args.n_shared_experts else None)
-        if model_args.n_shared_experts is not None:
-            intermediate_size = model_args.moe_intermediate_size * model_args.n_shared_experts
-            self.shared_expert = MLP(config=model_args,
-                                      intermediate_size=intermediate_size)
-        else:
-            self.shared_expert = None
+
+        self.shared_expert = (GroupedExperts(
+            dim=dim,
+            hidden_dim=hidden_dim * model_args.n_shared_experts,
+            num_experts=1,
+            use_grouped_mm=self.use_grouped_mm,
+        ) if model_args.n_shared_experts else None)
 
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
@@ -515,7 +510,8 @@ class Attention(nn.Module):
             q = self.q_proj(hidden_states)
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+        q = q.view(bsz, q_len, -1, self.q_head_dim).transpose(1, 2)
+        current_num_heads = q.shape[1]
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
@@ -527,7 +523,7 @@ class Attention(nn.Module):
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
         kv = (
             self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
-            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            .view(bsz, q_len, -1, self.qk_nope_head_dim + self.v_head_dim)
             .transpose(1, 2)
         )
 
@@ -540,11 +536,13 @@ class Attention(nn.Module):
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
-        query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        query_states = k_pe.new_empty(bsz, current_num_heads, q_len,
+                                      self.q_head_dim)
         query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
         query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
 
-        key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+        key_states = k_pe.new_empty(bsz, current_num_heads, q_len,
+                                    self.q_head_dim)
         key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
         key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
 
@@ -576,7 +574,8 @@ class Attention(nn.Module):
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+        attn_output = attn_output.reshape(bsz, q_len,
+                                          current_num_heads * self.v_head_dim)
         attn_output = self.o_proj(attn_output)
 
         return attn_output
@@ -589,15 +588,15 @@ class DecoderLayer(nn.Module):
 
         self.self_attn = Attention(config=config, layer_idx=layer_idx)
 
-        self.mlp = (
-            MoE(config)
-            if (
-                config.n_routed_experts is not None
+        if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0
-            )
-            else MLP(config)
-        )
+                and layer_idx % config.moe_layer_freq == 0):
+            self.moe = MoE(config)
+            self.feed_forward = None
+        else:
+            self.moe = None
+            self.feed_forward = MLP(config)
+
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -623,16 +622,19 @@ class DecoderLayer(nn.Module):
 
         # Self Attention
         hidden_states = self.self_attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
+            hidden_states,
+            attention_mask,
+            position_ids,
         )
         hidden_states = residual + hidden_states
 
         # Fully Connected
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if self.moe is not None:
+            hidden_states = self.moe(hidden_states)
+        else:
+            hidden_states = self.feed_forward(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -803,7 +805,7 @@ class DeepseekForCausalLM(torch.nn.Module):
     def __init__(self, config):
         super().__init__()
         self.model = DeepseekModel(config)
-        self.lm_head = (
+        self.output = (
             nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             if config.stage_idx == config.num_stages - 1
             else None
@@ -817,6 +819,7 @@ class DeepseekForCausalLM(torch.nn.Module):
         tokens: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        input_batch: Optional[torch.Tensor] = None,
     ) -> Tuple:
         r"""
         Example:
@@ -842,7 +845,7 @@ class DeepseekForCausalLM(torch.nn.Module):
         )
 
         logits = (
-            self.lm_head(hidden_states) if self.lm_head is not None else hidden_states
+            self.output(hidden_states) if self.output is not None else hidden_states
         )
         return logits
 
@@ -949,11 +952,11 @@ class DeepseekForCausalLM(torch.nn.Module):
         if self.model.tok_embeddings is not None:
             nn.init.normal_(self.model.tok_embeddings.weight)
         self.model.apply(self.model._init_weights)
-        final_out_std = self.lm_head.weight.shape[-1]**-0.5
         cutoff_factor = 3
-        if self.lm_head is not None:
+        if self.output is not None:
+            final_out_std = self.output.weight.shape[-1]**-0.5
             nn.init.trunc_normal_(
-                self.lm_head.weight,
+                self.output.weight,
                 mean=0.0,
                 std=final_out_std,
                 a=-cutoff_factor * final_out_std,
