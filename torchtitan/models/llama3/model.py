@@ -350,9 +350,9 @@ class AttentionFlashAttention2(Attention):
             # assert freqs_cis.shape == (
             #     1, seqlen, xq.shape[-1]
             # ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
-
+            # assert FIXED_BLOCK_M == FIXED_BLOCK_N
             # xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
-            #     xq, xk, freqs_cis.real, freqs_cis.imag, 64)
+            #     xq, xk, freqs_cis.real, freqs_cis.imag, FIXED_BLOCK_M, "bshd")
 
             xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
             if USE_CLIP:
