@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor, Partial
 
-from grouped_gemm.ops import GroupedGemm
+from .grouped_mm_utils import gmm
 
 from .args import TransformerModelArgs
 
@@ -86,7 +86,6 @@ class GroupedExperts(nn.Module):
             # h = h * torch._grouped_mm(x, self.w3, offs=offsets)
             # out = torch._grouped_mm(h, self.w2, offs=offsets)
 
-            gmm_func = GroupedGemm.apply
             device_mesh = None
             if isinstance(x, DTensor):
                 device_mesh = x.device_mesh
@@ -99,11 +98,11 @@ class GroupedExperts(nn.Module):
                 w1 = self.w1
                 w2 = self.w2
                 w3 = self.w3
-            num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(dtype=torch.int64, device="cpu")
-            h = F.silu(gmm_func(x, w1, num_local_tokens_per_expert_cpu,
-                                False))
-            h = h * gmm_func(x, w3, num_local_tokens_per_expert_cpu, False)
-            out = gmm_func(h, w2, num_local_tokens_per_expert_cpu, False)
+            num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
+                dtype=torch.int64, device="cpu")
+            h = F.silu(gmm(x, w1, num_local_tokens_per_expert_cpu))
+            h = h * gmm(x, w3, num_local_tokens_per_expert_cpu)
+            out = gmm(h, w2, num_local_tokens_per_expert_cpu)
             if device_mesh is not None:
                 out = DTensor.from_local(
                     out,

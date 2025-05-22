@@ -23,7 +23,7 @@ enable_wandb = false
 
 [model]
 name = "DeepSeek"
-flavor = "V2-Lite"
+flavor = "debugmodel"
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
 # converters = ["float8"]
 
@@ -43,9 +43,9 @@ lr_min = 0.0
 batch_size = 2
 seq_len = 4096
 max_norm = 1.0  # grad norm clipping
-steps = 1000
+steps = 10
 compile = false
-dataset = "c4"
+dataset = "c4_test"
 
 [parallelism]
 data_parallel_replicate_degree = 1
@@ -57,7 +57,7 @@ context_parallel_degree = 1
 enable_compiled_autograd = false
 
 [checkpoint]
-enable_checkpoint = true
+enable_checkpoint = false
 folder = "checkpoint"
 interval = 250
 model_weights_only = false
