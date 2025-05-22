@@ -18,8 +18,8 @@ import torch.distributed as dist
 from checkpoint import load_weights_from_hf
 from model import DeepseekForCausalLM
 from model_config import deepseek_config_registry
-from torch.distributed import DeviceMesh, get_process_group_ranks
-from torch.distributed.pipelining import PipelineStage, ScheduleGPipe
+from torch.distributed import get_process_group_ranks
+from torch.distributed.tensor import DTensor
 from transformers import AutoTokenizer
 
 import torchtitan.protocols.train_spec as train_spec_module
@@ -223,8 +223,10 @@ def generate(
                 pp_schedule.step(x)
             elif pp_has_last_stage:
                 preds = pp_schedule.step()
+                if isinstance(preds, DTensor):
+                    preds = preds.full_tensor()
                 next_token = torch.argmax(preds[:, next_idx - 1], dim=-1)
-                x[:, next_idx] = next_token 
+                x[:, next_idx] = next_token
             else:
                 pp_schedule.step()
             torch.distributed.broadcast(
@@ -240,6 +242,8 @@ def generate(
         else:
             assert len(model_parts) == 1
             preds = model_parts[0](x)
+            if isinstance(preds, DTensor):
+                preds = preds.full_tensor()
             next_token = torch.argmax(preds[:, next_idx - 1], dim=-1)
             x[:, next_idx] = next_token
             next_idx += 1
