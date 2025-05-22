@@ -142,7 +142,7 @@ class RotaryEmbedding(nn.Module):
             self.sin_cached[:seq_len].to(dtype=x.dtype),
         )
 
-    def reset_parameters(self):
+    def init_weights(self):
         device = self.inv_freq.device
         inv_freq = 1.0 / (self.base**(
             torch.arange(0, self.dim, 2).float().to(device) / self.dim))
@@ -778,7 +778,9 @@ class DeepseekModel(torch.nn.Module):
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, MoE):
             module.init_weights(std)
-        elif hasattr(module, "reset_parameters"):
+        elif isinstance(module, RotaryEmbedding):
+            module.init_weights()
+        elif isinstance(module, nn.RMSNorm):
             module.reset_parameters()
 
     def forward(

@@ -7,7 +7,7 @@
 # DeepSeek V2 Lite
 
 [job]
-dump_folder = "./outputs"
+dump_folder = "./deepseek-v2-lite-bf16-outputs"
 description = "DeepSeek v2 training"
 
 [profiling]
@@ -34,16 +34,16 @@ eps = 1e-15
 # B1 = 0.9 / B2 = 0.95
 
 [lr_scheduler]
-warmup_steps = 2  # lr scheduler warm up, normally 20% of the train steps
+warmup_steps = 600  # lr scheduler warm up, normally 20% of the train steps
 decay_ratio = 0.8  # lr scheduler decay ratio, 80% of the train steps
 decay_type = "linear"
-lr_min = 0.0
+lr_min = 0.1
 
 [training]
 batch_size = 2
 seq_len = 4096
 max_norm = 1.0  # grad norm clipping
-steps = 1000
+steps = 3000
 compile = false
 dataset = "c4"
 
