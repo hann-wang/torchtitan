@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from grouped_gemm.ops import GroupedGemm
+
 from .args import TransformerModelArgs
 
 
@@ -74,18 +76,30 @@ class GroupedExperts(nn.Module):
             )
             # grouped mm between a 2D tensor and a 3D tensor
             assert x.dim() == 2
+
+            assert (
+                x.dtype == self.w1.dtype == self.w2.dtype == self.w3.dtype == torch.bfloat16
+            ), "torch._grouped_mm only supports bf16 dtypes"
+
+            # h = F.silu(torch._grouped_mm(x, self.w1, offs=offsets))
+            # h = h * torch._grouped_mm(x, self.w3, offs=offsets)
+            # out = torch._grouped_mm(h, self.w2, offs=offsets)
+            gmm_func = GroupedGemm.apply
+            num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(dtype=torch.int64, device="cpu")
+            h = F.silu(gmm_func(x, self.w1, num_local_tokens_per_expert_cpu,
+                                False))
+            h = h * gmm_func(x, self.w3, num_local_tokens_per_expert_cpu, False)
+            out = gmm_func(h, self.w2, num_local_tokens_per_expert_cpu, False)
         else:
             offsets = None
             # fall back to regular bmm between 3D tensors
             assert x.dim() == 3
 
-        assert (
-            x.dtype == self.w1.dtype == self.w2.dtype == self.w3.dtype == torch.bfloat16
-        ), "torch._grouped_mm only supports bf16 dtypes"
-        h = F.silu(torch._grouped_mm(x, self.w1, offs=offsets))
-        h = h * torch._grouped_mm(x, self.w3, offs=offsets)
-        out = torch._grouped_mm(h, self.w2, offs=offsets)
-
+            # x shape (num_experts, tokens_per_expert, dim)
+            h = F.silu(torch.bmm(x, self.w1))
+            h = h * torch.bmm(x, self.w3)
+            # out shape (num_experts, tokens_per_expert, dim)
+            out = torch.bmm(h, self.w2)
         return out
 
     def init_weights(self, init_std: float):
@@ -309,12 +323,13 @@ class MoE(nn.Module):
         routed_input = torch.gather(
             x.view(-1, dim),
             dim=0,
-            index=token_indices,
+            index=token_indices.clone(
+            ),  # FIXME: avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
         )
+
         if self.scoring_before_experts:
-            routed_input = (routed_input.to(torch.float32) * top_scores.reshape(-1, 1)).to(
-                x.dtype
-            )
+            routed_input = (routed_input.to(torch.float32) *
+                            top_scores.reshape(-1, 1)).to(x.dtype)
 
         if self.use_grouped_mm:
             # NOTE: In order to use torch._grouped_mm, we need to make sure
@@ -339,12 +354,19 @@ class MoE(nn.Module):
                     token_indices.shape[0] + self.experts.num_experts * ALIGN_SIZE_M,
                     ALIGN_SIZE_M,
                 )
-            token_indices = torch.vstack(
+            token_indices_appended = torch.vstack(
                 (token_indices, token_indices.new_zeros((dim)))
-            )
-            token_indices = token_indices[permuted_indices, :]
-            routed_input = torch.vstack((routed_input, routed_input.new_zeros((dim))))
+            )  # FIXME: renamed to avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
+            token_indices = token_indices_appended[permuted_indices, :]
+
+            routed_input = torch.vstack(
+                (routed_input, routed_input.new_zeros((dim))))
             routed_input = routed_input[permuted_indices, :]
+
+            top_scores = torch.cat(
+                (top_scores, top_scores.new_zeros(1))
+            )
+            top_scores = top_scores[permuted_indices]
         else:
             # NOTE: this would incur a synchronization between device and host
             if num_local_tokens_per_expert is not None:
