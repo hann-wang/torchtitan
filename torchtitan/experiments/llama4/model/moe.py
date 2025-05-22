@@ -78,16 +78,6 @@ class GroupedExperts(nn.Module):
                 x.dtype == self.w1.dtype == self.w2.dtype == self.w3.dtype == torch.bfloat16
             ), "torch._grouped_mm only supports bf16 dtypes"
 
-            # https://github.com/pytorch/pytorch/pull/150374
-            # NOTE: torch._gouped_mm requires bf16 dtypes
-            #       and shapes to be multiple of 8
-            offsets = torch.cumsum(
-                num_local_tokens_per_expert, dim=0, dtype=torch.int32
-            )
-            # h = F.silu(torch._grouped_mm(x, self.w1, offs=offsets))
-            # h = h * torch._grouped_mm(x, self.w3, offs=offsets)
-            # out = torch._grouped_mm(h, self.w2, offs=offsets)
-
             device_mesh = None
             if isinstance(x, DTensor):
                 device_mesh = x.device_mesh
@@ -101,6 +91,16 @@ class GroupedExperts(nn.Module):
                 w2 = self.w2
                 w3 = self.w3
 
+            # https://github.com/pytorch/pytorch/pull/150374
+            # NOTE: torch._gouped_mm requires bf16 dtypes
+            #       and shapes to be multiple of 8
+            offsets = torch.cumsum(
+                num_local_tokens_per_expert, dim=0, dtype=torch.int32
+            )
+            # h = F.silu(torch._grouped_mm(x, self.w1, offs=offsets))
+            # h = h * torch._grouped_mm(x, self.w3, offs=offsets)
+            # out = torch._grouped_mm(h, self.w2, offs=offsets)
+
             # num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
             #     dtype=torch.int64, device="cpu")
             # h = F.silu(gmm(x, w1, num_local_tokens_per_expert_cpu))
@@ -108,26 +108,22 @@ class GroupedExperts(nn.Module):
             # out = gmm(h, w2, num_local_tokens_per_expert_cpu)
 
             from torchtitan.experiments.deepseek_v3 import dsgemm_utils
-            contig_tokens = x
-            cutoff_idx = offsets[-1]
-            valid_tokens = contig_tokens[:cutoff_idx]
 
             # Create indices from offsets without CPU-GPU sync
             m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
                 offsets)
-            gate_proj = cg_grouped_gemm(valid_tokens, w1.transpose(-1, -2).contiguous(), m_indices)
-            up_proj = cg_grouped_gemm(
-                valid_tokens,
-                w3.transpose(-1, -2).contiguous(), m_indices)
+            gate_proj = cg_grouped_gemm(x,
+                                        w1.transpose(-1, -2).contiguous(),
+                                        m_indices)
+            up_proj = cg_grouped_gemm(x,
+                                      w3.transpose(-1, -2).contiguous(),
+                                      m_indices)
             # Apply activation
             hidden_outputs = F.silu(gate_proj) * up_proj
             # Run the third GEMM (down projection)
-            down_proj_out = cg_grouped_gemm(hidden_outputs,
+            out = cg_grouped_gemm(hidden_outputs,
                                             w2.transpose(-1, -2).contiguous(),
                                             m_indices)
-            # Copy results back to contig_tokens
-            out = torch.zeros_like(contig_tokens)
-            out[:cutoff_idx] = down_proj_out
 
             if device_mesh is not None:
                 out = DTensor.from_local(

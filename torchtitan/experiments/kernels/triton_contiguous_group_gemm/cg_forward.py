@@ -9,7 +9,7 @@
 import logging
 
 import torch
-from torch.library import custom_op, triton_op, wrap_triton
+from torch.library import triton_op, wrap_triton
 import triton
 import triton.language as tl
 
@@ -258,9 +258,9 @@ def _kernel_cg_forward_aligned(
 # =============== Forward Wrapper for CGGEMM =================
 
 
-@custom_op("torchtitan::cg_grouped_gemm_forward", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_forward", mutates_args={})
 def cg_grouped_gemm_forward(
-    inputs: torch.Tensor,  # [M_total, K]
+    inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
     group_size_m: int = 128,
@@ -270,7 +270,7 @@ def cg_grouped_gemm_forward(
     All tokens mapped to the same expert must be in contiguous blocks of size group_size_m.
 
     Args:
-        inputs: Input tensor of shape [M_total, K]
+        inputs: Input tensor of shape [M_bufferlen, K]
         expert_weights: Expert weight tensor of shape [num_experts, N, K]
         expert_indices: Indices tensor of shape [M_total] mapping each token to its expert
         group_size_m: Size of contiguous token blocks for each expert (default: 128)
@@ -285,7 +285,8 @@ def cg_grouped_gemm_forward(
     assert expert_indices.is_contiguous(), "Expert indices tensor must be contiguous"
 
     # Check if inputs are properly aligned
-    M_total, K = inputs.shape
+    M_bufferlen, K = inputs.shape
+    M_total = expert_indices.shape[0]
     assert (
         M_total % group_size_m == 0
     ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
@@ -299,12 +300,14 @@ def cg_grouped_gemm_forward(
 
     # Validate dimensions
     assert K == K_weights, f"Input K ({K}) must match weight K ({K_weights})"
-    assert (
-        expert_indices.shape[0] == M_total
-    ), f"Expert indices length ({expert_indices.shape[0]}) must match M_total ({M_total})"
+    # assert (
+    #     expert_indices.shape[0] == M_total
+    # ), f"Expert indices length ({expert_indices.shape[0]}) must match M_total ({M_total})"
 
     # Create output tensor
-    output = torch.empty((M_total, N), device=inputs.device, dtype=torch.bfloat16)
+    output = torch.empty((M_bufferlen, N),
+                         device=inputs.device,
+                         dtype=torch.bfloat16)
 
     # Calculate grid size for the kernel
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -322,13 +325,14 @@ def cg_grouped_gemm_forward(
         NUM_EXPERTS=num_experts,
         GROUP_SIZE_M=group_size_m,
         NUM_SMS=NUM_SMS,
+        SUPER_GROUP_M=32,
     )
 
     return output
 
 @cg_grouped_gemm_forward.register_fake
 def cg_grouped_gemm_forward_fake(
-    inputs: torch.Tensor,  # [M_total, K]
+    inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
     group_size_m: int = 128,
@@ -337,12 +341,14 @@ def cg_grouped_gemm_forward_fake(
     Fake function for cg_grouped_gemm_forward.
     Returns a tensor of zeros with the same shape as the expected output.
     """
-    M_total, _ = inputs.shape
+    M_bufferlen, _ = inputs.shape
     _, N, _ = expert_weights.shape
-    return torch.zeros((M_total, N), dtype=inputs.dtype, device=inputs.device)
+    return torch.zeros((M_bufferlen, N),
+                       dtype=inputs.dtype,
+                       device=inputs.device)
 
 
-@custom_op("torchtitan::cg_grouped_gemm_forward_dynamic", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_forward_dynamic", mutates_args={})
 def cg_grouped_gemm_forward_dynamic(
     inputs: torch.Tensor,  # [M_total, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]

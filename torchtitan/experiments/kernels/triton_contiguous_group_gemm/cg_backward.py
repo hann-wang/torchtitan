@@ -7,7 +7,7 @@
 
 import torch
 import triton
-from torch.library import custom_op, triton_op, wrap_triton
+from torch.library import triton_op, wrap_triton
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
@@ -215,10 +215,10 @@ def _kernel_cg_backward_dw(
             tl.store(grad_w_ptrs, grad_weights, mask=mask_gw)
 
 
-@custom_op("torchtitan::cg_grouped_gemm_backward_weights", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_backward_weights", mutates_args={})
 def cg_grouped_gemm_backward_weights(
-    grad_output: torch.Tensor,  # [M_total, N]
-    inputs: torch.Tensor,  # [M_total, K]
+    grad_output: torch.Tensor,  # [M_bufferlen, N]
+    inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_indices: torch.Tensor,  # [M_total]
     num_experts: int,
     group_size_m: int = 128,
@@ -227,8 +227,8 @@ def cg_grouped_gemm_backward_weights(
     Simple version of backward pass for weights using a single kernel launch.
 
     Args:
-        grad_output: Gradient from output, shape [M_total, N]
-        inputs: Input tensor, shape [M_total, K]
+        grad_output: Gradient from output, shape [M_bufferlen, N]
+        inputs: Input tensor, shape [M_bufferlen, K]
         expert_indices: Indices tensor mapping each token to its expert, shape [M_total]
         num_experts: Number of experts
         group_size_m: Size of contiguous token blocks for each expert (default: 128)
@@ -242,8 +242,9 @@ def cg_grouped_gemm_backward_weights(
     assert expert_indices.is_contiguous(), "Expert indices tensor must be contiguous"
 
     # Get dimensions
-    M_total, N = grad_output.shape
+    _, N = grad_output.shape
     _, K = inputs.shape
+    M_total = expert_indices.shape[0]
 
     # Ensure expert_indices has the right dtype
     if expert_indices.dtype != torch.int32:
@@ -286,8 +287,8 @@ def cg_grouped_gemm_backward_weights(
 
 @cg_grouped_gemm_backward_weights.register_fake
 def cg_grouped_gemm_backward_weights_fake(
-    grad_output: torch.Tensor,  # [M_total, N]
-    inputs: torch.Tensor,  # [M_total, K]
+    grad_output: torch.Tensor,  # [M_bufferlen, N]
+    inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_indices: torch.Tensor,  # [M_total]
     num_experts: int,
     group_size_m: int = 128,
@@ -296,14 +297,14 @@ def cg_grouped_gemm_backward_weights_fake(
     Fake function for backward pass for weights.
     Returns a tensor of zeros with the same shape as the expected output.
     """
-    M_total, N = grad_output.shape
+    _, N = grad_output.shape
     _, K = inputs.shape
     return torch.zeros((num_experts, N, K), device=grad_output.device, dtype=grad_output.dtype)
 
 
-@custom_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
 def cg_grouped_gemm_backward_inputs(
-    grad_output: torch.Tensor,  # [M_total, N]
+    grad_output: torch.Tensor,  # [M_bufferlen, N]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
     group_size_m: int = 128,
@@ -326,8 +327,9 @@ def cg_grouped_gemm_backward_inputs(
     assert expert_indices.is_contiguous(), "Expert indices tensor must be contiguous"
 
     # Get dimensions
-    M_total, N = grad_output.shape
+    M_bufferlen, N = grad_output.shape
     num_experts, _, K = expert_weights.shape
+    M_total = expert_indices.shape[0]
 
     # Check if dimensions match
     assert (
@@ -336,7 +338,7 @@ def cg_grouped_gemm_backward_inputs(
 
     # Create output tensor for gradients
     grad_inputs = torch.zeros(
-        (M_total, K), device=grad_output.device, dtype=grad_output.dtype
+        (M_bufferlen, K), device=grad_output.device, dtype=grad_output.dtype
     )
 
     # Calculate grid size for the kernel
@@ -363,7 +365,7 @@ def cg_grouped_gemm_backward_inputs(
 
 @cg_grouped_gemm_backward_inputs.register_fake
 def cg_grouped_gemm_backward_inputs_fake(
-    grad_output: torch.Tensor,  # [M_total, N]
+    grad_output: torch.Tensor,  # [M_bufferlen, N]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
     group_size_m: int = 128,
@@ -372,9 +374,11 @@ def cg_grouped_gemm_backward_inputs_fake(
     Fake function for backward pass for inputs.
     Returns a tensor of zeros with the same shape as the expected output.
     """
-    M_total, N = grad_output.shape
+    M_bufferlen, N = grad_output.shape
     _, _, K = expert_weights.shape
-    return torch.zeros((M_total, K), device=grad_output.device, dtype=grad_output.dtype)
+    return torch.zeros((M_bufferlen, K),
+                       device=grad_output.device,
+                       dtype=grad_output.dtype)
 
 
 # =============== Update the autograd function =================

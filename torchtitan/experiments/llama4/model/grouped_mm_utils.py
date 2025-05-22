@@ -1,6 +1,25 @@
 import torch
-from grouped_gemm import backend
 
+from torch.distributed.tensor._op_schema import (
+    OpSchema,
+    OpStrategy,
+    PlacementList,
+    PlacementStrategy,
+    RuntimeSchemaInfo,
+    TupleStrategy,
+)
+from torch.distributed.tensor._ops import common_reduction_strategy
+from torch.distributed.tensor._ops.utils import (
+    as_list,
+    expand_to_full_mesh_op_strategy,
+    generate_redistribute_costs,
+    is_tensor_evenly_shardable,
+    normalize_dim,
+    normalize_dims,
+    register_op_strategy,
+)
+
+from grouped_gemm import backend
 
 @torch.library.custom_op("amd::grouped_gemm_cuda_ext_ff", mutates_args=())
 def grouped_gemm_cuda_ext_ff(a: torch.Tensor, b: torch.Tensor,
@@ -84,3 +103,16 @@ def _(a: torch.Tensor, b: torch.Tensor,
     m, _ = a.shape
     _, _, n = b.shape
     return torch.zeros((m, n), dtype=a.dtype, device=a.device)
+
+
+@register_op_strategy(torch.ops.aten.cumsum.default, schema_info=RuntimeSchemaInfo(1))
+def cumsum_strategy(op_schema: OpSchema) -> OpStrategy:
+    args_schema = op_schema.args_schema
+    input_strategy = args_schema[0]
+    assert isinstance(input_strategy, OpStrategy)
+    dim = args_schema[1]
+    assert isinstance(dim, int), f"{dim}"
+
+    return common_reduction_strategy(input_strategy, [dim],
+                                     keep_dim=True,
+                                     reduction_linear=False)
