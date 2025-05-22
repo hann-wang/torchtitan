@@ -7,6 +7,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor, Partial
 
 from grouped_gemm.ops import GroupedGemm
 
@@ -68,12 +69,6 @@ class GroupedExperts(nn.Module):
 
         # grouped mm implementation
         if num_local_tokens_per_expert is not None:
-            # https://github.com/pytorch/pytorch/pull/150374
-            # NOTE: torch._gouped_mm requires bf16 dtypes
-            #       and shapes to be multiple of 8
-            offsets = torch.cumsum(
-                num_local_tokens_per_expert, dim=0, dtype=torch.int32
-            )
             # grouped mm between a 2D tensor and a 3D tensor
             assert x.dim() == 2
 
@@ -81,15 +76,41 @@ class GroupedExperts(nn.Module):
                 x.dtype == self.w1.dtype == self.w2.dtype == self.w3.dtype == torch.bfloat16
             ), "torch._grouped_mm only supports bf16 dtypes"
 
+            # https://github.com/pytorch/pytorch/pull/150374
+            # NOTE: torch._gouped_mm requires bf16 dtypes
+            #       and shapes to be multiple of 8
+            # offsets = torch.cumsum(
+            #     num_local_tokens_per_expert, dim=0, dtype=torch.int32
+            # )
             # h = F.silu(torch._grouped_mm(x, self.w1, offs=offsets))
             # h = h * torch._grouped_mm(x, self.w3, offs=offsets)
             # out = torch._grouped_mm(h, self.w2, offs=offsets)
+
             gmm_func = GroupedGemm.apply
+            device_mesh = None
+            if isinstance(x, DTensor):
+                device_mesh = x.device_mesh
+                num_local_tokens_per_expert = num_local_tokens_per_expert.to_local()
+                x = x.to_local()
+                w1 = self.w1.to_local()
+                w2 = self.w2.to_local()
+                w3 = self.w3.to_local()
+            else:
+                w1 = self.w1
+                w2 = self.w2
+                w3 = self.w3
             num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(dtype=torch.int64, device="cpu")
-            h = F.silu(gmm_func(x, self.w1, num_local_tokens_per_expert_cpu,
+            h = F.silu(gmm_func(x, w1, num_local_tokens_per_expert_cpu,
                                 False))
-            h = h * gmm_func(x, self.w3, num_local_tokens_per_expert_cpu, False)
-            out = gmm_func(h, self.w2, num_local_tokens_per_expert_cpu, False)
+            h = h * gmm_func(x, w3, num_local_tokens_per_expert_cpu, False)
+            out = gmm_func(h, w2, num_local_tokens_per_expert_cpu, False)
+            if device_mesh is not None:
+                out = DTensor.from_local(
+                    out,
+                    device_mesh,
+                    (Partial(), ),
+                    run_check=False,
+                )
         else:
             offsets = None
             # fall back to regular bmm between 3D tensors
