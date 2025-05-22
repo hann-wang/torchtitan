@@ -90,6 +90,7 @@ def prepare_fp8_weight(w):
     return (w_fp8, w_scales)
 
 
+@torch.library.custom_op("torchtitan::create_indices_from_offsets_nosync", mutates_args=())
 def create_indices_from_offsets_nosync(m_offsets: torch.Tensor) -> torch.Tensor:
     """
     Create m_indices tensor from m_offsets tensor without CPU-GPU sync points.
@@ -121,6 +122,16 @@ def create_indices_from_offsets_nosync(m_offsets: torch.Tensor) -> torch.Tensor:
         # Update prev_offset for next iteration
         prev_offset = m_offsets[i]
 
+    return indices
+
+@create_indices_from_offsets_nosync.register_fake
+def create_indices_from_offsets_nosync_fake(
+    m_offsets: torch.Tensor,
+) -> torch.Tensor:
+    total_size = m_offsets[-1]
+    indices = torch.empty(total_size,
+                          device=m_offsets.device,
+                          dtype=torch.int32)
     return indices
 
 

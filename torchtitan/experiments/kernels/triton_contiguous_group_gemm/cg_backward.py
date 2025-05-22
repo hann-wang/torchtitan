@@ -7,6 +7,7 @@
 
 import torch
 import triton
+from torch.library import custom_op, triton_op, wrap_triton
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
@@ -214,6 +215,7 @@ def _kernel_cg_backward_dw(
             tl.store(grad_w_ptrs, grad_weights, mask=mask_gw)
 
 
+@custom_op("torchtitan::cg_grouped_gemm_backward_weights", mutates_args={})
 def cg_grouped_gemm_backward_weights(
     grad_output: torch.Tensor,  # [M_total, N]
     inputs: torch.Tensor,  # [M_total, K]
@@ -265,7 +267,7 @@ def cg_grouped_gemm_backward_weights(
     grid = (num_experts * n_tiles * k_tiles,)
 
     # Launch kernel
-    _kernel_cg_backward_dw[grid](
+    wrap_triton(_kernel_cg_backward_dw)[grid](
         grad_output,
         inputs,
         grad_weights,
@@ -282,7 +284,24 @@ def cg_grouped_gemm_backward_weights(
 
     return grad_weights
 
+@cg_grouped_gemm_backward_weights.register_fake
+def cg_grouped_gemm_backward_weights_fake(
+    grad_output: torch.Tensor,  # [M_total, N]
+    inputs: torch.Tensor,  # [M_total, K]
+    expert_indices: torch.Tensor,  # [M_total]
+    num_experts: int,
+    group_size_m: int = 128,
+) -> torch.Tensor:
+    """
+    Fake function for backward pass for weights.
+    Returns a tensor of zeros with the same shape as the expected output.
+    """
+    M_total, N = grad_output.shape
+    _, K = inputs.shape
+    return torch.zeros((num_experts, N, K), device=grad_output.device, dtype=grad_output.dtype)
 
+
+@custom_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
 def cg_grouped_gemm_backward_inputs(
     grad_output: torch.Tensor,  # [M_total, N]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
@@ -327,7 +346,7 @@ def cg_grouped_gemm_backward_inputs(
     )
 
     # Launch kernel
-    _kernel_cg_backward_dx[grid](
+    wrap_triton(_kernel_cg_backward_dx)[grid](
         grad_output,
         expert_weights,
         grad_inputs,
@@ -340,6 +359,22 @@ def cg_grouped_gemm_backward_inputs(
     )
 
     return grad_inputs
+
+
+@cg_grouped_gemm_backward_inputs.register_fake
+def cg_grouped_gemm_backward_inputs_fake(
+    grad_output: torch.Tensor,  # [M_total, N]
+    expert_weights: torch.Tensor,  # [num_experts, N, K]
+    expert_indices: torch.Tensor,  # [M_total]
+    group_size_m: int = 128,
+) -> torch.Tensor:
+    """
+    Fake function for backward pass for inputs.
+    Returns a tensor of zeros with the same shape as the expected output.
+    """
+    M_total, N = grad_output.shape
+    _, _, K = expert_weights.shape
+    return torch.zeros((M_total, K), device=grad_output.device, dtype=grad_output.dtype)
 
 
 # =============== Update the autograd function =================

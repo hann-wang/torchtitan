@@ -108,9 +108,9 @@ class GroupedExperts(nn.Module):
             # out = gmm(h, w2, num_local_tokens_per_expert_cpu)
 
             from torchtitan.experiments.deepseek_v3 import dsgemm_utils
-            assert x.is_contiguous()
             contig_tokens = x
-            valid_tokens = contig_tokens[: offsets[-1]]
+            cutoff_idx = offsets[-1]
+            valid_tokens = contig_tokens[:cutoff_idx]
 
             # Create indices from offsets without CPU-GPU sync
             m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
@@ -127,7 +127,7 @@ class GroupedExperts(nn.Module):
                                             m_indices)
             # Copy results back to contig_tokens
             out = torch.zeros_like(contig_tokens)
-            out[:offsets[-1]] = down_proj_out
+            out[:cutoff_idx] = down_proj_out
 
             if device_mesh is not None:
                 out = DTensor.from_local(

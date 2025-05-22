@@ -9,6 +9,7 @@
 import logging
 
 import torch
+from torch.library import custom_op, triton_op, wrap_triton
 import triton
 import triton.language as tl
 
@@ -257,6 +258,7 @@ def _kernel_cg_forward_aligned(
 # =============== Forward Wrapper for CGGEMM =================
 
 
+@custom_op("torchtitan::cg_grouped_gemm_forward", mutates_args={})
 def cg_grouped_gemm_forward(
     inputs: torch.Tensor,  # [M_total, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
@@ -299,7 +301,7 @@ def cg_grouped_gemm_forward(
     assert K == K_weights, f"Input K ({K}) must match weight K ({K_weights})"
     assert (
         expert_indices.shape[0] == M_total
-    ), "Expert indices length must match M_total"
+    ), f"Expert indices length ({expert_indices.shape[0]}) must match M_total ({M_total})"
 
     # Create output tensor
     output = torch.empty((M_total, N), device=inputs.device, dtype=torch.bfloat16)
@@ -309,7 +311,7 @@ def cg_grouped_gemm_forward(
 
     grid = (NUM_SMS, 1, 1)
     # Launch kernel
-    _kernel_cg_persistent_forward[grid](
+    wrap_triton(_kernel_cg_persistent_forward)[grid](
         inputs,
         expert_weights,
         output,
@@ -324,7 +326,23 @@ def cg_grouped_gemm_forward(
 
     return output
 
+@cg_grouped_gemm_forward.register_fake
+def cg_grouped_gemm_forward_fake(
+    inputs: torch.Tensor,  # [M_total, K]
+    expert_weights: torch.Tensor,  # [num_experts, N, K]
+    expert_indices: torch.Tensor,  # [M_total]
+    group_size_m: int = 128,
+) -> torch.Tensor:
+    """
+    Fake function for cg_grouped_gemm_forward.
+    Returns a tensor of zeros with the same shape as the expected output.
+    """
+    M_total, _ = inputs.shape
+    _, N, _ = expert_weights.shape
+    return torch.zeros((M_total, N), dtype=inputs.dtype, device=inputs.device)
 
+
+@custom_op("torchtitan::cg_grouped_gemm_forward_dynamic", mutates_args={})
 def cg_grouped_gemm_forward_dynamic(
     inputs: torch.Tensor,  # [M_total, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
@@ -384,7 +402,7 @@ def cg_grouped_gemm_forward_dynamic(
     )
 
     # Launch kernel
-    _kernel_cg_forward_aligned[grid](
+    wrap_triton(_kernel_cg_forward_aligned)[grid](
         inputs,
         expert_weights,
         output,
@@ -397,6 +415,22 @@ def cg_grouped_gemm_forward_dynamic(
     )
 
     return output
+
+
+@cg_grouped_gemm_forward_dynamic.register_fake
+def cg_grouped_gemm_forward_dynamic_fake(
+    inputs: torch.Tensor,  # [M_total, K]
+    expert_weights: torch.Tensor,  # [num_experts, N, K]
+    expert_indices: torch.Tensor,  # [M_total]
+    group_size_m: int = 128,
+) -> torch.Tensor:
+    """
+    Fake function for cg_grouped_gemm_forward_dynamic.
+    Returns a tensor of zeros with the same shape as the expected output.
+    """
+    M_total, _ = inputs.shape
+    _, N, _ = expert_weights.shape
+    return torch.zeros((M_total, N), dtype=inputs.dtype, device=inputs.device)
 
 
 # =============== End Forward Wrapper for CGGEMM =================
