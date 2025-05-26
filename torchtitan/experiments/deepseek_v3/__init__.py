@@ -26,7 +26,7 @@ deepseek_configs = {
     "debugmodel":
     ModelArgs(
         vocab_size=102400,
-        hidden_size=512,
+        hidden_size=2048,
         intermediate_size=1024,
         moe_intermediate_size=512,
         num_hidden_layers=2,

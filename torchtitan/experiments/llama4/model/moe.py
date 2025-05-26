@@ -11,10 +11,11 @@ from torch.distributed.tensor import DTensor, Partial
 
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
     cg_grouped_gemm, )
-# from .grouped_mm_utils import gmm
 
 from .args import TransformerModelArgs
 
+USE_CG_GROUPED_GEMM = True
+ALIGN_SIZE_M = 128
 
 class GroupedExperts(nn.Module):
     def __init__(
@@ -97,33 +98,50 @@ class GroupedExperts(nn.Module):
             offsets = torch.cumsum(
                 num_local_tokens_per_expert, dim=0, dtype=torch.int32
             )
-            # h = F.silu(torch._grouped_mm(x, self.w1, offs=offsets))
-            # h = h * torch._grouped_mm(x, self.w3, offs=offsets)
-            # out = torch._grouped_mm(h, self.w2, offs=offsets)
 
-            # num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
-            #     dtype=torch.int64, device="cpu")
-            # h = F.silu(gmm(x, w1, num_local_tokens_per_expert_cpu))
-            # h = h * gmm(x, w3, num_local_tokens_per_expert_cpu)
-            # out = gmm(h, w2, num_local_tokens_per_expert_cpu)
+            if USE_CG_GROUPED_GEMM:
+                from torchtitan.experiments.deepseek_v3 import dsgemm_utils
 
-            from torchtitan.experiments.deepseek_v3 import dsgemm_utils
+                # Create indices from offsets without CPU-GPU sync
+                m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
+                    offsets)
+                gate_proj = cg_grouped_gemm(x,
+                                            w1.transpose(-1, -2).contiguous(),
+                                            m_indices, ALIGN_SIZE_M)
+                up_proj = cg_grouped_gemm(x,
+                                          w3.transpose(-1, -2).contiguous(),
+                                          m_indices, ALIGN_SIZE_M)
+                # Apply activation
+                hidden_outputs = F.silu(gate_proj) * up_proj
+                # Run the third GEMM (down projection)
+                out = cg_grouped_gemm(hidden_outputs,
+                                      w2.transpose(-1, -2).contiguous(),
+                                      m_indices, ALIGN_SIZE_M)
+            else:
+                # h = F.silu(torch._grouped_mm(x, self.w1, offs=offsets))
+                # h = h * torch._grouped_mm(x, self.w3, offs=offsets)
+                # out = torch._grouped_mm(h, self.w2, offs=offsets)
+                from .grouped_mm_utils import gmm
 
-            # Create indices from offsets without CPU-GPU sync
-            m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
-                offsets)
-            gate_proj = cg_grouped_gemm(x,
-                                        w1.transpose(-1, -2).contiguous(),
-                                        m_indices)
-            up_proj = cg_grouped_gemm(x,
-                                      w3.transpose(-1, -2).contiguous(),
-                                      m_indices)
-            # Apply activation
-            hidden_outputs = F.silu(gate_proj) * up_proj
-            # Run the third GEMM (down projection)
-            out = cg_grouped_gemm(hidden_outputs,
-                                            w2.transpose(-1, -2).contiguous(),
-                                            m_indices)
+                num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
+                    dtype=torch.int64, device="cpu")
+                # print(f"x({x.shape}): {x}")
+                # print(f"w1({w1.shape}): {w1}")
+                # print(f"m_sizes({num_local_tokens_per_expert_cpu.shape}): {num_local_tokens_per_expert_cpu}")
+                g = gmm(x.contiguous(), w1.contiguous(),
+                        num_local_tokens_per_expert_cpu.contiguous())
+                # torch.save(
+                #     {
+                #         "x": x.cpu(),
+                #         "w": w1.cpu(),
+                #         "m_sizes": num_local_tokens_per_expert_cpu,
+                #         "out": g.cpu(),
+                #     }, "gmm_inputs.pt")
+                assert not torch.isnan(g).any(), "NaN detected in grouped mm gate projection"
+                h = F.silu(g)
+                h = h * gmm(x, w3, num_local_tokens_per_expert_cpu)
+                out = gmm(h, w2, num_local_tokens_per_expert_cpu)
+
 
             if device_mesh is not None:
                 out = DTensor.from_local(
@@ -381,8 +399,6 @@ class MoE(nn.Module):
             from torchtitan.experiments.kernels.moe.indices import (
                 generate_permute_indices,
             )
-
-            ALIGN_SIZE_M = 128
 
             with torch.no_grad():
                 (

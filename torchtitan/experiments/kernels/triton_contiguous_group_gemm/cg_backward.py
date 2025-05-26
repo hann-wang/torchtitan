@@ -7,7 +7,7 @@
 
 import torch
 import triton
-from torch.library import triton_op, wrap_triton
+from torch.library import custom_op
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
@@ -215,7 +215,7 @@ def _kernel_cg_backward_dw(
             tl.store(grad_w_ptrs, grad_weights, mask=mask_gw)
 
 
-@triton_op("torchtitan::cg_grouped_gemm_backward_weights", mutates_args={})
+@custom_op("torchtitan::cg_grouped_gemm_backward_weights", mutates_args={})
 def cg_grouped_gemm_backward_weights(
     grad_output: torch.Tensor,  # [M_bufferlen, N]
     inputs: torch.Tensor,  # [M_bufferlen, K]
@@ -268,7 +268,7 @@ def cg_grouped_gemm_backward_weights(
     grid = (num_experts * n_tiles * k_tiles,)
 
     # Launch kernel
-    wrap_triton(_kernel_cg_backward_dw)[grid](
+    _kernel_cg_backward_dw[grid](
         grad_output,
         inputs,
         grad_weights,
@@ -302,7 +302,7 @@ def cg_grouped_gemm_backward_weights_fake(
     return torch.zeros((num_experts, N, K), device=grad_output.device, dtype=grad_output.dtype)
 
 
-@triton_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
+@custom_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
 def cg_grouped_gemm_backward_inputs(
     grad_output: torch.Tensor,  # [M_bufferlen, N]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
@@ -348,7 +348,7 @@ def cg_grouped_gemm_backward_inputs(
     )
 
     # Launch kernel
-    wrap_triton(_kernel_cg_backward_dx)[grid](
+    _kernel_cg_backward_dx[grid](
         grad_output,
         expert_weights,
         grad_inputs,
@@ -384,6 +384,7 @@ def cg_grouped_gemm_backward_inputs_fake(
 # =============== Update the autograd function =================
 
 
+@torch._dynamo.allow_in_graph
 class ContiguousGroupedGEMM(torch.autograd.Function):
     """
     Autograd function for contiguous grouped GEMM with complete backward pass.

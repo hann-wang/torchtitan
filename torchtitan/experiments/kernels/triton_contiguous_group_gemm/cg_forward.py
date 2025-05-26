@@ -9,7 +9,7 @@
 import logging
 
 import torch
-from torch.library import triton_op, wrap_triton
+from torch.library import custom_op
 import triton
 import triton.language as tl
 
@@ -258,7 +258,7 @@ def _kernel_cg_forward_aligned(
 # =============== Forward Wrapper for CGGEMM =================
 
 
-@triton_op("torchtitan::cg_grouped_gemm_forward", mutates_args={})
+@custom_op("torchtitan::cg_grouped_gemm_forward", mutates_args={})
 def cg_grouped_gemm_forward(
     inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
@@ -305,7 +305,7 @@ def cg_grouped_gemm_forward(
     # ), f"Expert indices length ({expert_indices.shape[0]}) must match M_total ({M_total})"
 
     # Create output tensor
-    output = torch.empty((M_bufferlen, N),
+    output = torch.zeros((M_bufferlen, N),
                          device=inputs.device,
                          dtype=torch.bfloat16)
 
@@ -314,7 +314,7 @@ def cg_grouped_gemm_forward(
 
     grid = (NUM_SMS, 1, 1)
     # Launch kernel
-    wrap_triton(_kernel_cg_persistent_forward)[grid](
+    _kernel_cg_persistent_forward[grid](
         inputs,
         expert_weights,
         output,
@@ -348,7 +348,7 @@ def cg_grouped_gemm_forward_fake(
                        device=inputs.device)
 
 
-@triton_op("torchtitan::cg_grouped_gemm_forward_dynamic", mutates_args={})
+@custom_op("torchtitan::cg_grouped_gemm_forward_dynamic", mutates_args={})
 def cg_grouped_gemm_forward_dynamic(
     inputs: torch.Tensor,  # [M_total, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
@@ -394,9 +394,6 @@ def cg_grouped_gemm_forward_dynamic(
     assert (
         expert_indices.shape[0] == M_total
     ), "Expert indices length must match M_total"
-    # assert (
-    #    expert_indices.shape[0] == M_total // group_size_m
-    # ), "Expert indices length must match number of groups"
 
     # Create output tensor
     output = torch.empty((M_total, N), device=inputs.device, dtype=inputs.dtype)
@@ -408,7 +405,7 @@ def cg_grouped_gemm_forward_dynamic(
     )
 
     # Launch kernel
-    wrap_triton(_kernel_cg_forward_aligned)[grid](
+    _kernel_cg_forward_aligned[grid](
         inputs,
         expert_weights,
         output,
