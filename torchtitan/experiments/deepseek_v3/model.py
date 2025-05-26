@@ -43,6 +43,17 @@ from torchtitan.experiments.llama4.model.moe import MoE as Llama4MoE, GroupedExp
 from torchtitan.experiments.deepseek_v3.attn_mask_utils import _prepare_4d_causal_attention_mask
 from torchtitan.experiments.deepseek_v3.model_config import ModelArgs
 
+from transformers.modeling_flash_attention_utils import _flash_attention_forward
+from transformers.triton_flash_attention_fp8_block import block_scaling_node, FIXED_BLOCK_M, FIXED_BLOCK_N
+
+USE_SDPA = True
+
+
+def check_and_convert(t, scale):
+    float8_fw = torch.float8_e4m3fnuz
+    finfo = torch.finfo(float8_fw)
+    return ((t * scale).clamp(min=finfo.min, max=finfo.max).to(
+        dtype=float8_fw) if t.dtype != float8_fw else t)
 
 class MoE(Llama4MoE):
     def __init__(self, model_args: ModelArgs):
@@ -585,13 +596,166 @@ class Attention(nn.Module):
 
         return attn_output
 
+class AttentionFlashAttention2(Attention):
+
+    def __init__(self, config: ModelArgs, layer_idx: Optional[int] = None):
+        super().__init__(config, layer_idx)
+        self.use_fp8 = False
+        self.use_fp8_fa_block_scales = True
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor],
+               Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.q_lora_rank is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q = q.view(bsz, q_len, -1, self.q_head_dim).transpose(1, 2)
+        current_num_heads = q.shape[1]
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        kv = (self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
+            bsz, q_len, -1,
+            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2))
+
+        k_nope, value_states = torch.split(
+            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        kv_seq_len = value_states.shape[-2]
+
+        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+
+        query_states = k_pe.new_empty(bsz, current_num_heads, q_len,
+                                      self.q_head_dim)
+        query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
+        query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
+
+        key_states = k_pe.new_empty(bsz, current_num_heads, q_len,
+                                    self.q_head_dim)
+        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
+        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+
+        if attention_mask is not None:
+            # Attention mask was made 4D because the `attn_weights` above is 4D.
+            # We probably can make this mask smarter if we want to pack sequences
+            # together, instead of using padding. This optimization can be used in
+            # inference. For training, if we want to pack sequences, data loader
+            # will pass in a mask containing such info.
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask,  # None, or user provided mask in 2D
+                (bsz, q_len),
+                hidden_states,
+                0,  # past_key_values_length, 0 when training
+            )
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+
+        xq_hp = query_states.transpose(1, 2)
+        xk_hp = key_states.transpose(1, 2)
+        xv_hp = value_states.transpose(1, 2)
+        if self.use_fp8:
+            with torch.no_grad():
+                if self.use_fp8_fa_block_scales:
+                    xq, descale_q = block_scaling_node(xq_hp,
+                                                       FIXED_BLOCK_M)
+                    xk, descale_k = block_scaling_node(xk_hp, FIXED_BLOCK_N)
+                else:
+                    descale_q = 240. / xq_hp.abs().max()
+                    xq = check_and_convert(xq_hp, descale_q)
+                    descale_k = 240. / xk_hp.abs().max()
+                    xk = check_and_convert(xk_hp, descale_k)
+                descale_v = 240. / xv_hp.abs().max()
+                xv = check_and_convert(xv_hp, descale_v)
+        else:
+            descale_q = None
+            descale_k = None
+            descale_v = None
+            xq = query_states
+            xk = key_states
+            xv = value_states
+
+        assert attention_mask is None
+        assert q_len == kv_seq_len
+
+        if self.use_fp8:
+            attn_output = _flash_attention_forward(
+                xq_hp,
+                xk_hp,
+                xv_hp,
+                xq,
+                xk,
+                xv,
+                None,
+                q_len,
+                softmax_scale=self.softmax_scale,
+                descale_q=descale_q,
+                descale_k=descale_k,
+                descale_v=descale_v,
+                position_ids=None,
+                dropout=0.0,
+                sliding_window=None,
+                use_top_left_mask=False,
+                is_causal=True,
+                use_fp8_perblock=self.use_fp8_fa_block_scales,
+            )
+        else:
+            if USE_SDPA:
+                attn_output = torch.nn.functional.scaled_dot_product_attention(
+                    xq,
+                    xk,
+                    xv,
+                    dropout_p=0.0,
+                    is_causal=True,
+                    scale=self.softmax_scale,
+                ).transpose(1, 2)
+            else:
+                attn_output = _flash_attention_forward(
+                    xq_hp,
+                    xk_hp,
+                    xv_hp,
+                    xq,
+                    xk,
+                    xv,
+                    None,
+                    q_len,
+                    softmax_scale=self.softmax_scale,
+                    descale_q=descale_q,
+                    descale_k=descale_k,
+                    descale_v=descale_v,
+                    position_ids=None,
+                    dropout=0.0,
+                    sliding_window=None,
+                    use_top_left_mask=False,
+                    is_causal=True,
+                )
+
+        attn_output = attn_output.reshape(bsz, q_len,
+                                          current_num_heads * self.v_head_dim)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output
 
 class DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = Attention(config=config, layer_idx=layer_idx)
+        self.self_attn = AttentionFlashAttention2(config=config,
+                                                  layer_idx=layer_idx)
 
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
