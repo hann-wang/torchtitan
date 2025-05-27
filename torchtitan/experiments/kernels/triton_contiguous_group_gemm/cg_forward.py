@@ -45,7 +45,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, super_group_m):
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["M_TOTAL", "N", "K"],
+    key=["M_TOTAL", "N", "K", "USE_FP8"],
     prune_configs_by={"early_config_prune": early_config_prune},
 )
 @triton.jit
@@ -56,6 +56,9 @@ def _kernel_cg_persistent_forward(
     c_ptr,
     # Pointer to indices array
     indices_ptr,
+    # Pointers to block scales (if needed)
+    a_s_ptr,
+    b_s_ptr,
     # Matrix dimensions
     M_TOTAL: tl.constexpr,  # Total M dimension (sum of all groups)
     N: tl.constexpr,  # N dimension
@@ -71,6 +74,7 @@ def _kernel_cg_persistent_forward(
     # Group size (for aligned loads)
     GROUP_SIZE_M: tl.constexpr = 128,
     SUPER_GROUP_M: tl.constexpr = 32,  # 32 works best
+    USE_FP8: tl.constexpr = False, # use FP8 blockwise quantization proposed by DeepSeek-V3
 ):
     """
     Contiguous Grouped GEMM kernel forward.
@@ -132,11 +136,18 @@ def _kernel_cg_persistent_forward(
                     b_ptr + expert_idx * N * K + offs_n[:, None] * K + offs_k[None, :]
                 )
                 b = tl.load(b_ptrs, mask=mask_b, other=0.0)
+                ab = tl.dot(a, b.T)
+
+                if USE_FP8:
+                    a_s_ptrs = a_s_ptr + offs_m * k_tiles + ki
+                    a_scale = tl.load(a_s_ptrs, mask=mask_m, other=1.0)
+                    b_s_ptrs = b_s_ptr + expert_idx * num_pid_n * k_tiles + (
+                        offs_n // BLOCK_SIZE_K) * k_tiles + ki
+                    b_scale = tl.load(b_s_ptrs, mask=mask_n, other=1.0)
+                    ab = ab * a_scale[:, None] * b_scale[None, :]
 
                 # Accumulate matrix multiplication for this K tile
-                accumulator += tl.dot(
-                    a, b.T
-                )  # out_dtype=tl.float32) # * a_scale # * b_scale
+                accumulator += ab
 
             tile_id_c += NUM_SMS
             tile_m_idx, tile_n_idx = _compute_pid(
@@ -263,6 +274,8 @@ def cg_grouped_gemm_forward(
     inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
+    input_scales: torch.Tensor | None = None,  # [M_bufferlen, K // block_size] or None
+    weight_scales: torch.Tensor | None = None,  # [num_experts, N // block_size, K // block_size] or None
     group_size_m: int = 128,
 ) -> torch.Tensor:
     """
@@ -311,6 +324,7 @@ def cg_grouped_gemm_forward(
 
     # Calculate grid size for the kernel
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
+    use_fp8 = input_scales is not None and weight_scales is not None
 
     grid = (NUM_SMS, 1, 1)
     # Launch kernel
@@ -319,6 +333,8 @@ def cg_grouped_gemm_forward(
         expert_weights,
         output,
         expert_indices,
+        input_scales,
+        weight_scales,
         M_TOTAL=M_total,
         N=N,
         K=K,
@@ -326,6 +342,7 @@ def cg_grouped_gemm_forward(
         GROUP_SIZE_M=group_size_m,
         NUM_SMS=NUM_SMS,
         SUPER_GROUP_M=32,
+        USE_FP8=use_fp8,
     )
 
     return output
@@ -335,6 +352,10 @@ def cg_grouped_gemm_forward_fake(
     inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
+    a_scales: torch.Tensor
+    | None = None,  # [M_bufferlen, K // block_size] or None
+    b_scales: torch.Tensor
+    | None = None,  # [num_experts, N // block_size, K // block_size] or None
     group_size_m: int = 128,
 ) -> torch.Tensor:
     """

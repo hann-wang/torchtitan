@@ -16,6 +16,11 @@ from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_forward impo
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotune import (
     early_config_prune,
     STANDARD_CONFIGS,
+    FIXED_BLOCK_SIZE_K,
+)
+from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import (
+    fp8_blockwise_act_quant,
+    fp8_blockwise_weight_quant,
 )
 
 # ============ Triton kernel for contiguous grouped GEMM backward inputs ============
@@ -23,7 +28,7 @@ from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotu
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["M_TOTAL", "N", "K"],
+    key=["M_TOTAL", "N", "K", "USE_FP8"],
     prune_configs_by={"early_config_prune": early_config_prune},
 )
 @triton.jit
@@ -35,6 +40,8 @@ def _kernel_cg_backward_dx(
     # Pointer to indices array
     indices_ptr,  # [M_TOTAL]
     # Matrix dimensions
+    go_s_ptr, # [M_TOTAL, N // block_size] or None
+    b_s_ptr, # [num_experts, N // block_size, K // block_size] or None
     M_TOTAL: tl.constexpr,  # Total M dimension (sum of all groups)
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
@@ -46,6 +53,7 @@ def _kernel_cg_backward_dx(
     BLOCK_SIZE_K: tl.constexpr,
     # Group size (for aligned loads)
     GROUP_SIZE_M: tl.constexpr = 128,
+    USE_FP8: tl.constexpr = False,  # Whether to use FP8 quantization
 ):
     """
     Computes the gradient with respect to the inputs (backward pass).
@@ -56,6 +64,7 @@ def _kernel_cg_backward_dx(
     # number of tiles per matrix dimension
     num_m_tiles = tl.cdiv(M_TOTAL, BLOCK_SIZE_M)
     num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
+    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
 
     # 2D tile index from linear
     tile_m = pid // num_k_tiles
@@ -102,9 +111,20 @@ def _kernel_cg_backward_dx(
             w_ptrs = b_ptr + expert_idx * N * K + offs_n[:, None] * K + offs_k[None, :]
             w = tl.load(w_ptrs, mask=mask_w, other=0.0)
 
+            gow = tl.dot(go, w)
+
+            if USE_FP8:
+                ni = n // BLOCK_SIZE_N
+                go_s_ptrs = go_s_ptr + offs_m * num_n_tiles + ni
+                b_s_ptrs = b_s_ptr + expert_idx * num_n_tiles * num_k_tiles + (
+                    offs_n // BLOCK_SIZE_N) * num_k_tiles + ni
+                go_scale = tl.load(go_s_ptrs, mask=mask_m, other=1.0)
+                w_scale = tl.load(b_s_ptrs, mask=mask_n, other=1.0)
+                gow = gow * go_scale[:, None] * w_scale[None, :]
+
             # Compute partial gradient for this N tile: grad_input += grad_output @ weights
             # Note: We're doing matmul without explicit transpose in triton
-            grad_input += tl.dot(go, w)
+            grad_input += gow
 
         # Store results with bounds checking
         grad_input_ptrs = grad_input_ptr + offs_m[:, None] * K + offs_k[None, :]
@@ -124,6 +144,8 @@ def _kernel_cg_backward_dw(
     inputs_ptr,  # [M_TOTAL, K]
     grad_weights_ptr,  # [num_experts, N, K]
     indices_ptr,  # [M_total]
+    go_s_ptr,  # [M_TOTAL // block_size, N] or None
+    a_s_ptr,  # [M_TOTAL // block_size, K] or None
     # Matrix dimensions
     M_TOTAL: tl.constexpr,  # Total M dimension
     N: tl.constexpr,  # N dimension
@@ -136,6 +158,7 @@ def _kernel_cg_backward_dw(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
+    USE_FP8: tl.constexpr,
 ):
     """
     Significantly simplified kernel for weight gradient computation.
@@ -202,7 +225,17 @@ def _kernel_cg_backward_dw(
 
                         # Compute gradient contribution
                         go_t = tl.trans(go)  # Transpose: [N, M]
-                        grad_weights += tl.dot(go_t, inp)
+                        go_t_inp = tl.dot(go_t, inp)
+
+                        if USE_FP8:
+                            # Load scales if using FP8
+                            mi = m_start // BLOCK_SIZE_M
+                            go_s_ptrs = go_s_ptr + mi * N + offs_n
+                            a_s_ptrs = a_s_ptr + mi * K + offs_k
+                            go_scale = tl.load(go_s_ptrs, mask=mask_n, other=1.0)
+                            a_scale = tl.load(a_s_ptrs, mask=mask_k, other=1.0)
+                            go_t_inp = go_t_inp * go_scale[:, None] * a_scale[None, :]
+                        grad_weights += go_t_inp
 
             # Store results to the appropriate part of the expert's weight gradients
             grad_w_ptrs = (
@@ -222,6 +255,10 @@ def cg_grouped_gemm_backward_weights(
     expert_indices: torch.Tensor,  # [M_total]
     num_experts: int,
     group_size_m: int = 128,
+    go_scales: torch.Tensor |
+    None = None,  # [M_bufferlen // block_size, N] Optional scales for grad_output
+    input_scales: torch.Tensor
+    | None = None,  # [M_bufferlen // block_size, K] Optional scales for inputs
 ) -> torch.Tensor:
     """
     Simple version of backward pass for weights using a single kernel launch.
@@ -257,9 +294,9 @@ def cg_grouped_gemm_backward_weights(
 
     # Define block sizes based on dimensions
     # These are chosen to balance parallelism and shared memory usage
-    block_size_n = min(128, N)
+    block_size_n = min(32, N)
     block_size_k = min(32, K)
-    block_size_m = min(32, group_size_m)
+    block_size_m = min(FIXED_BLOCK_SIZE_K, group_size_m)
 
     # Calculate grid size for the kernel
     # Each thread block handles one expert's N-K tile
@@ -267,12 +304,16 @@ def cg_grouped_gemm_backward_weights(
     k_tiles = triton.cdiv(K, block_size_k)
     grid = (num_experts * n_tiles * k_tiles,)
 
+    use_fp8 = go_scales is not None and input_scales is not None
+
     # Launch kernel
     _kernel_cg_backward_dw[grid](
         grad_output,
         inputs,
         grad_weights,
         expert_indices,
+        go_scales,
+        input_scales,
         M_TOTAL=M_total,
         N=N,
         K=K,
@@ -281,6 +322,7 @@ def cg_grouped_gemm_backward_weights(
         BLOCK_SIZE_N=block_size_n,
         BLOCK_SIZE_K=block_size_k,
         BLOCK_SIZE_M=block_size_m,
+        USE_FP8=use_fp8,
     )
 
     return grad_weights
@@ -292,6 +334,10 @@ def cg_grouped_gemm_backward_weights_fake(
     expert_indices: torch.Tensor,  # [M_total]
     num_experts: int,
     group_size_m: int = 128,
+    go_scales: torch.Tensor |
+    None = None,  # [M_bufferlen // block_size, N] Optional scales for grad_output
+    input_scales: torch.Tensor
+    | None = None,  # [M_bufferlen // block_size, K] Optional scales for inputs
 ) -> torch.Tensor:
     """
     Fake function for backward pass for weights.
@@ -308,6 +354,10 @@ def cg_grouped_gemm_backward_inputs(
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
     group_size_m: int = 128,
+    go_scales: torch.Tensor |
+    None = None,  # [M_bufferlen, N // block_size] Optional scales for grad_output
+    expert_weight_scales: torch.Tensor |
+    None = None,  # [num_experts, N // block_size, K // block_size] Optional scales for expert weights
 ) -> torch.Tensor:
     """
     Backward pass for contiguous grouped GEMM with respect to inputs.
@@ -347,17 +397,22 @@ def cg_grouped_gemm_backward_inputs(
         * triton.cdiv(K, meta["BLOCK_SIZE_K"]),
     )
 
+    use_fp8 = go_scales is not None and expert_weight_scales is not None
+
     # Launch kernel
     _kernel_cg_backward_dx[grid](
         grad_output,
         expert_weights,
         grad_inputs,
         expert_indices,
+        go_scales,
+        expert_weight_scales,
         M_TOTAL=M_total,
         N=N,
         K=K,
         NUM_EXPERTS=num_experts,
         GROUP_SIZE_M=group_size_m,
+        USE_FP8=use_fp8,
     )
 
     return grad_inputs
@@ -369,6 +424,10 @@ def cg_grouped_gemm_backward_inputs_fake(
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
     group_size_m: int = 128,
+    go_scales: torch.Tensor |
+    None = None,  # [M_bufferlen, N // block_size] Optional scales for grad_output
+    expert_weight_scales: torch.Tensor |
+    None = None,  # [num_experts, N // block_size, K // block_size] Optional scales for expert weights
 ) -> torch.Tensor:
     """
     Fake function for backward pass for inputs.
@@ -394,22 +453,47 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
     def forward(ctx, inputs, expert_weights, expert_indices, group_size_m=128):
         """Forward pass for contiguous grouped GEMM."""
 
+        use_fp8 = False
+
+        if use_fp8:
+            inputs_fp8, input_scales = fp8_blockwise_act_quant(
+                inputs,
+                block_size=FIXED_BLOCK_SIZE_K,
+            )
+            expert_weights_fp8, expert_weight_scales = fp8_blockwise_weight_quant(
+                expert_weights,
+                block_size=FIXED_BLOCK_SIZE_K,
+            )
+
         # Save for backward
         ctx.save_for_backward(inputs, expert_weights, expert_indices)
         ctx.group_size_m = group_size_m
+        ctx.use_fp8 = use_fp8
 
-        return cg_grouped_gemm_forward(
-            inputs=inputs,
-            expert_weights=expert_weights,
-            expert_indices=expert_indices,
-            group_size_m=group_size_m,
-        )
+        if use_fp8:
+            res = cg_grouped_gemm_forward(
+                inputs=inputs_fp8,
+                expert_weights=expert_weights_fp8,
+                expert_indices=expert_indices,
+                group_size_m=group_size_m,
+                input_scales=input_scales,
+                weight_scales=expert_weight_scales,
+            )
+        else:
+            res = cg_grouped_gemm_forward(
+                inputs=inputs,
+                expert_weights=expert_weights,
+                expert_indices=expert_indices,
+                group_size_m=group_size_m,
+            )
+        return res
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward pass for contiguous grouped GEMM."""
         inputs, expert_weights, expert_indices = ctx.saved_tensors
         group_size_m = ctx.group_size_m
+        use_fp8 = ctx.use_fp8
 
         # Get number of experts
         num_experts = expert_weights.shape[0]
@@ -417,20 +501,55 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         # Make sure grad_output is contiguous
         grad_output = grad_output.contiguous()
 
+        if use_fp8:
+            inputs_t, input_t_scales = fp8_blockwise_act_quant(
+                inputs.T.contiguous(),
+                block_size=FIXED_BLOCK_SIZE_K,
+            )
+            inputs = inputs_t.T.contiguous()
+            input_scales = input_t_scales.T.contiguous()
+
+            expert_weights, expert_weight_scales = fp8_blockwise_weight_quant(
+                expert_weights,
+                block_size=FIXED_BLOCK_SIZE_K,
+            )
+            grad_output_fp8, grad_output_scales = fp8_blockwise_act_quant(
+                grad_output,
+                block_size=FIXED_BLOCK_SIZE_K,
+            )
+            grad_output_t, grad_output_t_scales = fp8_blockwise_act_quant(
+                grad_output.T.contiguous(),
+                block_size=FIXED_BLOCK_SIZE_K,
+            )
+            grad_output_fp8_m = grad_output_t.T.contiguous()
+            grad_output_scales_m = grad_output_t_scales.T.contiguous()
+
+        else:
+            input_scales = None
+            expert_weight_scales = None
+            grad_output_fp8 = grad_output
+            grad_output_scales = None
+            grad_output_fp8_m = grad_output
+            grad_output_scales_m = None
+
         # Compute gradients
         grad_inputs = cg_grouped_gemm_backward_inputs(
-            grad_output=grad_output,
+            grad_output=grad_output_fp8,
             expert_weights=expert_weights,
             expert_indices=expert_indices,
             group_size_m=group_size_m,
+            go_scales=grad_output_scales,
+            expert_weight_scales=expert_weight_scales,
         )
 
         grad_weights = cg_grouped_gemm_backward_weights(
-            grad_output=grad_output,
+            grad_output=grad_output_fp8_m,
             inputs=inputs,
             expert_indices=expert_indices,
             num_experts=num_experts,
             group_size_m=group_size_m,
+            go_scales=grad_output_scales_m,
+            input_scales=input_scales,
         )
 
         # No gradient for expert_indices (it's just an index tensor)
@@ -470,6 +589,18 @@ def cg_grouped_gemm(
 
 # =============== Test functions for verifying correctness =================
 
+def calc_snr(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    eps: float = 1e-6,
+) -> float:
+    """
+    Calculate the Signal-to-Noise Ratio (SNR) between two tensors.
+    SNR = 10 * log10(sum(x^2) / (sum((x - y)^2) + eps))
+    """
+    signal = torch.sum(x ** 2)
+    noise = torch.sum((x - y) ** 2) + eps
+    return 10 * torch.log10(signal / noise)
 
 def verify_cg_gemm_backward(
     M_total=1024,
@@ -493,11 +624,26 @@ def verify_cg_gemm_backward(
 
     # Create test tensors
     torch.manual_seed(0)
-    inputs = torch.randn((M_total, K), device=device, requires_grad=True)
-    expert_weights = torch.randn((num_experts, N, K), device=device, requires_grad=True)
+    dtype = torch.bfloat16
+    inputs = torch.randn(
+        (M_total, K),
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    expert_weights = torch.randn(
+        (num_experts, N, K),
+        dtype=dtype,
+        device=device,
+        requires_grad=True,
+    )
 
     # Create expert indices - each token in a group has the same expert
-    expert_indices = torch.zeros(M_total, dtype=torch.int32, device=device)
+    expert_indices = torch.zeros(
+        M_total,
+        dtype=torch.int32,
+        device=device,
+    )
     for g in range(num_groups):
         expert_idx = torch.randint(
             0, num_experts, (1,), device=device, dtype=torch.int32
@@ -507,10 +653,10 @@ def verify_cg_gemm_backward(
         expert_indices[start_idx:end_idx] = expert_idx
 
     # Create a target for gradient computation
-    target = torch.randn((M_total, N), device=device)
+    target = torch.randn((M_total, N), dtype=dtype, device=device)
 
     # PyTorch reference implementation
-    outputs_ref = torch.zeros((M_total, N), device=device)
+    outputs_ref = torch.zeros((M_total, N), dtype=dtype, device=device)
     for g in range(num_groups):
         group_start = g * group_size_m
         group_end = (g + 1) * group_size_m
@@ -538,8 +684,23 @@ def verify_cg_gemm_backward(
     loss.backward()
 
     # Check if outputs match
+    print(f"outputs={outputs}")
+    print(f"outputs_ref={outputs_ref}")
     outputs_match = torch.allclose(outputs, outputs_ref, atol=atol, rtol=rtol)
-    print(f"Outputs match: {outputs_match}")
+    print(f"Outputs match: {outputs_match} SNR={calc_snr(outputs, outputs_ref)}")
+    if not outputs_match:
+        # Compute max absolute difference for debugging
+        max_diff = torch.max(torch.abs(outputs - outputs_ref))
+        print(f"Max difference in outputs: {max_diff}")
+
+        # Check where the largest differences are
+        flat_idx = torch.argmax(torch.abs(outputs - outputs_ref))
+        row = flat_idx // N
+        col = flat_idx % N
+        print(f"Largest difference at position [{row}, {col}]")
+        print(
+            f"Triton: {outputs[row, col].item()}, PyTorch: {outputs_ref[row, col].item()}"
+        )
 
     # Check if gradients match
     inputs_grad_match = torch.allclose(
@@ -549,8 +710,8 @@ def verify_cg_gemm_backward(
         expert_weights.grad, grad_weights_ref, atol=atol, rtol=rtol
     )
 
-    print(f"Input gradients match: {inputs_grad_match}")
-    print(f"Weight gradients match: {weights_grad_match}")
+    print(f"Input gradients match: {inputs_grad_match} SNR={calc_snr(inputs.grad, grad_inputs_ref)}")
+    print(f"Weight gradients match: {weights_grad_match} SNR={calc_snr(expert_weights.grad, grad_weights_ref)}")
 
     if not inputs_grad_match:
         # Compute max absolute difference for debugging
@@ -609,8 +770,9 @@ def benchmark_cg_gemm_backward(
 
     # Create test tensors
     torch.manual_seed(0)
-    inputs = torch.randn((M_total, K), device=device, requires_grad=True)
-    expert_weights = torch.randn((num_experts, N, K), device=device, requires_grad=True)
+    dtype = torch.bfloat16
+    inputs = torch.randn((M_total, K), device=device, dtype=dtype, requires_grad=True)
+    expert_weights = torch.randn((num_experts, N, K), dtype=dtype, device=device, requires_grad=True)
 
     # Create expert indices - each token in a group has the same expert
     expert_indices = torch.zeros(M_total, dtype=torch.int32, device=device)
@@ -623,12 +785,12 @@ def benchmark_cg_gemm_backward(
         expert_indices[start_idx:end_idx] = expert_idx
 
     # Create gradient for backward pass
-    grad_output = torch.randn((M_total, N), device=device)
+    grad_output = torch.randn((M_total, N), dtype=dtype, device=device)
 
     # Benchmark PyTorch reference implementation
     def run_pytorch_backward():
         # PyTorch reference implementation
-        outputs_ref = torch.zeros((M_total, N), device=device)
+        outputs_ref = torch.zeros((M_total, N), dtype=dtype, device=device)
         for g in range(num_groups):
             group_start = g * group_size_m
             group_end = (g + 1) * group_size_m

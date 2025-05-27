@@ -12,6 +12,7 @@ import triton.language as tl
 
 # ===== Supporting utils, CUDA and TMA =====
 
+FIXED_BLOCK_SIZE_K = 128
 
 class CudaUtils:
     @staticmethod
@@ -126,102 +127,16 @@ class TmaDescriptorHelper:
 
 # ================== End of supporting functions ==================
 
-'''
-def early_config_prune(configs, args, **kwargs):
-    """Filter out configurations that would exceed shared memory capacity."""
-    sms = kwargs.get("NUM_SMS", 108)  # Default value if not provided
-    k = kwargs.get("K", 0)
-    configs = [
-        config for config in configs if config.kwargs.get("BLOCK_SIZE_K", 0) <= k
-    ]
-    return configs
-'''
-
-# Define standard configurations for Hopper GPUs
-HOPPER_CONFIGS = [
-    # Configurations for small matrices
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
-        num_stages=2,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32},
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-        num_stages=4,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
-        num_stages=4,
-        num_warps=4,
-    ),
-    # Configurations for medium to large matrices
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64},
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 64},
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64},
-        num_stages=4,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 256, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
-        num_stages=4,
-        num_warps=8,
-    ),
-]
-
 
 # Define standard configurations - simplified for robustness
 STANDARD_CONFIGS = [
-    # Configurations for small matrices
     triton.Config(
-        {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-        num_stages=2,
-        num_warps=4,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
-        num_stages=2,
-        num_warps=4,
-    ),
-    # Medium sizes
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
-        num_stages=2,
-        num_warps=8,
-    ),
-    # Larger sizes with more warps, stages
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
-        num_stages=3,
-        num_warps=8,
-    ),
-    triton.Config(
-        {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 64},
-        num_stages=4,
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K
+        },
+        num_stages=1,
         num_warps=8,
     ),
 ]

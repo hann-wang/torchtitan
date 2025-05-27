@@ -7,7 +7,7 @@
 # DeepSeek V2 Lite
 
 [job]
-dump_folder = "./deepseek-v2-lite-bf16-outputs"
+dump_folder = "./deepseek-v2-lite-fp8-linear-fa-outputs"
 description = "DeepSeek v2 training"
 
 [profiling]
@@ -25,7 +25,7 @@ enable_wandb = false
 name = "DeepSeek"
 flavor = "V2-Lite"
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
-# converters = ["float8"]
+converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
