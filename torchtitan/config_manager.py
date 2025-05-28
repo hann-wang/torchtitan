@@ -461,6 +461,9 @@ class Float8:
     
     enable_fp8_gmm: bool = False
     """Whether to use FP8 grouped_gemm Triton kernel"""
+    
+    enable_fp8_linear: bool = True
+    """Whether to use FP8 Linear module"""
 
 
 @dataclass

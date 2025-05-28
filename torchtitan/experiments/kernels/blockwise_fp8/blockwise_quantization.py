@@ -5,15 +5,16 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Tuple, List
+from typing import Tuple
 
 import torch
-from torch.library import custom_op
+from torch.library import triton_op, wrap_triton
 import triton
 import triton.language as tl
 from triton import Config
 
 # Original implementation at https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py
+torch_dtype = torch.bfloat16
 
 fp8_gemm_configs = [
     Config(
@@ -93,7 +94,7 @@ def blockwise_fp8_gemm(
     M = a.numel() // K
     N = b.size(0)
     M_BUCKET = math.ceil(math.log2(M))
-    c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
+    c = a.new_empty(*a.size()[:-1], N, dtype=torch_dtype)
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
@@ -152,10 +153,10 @@ def fp8_blockwise_act_quant_kernel(
                                   tl.arange(0, BLOCK_SIZE)) * stride_yn
     offs_s = pid_m * stride_sm + pid_n * stride_sn
     tl.store(y_ptr + offs_y, y)
-    tl.store(s_ptr + offs_s, s)
+    tl.store(s_ptr + offs_s, s.to(s_ptr.dtype.element_ty))
 
 
-@custom_op("torchtitan::fp8_blockwise_act_quant", mutates_args={})
+@triton_op("torchtitan::fp8_blockwise_act_quant", mutates_args={})
 def fp8_blockwise_act_quant(
     x: torch.Tensor,
     block_size: int = 128,
@@ -198,7 +199,7 @@ def fp8_blockwise_act_quant(
         M,
         num_blocks_n,
     )
-    fp8_blockwise_act_quant_kernel[grid](
+    wrap_triton(fp8_blockwise_act_quant_kernel)[grid](
         x,
         y,
         s,
@@ -268,7 +269,7 @@ def fp8_blockwise_act_dequant_kernel(
 
     offs_x = pid_m * stride_xm + (start_n +
                                   tl.arange(0, BLOCK_SIZE)) * stride_xn
-    x = tl.load(x_ptr + offs_x).to(y_ptr.dtype.element_ty)
+    x = tl.load(x_ptr + offs_x).to(tl.float32)
 
     s = tl.load(s_ptr + pid_m * stride_sm + pid_n * stride_sn)
     y = x * s
@@ -279,7 +280,7 @@ def fp8_blockwise_act_dequant_kernel(
     tl.store(y_ptr + offs_y, y)
 
 
-@custom_op("torchtitan::fp8_blockwise_act_dequant", mutates_args={})
+@triton_op("torchtitan::fp8_blockwise_act_dequant", mutates_args={})
 def fp8_blockwise_act_dequant(
     x: torch.Tensor,
     s: torch.Tensor,
@@ -304,7 +305,7 @@ def fp8_blockwise_act_dequant(
     assert x.dim() == 2, "Input tensor must have 2 dimensions"
 
     y = torch.zeros_like(x,
-                         dtype=torch.get_default_dtype(),
+                         dtype=torch_dtype,
                          memory_format=torch.contiguous_format)
 
     x = x.transpose(axis, -1)
@@ -320,7 +321,7 @@ def fp8_blockwise_act_dequant(
         M,
         num_blocks_n,
     )
-    fp8_blockwise_act_dequant_kernel[grid](
+    wrap_triton(fp8_blockwise_act_dequant_kernel)[grid](
         x,
         s,
         y,
@@ -351,7 +352,7 @@ def fp8_blockwise_act_dequant_fake(
     )
     assert x.dim() == 2, "Input tensor must have 2 dimensions"
 
-    y = torch.zeros_like(x, dtype=torch.get_default_dtype())
+    y = torch.zeros_like(x, dtype=torch_dtype)
     return y
 
 
@@ -383,11 +384,12 @@ def fp8_blockwise_weight_quant_kernel(x_ptr, y_ptr, s_ptr, M, N,
     s = tl.where(s == 0.0, 1.0, s)  # Avoid division by zero
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
+    s = s.to(s_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
     tl.store(s_ptr + pid_b * m * n + pid_m * n + pid_n, s)
 
 
-@custom_op("torchtitan::fp8_blockwise_weight_quant", mutates_args={})
+@triton_op("torchtitan::fp8_blockwise_weight_quant", mutates_args={})
 def fp8_blockwise_weight_quant(
     x: torch.Tensor,
     block_size: int = 128,
@@ -423,12 +425,12 @@ def fp8_blockwise_weight_quant(
         triton.cdiv(M, meta["BLOCK_SIZE"]),
         triton.cdiv(N, meta["BLOCK_SIZE"]),
     )
-    fp8_blockwise_weight_quant_kernel[grid](x,
-                                            y,
-                                            s,
-                                            M,
-                                            N,
-                                            BLOCK_SIZE=block_size)
+    wrap_triton(fp8_blockwise_weight_quant_kernel)[grid](x,
+                                                         y,
+                                                         s,
+                                                         M,
+                                                         N,
+                                                         BLOCK_SIZE=block_size)
     if x.dim() == 2:
         s = s.squeeze(0)
     return y, s
@@ -490,10 +492,10 @@ def fp8_blockwise_weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N,
     x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
     s = tl.load(s_ptr + pid_b * m * n + pid_m * n + pid_n)
     y = x * s
-    tl.store(y_ptr + offs, y, mask=mask)
+    tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
 
 
-@custom_op("torchtitan::fp8_blockwise_weight_dequant", mutates_args={})
+@triton_op("torchtitan::fp8_blockwise_weight_dequant", mutates_args={})
 def fp8_blockwise_weight_dequant(x: torch.Tensor,
                                  s: torch.Tensor,
                                  block_size: int = 128) -> torch.Tensor:
@@ -521,18 +523,14 @@ def fp8_blockwise_weight_dequant(x: torch.Tensor,
         B = 1
     else:
         B, M, N = x.size()
-    y = torch.zeros_like(x, dtype=torch.get_default_dtype())
+    y = torch.zeros_like(x, dtype=torch_dtype)
     grid = lambda meta: (
         B,
         triton.cdiv(M, meta["BLOCK_SIZE"]),
         triton.cdiv(N, meta["BLOCK_SIZE"]),
     )
-    fp8_blockwise_weight_dequant_kernel[grid](x,
-                                              s,
-                                              y,
-                                              M,
-                                              N,
-                                              BLOCK_SIZE=block_size)
+    wrap_triton(fp8_blockwise_weight_dequant_kernel)[grid](
+        x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
 
 
@@ -551,5 +549,5 @@ def fp8_blockwise_weight_dequant_fake(
     assert (x.dim() == 2 and s.dim() == 2) or (
         x.dim() == 3
         and s.dim() == 3), "Input tensors must have 2 or 3 dimensions"
-    y = torch.zeros_like(x, dtype=torch.get_default_dtype())
+    y = torch.zeros_like(x, dtype=torch_dtype)
     return y

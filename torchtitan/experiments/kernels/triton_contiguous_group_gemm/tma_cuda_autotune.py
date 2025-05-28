@@ -12,7 +12,7 @@ import triton.language as tl
 
 # ===== Supporting utils, CUDA and TMA =====
 
-FIXED_BLOCK_SIZE_K = 128
+ALIGN_SIZE_M = 128
 
 class CudaUtils:
     @staticmethod
@@ -131,8 +131,8 @@ STANDARD_CONFIGS = [
     triton.Config(
         {
             "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": ALIGN_SIZE_M,
+            "BLOCK_SIZE_K": ALIGN_SIZE_M,
         },
         num_stages=2,
         num_warps=4,
@@ -140,8 +140,8 @@ STANDARD_CONFIGS = [
     triton.Config(
         {
             "BLOCK_SIZE_M": 32,
-            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": ALIGN_SIZE_M,
+            "BLOCK_SIZE_K": ALIGN_SIZE_M,
         },
         num_stages=2,
         num_warps=8,
@@ -149,8 +149,8 @@ STANDARD_CONFIGS = [
     triton.Config(
         {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": ALIGN_SIZE_M,
+            "BLOCK_SIZE_K": ALIGN_SIZE_M,
         },
         num_stages=2,
         num_warps=4,
@@ -158,8 +158,8 @@ STANDARD_CONFIGS = [
     triton.Config(
         {
             "BLOCK_SIZE_M": 64,
-            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": ALIGN_SIZE_M,
+            "BLOCK_SIZE_K": ALIGN_SIZE_M,
         },
         num_stages=2,
         num_warps=8,
@@ -167,8 +167,8 @@ STANDARD_CONFIGS = [
     triton.Config(
         {
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": ALIGN_SIZE_M,
+            "BLOCK_SIZE_K": ALIGN_SIZE_M,
         },
         num_stages=2,
         num_warps=4,
@@ -176,8 +176,8 @@ STANDARD_CONFIGS = [
     triton.Config(
         {
             "BLOCK_SIZE_M": 128,
-            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": ALIGN_SIZE_M,
+            "BLOCK_SIZE_K": ALIGN_SIZE_M,
         },
         num_stages=2,
         num_warps=8,
@@ -187,7 +187,7 @@ STANDARD_CONFIGS = [
 STANDARD_DW_CONFIGS = [
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": ALIGN_SIZE_M,
             "BLOCK_SIZE_N": 32,
             "BLOCK_SIZE_K": 32,
         },
@@ -196,7 +196,7 @@ STANDARD_DW_CONFIGS = [
     ),
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": ALIGN_SIZE_M,
             "BLOCK_SIZE_N": 32,
             "BLOCK_SIZE_K": 32,
         },
@@ -205,7 +205,7 @@ STANDARD_DW_CONFIGS = [
     ),
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": ALIGN_SIZE_M,
             "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 64,
         },
@@ -214,7 +214,7 @@ STANDARD_DW_CONFIGS = [
     ),
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": ALIGN_SIZE_M,
             "BLOCK_SIZE_N": 64,
             "BLOCK_SIZE_K": 64,
         },
@@ -223,7 +223,7 @@ STANDARD_DW_CONFIGS = [
     ),
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": ALIGN_SIZE_M,
             "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 128,
         },
@@ -232,7 +232,7 @@ STANDARD_DW_CONFIGS = [
     ),
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": ALIGN_SIZE_M,
             "BLOCK_SIZE_N": 128,
             "BLOCK_SIZE_K": 128,
         },

@@ -7,7 +7,9 @@
 
 import torch
 import triton
-from torch.library import custom_op
+# from torch.library import triton_op, wrap_triton
+from torch.library import custom_op as triton_op
+wrap_triton = lambda x: x
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
@@ -15,7 +17,7 @@ import triton.language as tl
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_forward import cg_grouped_gemm_forward
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotune import (
     STANDARD_CONFIGS,
-    FIXED_BLOCK_SIZE_K,
+    ALIGN_SIZE_M,
     STANDARD_DW_CONFIGS,
 )
 from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import (
@@ -265,13 +267,12 @@ def _kernel_cg_backward_dw(
             tl.store(grad_w_ptrs, grad_weights, mask=mask_gw)
 
 
-@custom_op("torchtitan::cg_grouped_gemm_backward_weights", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_backward_weights", mutates_args={})
 def cg_grouped_gemm_backward_weights(
     grad_output: torch.Tensor,  # [M_bufferlen, N]
     inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_indices: torch.Tensor,  # [M_total]
     num_experts: int,
-    group_size_m: int = 128,
     go_scales: torch.Tensor |
     None = None,  # [M_bufferlen // block_size, N] Optional scales for grad_output
     input_scales: torch.Tensor
@@ -285,7 +286,6 @@ def cg_grouped_gemm_backward_weights(
         inputs: Input tensor, shape [M_bufferlen, K]
         expert_indices: Indices tensor mapping each token to its expert, shape [M_total]
         num_experts: Number of experts
-        group_size_m: Size of contiguous token blocks for each expert (default: 128)
 
     Returns:
         grad_weights: Gradient with respect to expert weights, shape [num_experts, N, K]
@@ -318,7 +318,7 @@ def cg_grouped_gemm_backward_weights(
     use_fp8 = go_scales is not None and input_scales is not None
 
     # Launch kernel
-    _kernel_cg_backward_dw[grid](
+    wrap_triton(_kernel_cg_backward_dw)[grid](
         grad_output,
         inputs,
         grad_weights,
@@ -329,7 +329,7 @@ def cg_grouped_gemm_backward_weights(
         N=N,
         K=K,
         NUM_EXPERTS=num_experts,
-        GROUP_SIZE_M=group_size_m,
+        GROUP_SIZE_M=ALIGN_SIZE_M,
         USE_FP8=use_fp8,
     )
 
@@ -341,7 +341,6 @@ def cg_grouped_gemm_backward_weights_fake(
     inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_indices: torch.Tensor,  # [M_total]
     num_experts: int,
-    group_size_m: int = 128,
     go_scales: torch.Tensor |
     None = None,  # [M_bufferlen // block_size, N] Optional scales for grad_output
     input_scales: torch.Tensor
@@ -358,12 +357,11 @@ def cg_grouped_gemm_backward_weights_fake(
                        dtype=torch_dtype)
 
 
-@custom_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
 def cg_grouped_gemm_backward_inputs(
     grad_output: torch.Tensor,  # [M_bufferlen, N]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
-    group_size_m: int = 128,
     go_scales: torch.Tensor |
     None = None,  # [M_bufferlen, N // block_size] Optional scales for grad_output
     expert_weight_scales: torch.Tensor |
@@ -376,7 +374,6 @@ def cg_grouped_gemm_backward_inputs(
         grad_output: Gradient from output, shape [M_total, N]
         expert_weights: Expert weight tensor, shape [num_experts, N, K]
         expert_indices: Indices tensor mapping each token to its expert, shape [M_total]
-        group_size_m: Size of contiguous token blocks for each expert (default: 128)
 
     Returns:
         grad_inputs: Gradient with respect to inputs, shape [M_total, K]
@@ -393,8 +390,8 @@ def cg_grouped_gemm_backward_inputs(
 
     # Check if dimensions match
     assert (
-        M_total % group_size_m == 0
-    ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
+        M_total % ALIGN_SIZE_M == 0
+    ), f"M_total ({M_total}) must be a multiple of group_size_m ({ALIGN_SIZE_M})"
 
     # Create output tensor for gradients
     grad_inputs = torch.zeros((M_bufferlen, K),
@@ -410,7 +407,7 @@ def cg_grouped_gemm_backward_inputs(
     use_fp8 = go_scales is not None and expert_weight_scales is not None
 
     # Launch kernel
-    _kernel_cg_backward_dx[grid](
+    wrap_triton(_kernel_cg_backward_dx)[grid](
         grad_output,
         expert_weights,
         grad_inputs,
@@ -421,7 +418,7 @@ def cg_grouped_gemm_backward_inputs(
         N=N,
         K=K,
         NUM_EXPERTS=num_experts,
-        GROUP_SIZE_M=group_size_m,
+        GROUP_SIZE_M=ALIGN_SIZE_M,
         USE_FP8=use_fp8,
     )
 
@@ -433,7 +430,6 @@ def cg_grouped_gemm_backward_inputs_fake(
     grad_output: torch.Tensor,  # [M_bufferlen, N]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
-    group_size_m: int = 128,
     go_scales: torch.Tensor |
     None = None,  # [M_bufferlen, N // block_size] Optional scales for grad_output
     expert_weight_scales: torch.Tensor |
@@ -452,7 +448,6 @@ def cg_grouped_gemm_backward_inputs_fake(
 
 # =============== Update the autograd function =================
 
-
 @torch._dynamo.allow_in_graph
 class ContiguousGroupedGEMM(torch.autograd.Function):
     """
@@ -460,18 +455,18 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs, expert_weights, expert_indices, group_size_m=128, use_fp8=False):
+    def forward(ctx, inputs, expert_weights, expert_indices, use_fp8=False):
         """Forward pass for contiguous grouped GEMM."""
 
         if use_fp8:
             inputs_fp8, input_scales = fp8_blockwise_act_quant(
                 inputs,
-                block_size=FIXED_BLOCK_SIZE_K,
+                block_size=ALIGN_SIZE_M,
                 axis=-1,
             )
             expert_weights_fp8, expert_weight_scales = fp8_blockwise_weight_quant(
                 expert_weights,
-                block_size=FIXED_BLOCK_SIZE_K,
+                block_size=ALIGN_SIZE_M,
             )
             # Save for backward
             ctx.save_for_backward(inputs_fp8, input_scales, expert_weights_fp8,
@@ -479,7 +474,6 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         else:
             # Save for backward
             ctx.save_for_backward(inputs, expert_weights, expert_indices)
-        ctx.group_size_m = group_size_m
         ctx.use_fp8 = use_fp8
 
         if use_fp8:
@@ -487,7 +481,6 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
                 inputs=inputs_fp8,
                 expert_weights=expert_weights_fp8,
                 expert_indices=expert_indices,
-                group_size_m=group_size_m,
                 input_scales=input_scales,
                 weight_scales=expert_weight_scales,
             )
@@ -496,15 +489,12 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
                 inputs=inputs,
                 expert_weights=expert_weights,
                 expert_indices=expert_indices,
-                group_size_m=group_size_m,
             )
         return res
 
     @staticmethod
     def backward(ctx, grad_output):
         """Backward pass for contiguous grouped GEMM."""
-
-        group_size_m = ctx.group_size_m
         use_fp8 = ctx.use_fp8
         if use_fp8:
             inputs_fp8, input_scales, expert_weights, expert_weight_scales, expert_indices = ctx.saved_tensors
@@ -521,22 +511,22 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
             inputs_dequant = fp8_blockwise_act_dequant(
                 inputs_fp8,
                 input_scales,
-                block_size=FIXED_BLOCK_SIZE_K,
+                block_size=ALIGN_SIZE_M,
                 axis=-1,
             )
             inputs_fp8, input_scales = fp8_blockwise_act_quant(
                 inputs_dequant,
-                block_size=FIXED_BLOCK_SIZE_K,
+                block_size=ALIGN_SIZE_M,
                 axis=0,
             )
             grad_output_fp8, grad_output_scales = fp8_blockwise_act_quant(
                 grad_output,
-                block_size=FIXED_BLOCK_SIZE_K,
+                block_size=ALIGN_SIZE_M,
                 axis=-1,
             )
             grad_output_fp8_m, grad_output_scales_m = fp8_blockwise_act_quant(
                 grad_output,
-                block_size=FIXED_BLOCK_SIZE_K,
+                block_size=ALIGN_SIZE_M,
                 axis=0,
             )
         else:
@@ -553,7 +543,6 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
             grad_output=grad_output_fp8,
             expert_weights=expert_weights,
             expert_indices=expert_indices,
-            group_size_m=group_size_m,
             go_scales=grad_output_scales,
             expert_weight_scales=expert_weight_scales,
         )
@@ -562,7 +551,6 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
             inputs=inputs_fp8,
             expert_indices=expert_indices,
             num_experts=num_experts,
-            group_size_m=group_size_m,
             go_scales=grad_output_scales_m,
             input_scales=input_scales,
         )
@@ -570,18 +558,14 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         # No gradient for expert_indices (it's just an index tensor)
         grad_indices = None
 
-        # No gradient for group_size_m (it's just a parameter)
-        grad_group_size_m = None
-
-        return grad_inputs, grad_weights, grad_indices, grad_group_size_m, None
+        return grad_inputs, grad_weights, grad_indices, None
 
 
 def cg_grouped_gemm(
     inputs: torch.Tensor,
     expert_weights: torch.Tensor,
     expert_indices: torch.Tensor,
-    group_size_m: int = 128,
-    use_fp8: bool = False,
+    use_fp8: bool = True,
 ) -> torch.Tensor:
     """
     Interface for contiguous grouped GEMM with full backward pass support.
@@ -590,7 +574,6 @@ def cg_grouped_gemm(
         inputs: Input tensor of shape [M_total, K]
         expert_weights: Expert weight tensor of shape [num_experts, N, K]
         expert_indices: Indices tensor of shape [M_total] mapping each token to its expert
-        group_size_m: Size of contiguous token blocks for each expert (default: 128)
 
     Returns:
         Output tensor of shape [M_total, N]
@@ -599,7 +582,7 @@ def cg_grouped_gemm(
         expert_indices = expert_indices.to(torch.int32)
 
     return ContiguousGroupedGEMM.apply(inputs, expert_weights, expert_indices,
-                                       group_size_m, use_fp8)
+                                       use_fp8)
 
 
 # =============== Test functions for verifying correctness =================
@@ -636,7 +619,6 @@ def verify_cg_gemm_backward(
     N=512,
     K=512,
     num_experts=8,
-    group_size_m=128,
     device="cuda",
     atol=1e-1,  # Absolute tolerance for validation
     rtol=1e-1,  # Relative tolerance for validation
@@ -648,8 +630,8 @@ def verify_cg_gemm_backward(
         tuple: (inputs_passed, weights_passed) indicating if the respective gradients match
     """
     # Ensure M_total is a multiple of group_size_m
-    M_total = (M_total // group_size_m) * group_size_m
-    num_groups = M_total // group_size_m
+    M_total = (M_total // ALIGN_SIZE_M) * ALIGN_SIZE_M
+    num_groups = M_total // ALIGN_SIZE_M
 
     # Create test tensors
     torch.manual_seed(0)
@@ -677,8 +659,8 @@ def verify_cg_gemm_backward(
         expert_idx = torch.randint(
             0, num_experts, (1,), device=device, dtype=torch.int32
         ).item()
-        start_idx = g * group_size_m
-        end_idx = (g + 1) * group_size_m
+        start_idx = g * ALIGN_SIZE_M
+        end_idx = (g + 1) * ALIGN_SIZE_M
         expert_indices[start_idx:end_idx] = expert_idx
 
     # Create a target for gradient computation
@@ -687,8 +669,8 @@ def verify_cg_gemm_backward(
     # PyTorch reference implementation
     outputs_ref = torch.zeros((M_total, N), dtype=dtype, device=device)
     for g in range(num_groups):
-        group_start = g * group_size_m
-        group_end = (g + 1) * group_size_m
+        group_start = g * ALIGN_SIZE_M
+        group_end = (g + 1) * ALIGN_SIZE_M
         expert_idx = expert_indices[group_start].item()
 
         # Compute output for this group
@@ -708,7 +690,8 @@ def verify_cg_gemm_backward(
     expert_weights.grad.zero_()
 
     # Compute with our implementation
-    outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices, group_size_m)
+    outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices,
+                              ALIGN_SIZE_M)
     loss = torch.nn.functional.mse_loss(outputs, target)
     loss.backward()
 
@@ -781,7 +764,6 @@ def benchmark_cg_gemm_backward(
     N=512,
     K=512,
     num_experts=8,
-    group_size_m=128,
     device="cuda",
     num_runs=10,
 ):
@@ -794,8 +776,8 @@ def benchmark_cg_gemm_backward(
     import time
 
     # Ensure M_total is a multiple of group_size_m
-    M_total = (M_total // group_size_m) * group_size_m
-    num_groups = M_total // group_size_m
+    M_total = (M_total // ALIGN_SIZE_M) * ALIGN_SIZE_M
+    num_groups = M_total // ALIGN_SIZE_M
 
     # Create test tensors
     torch.manual_seed(0)
@@ -816,8 +798,8 @@ def benchmark_cg_gemm_backward(
                                    num_experts, (1, ),
                                    device=device,
                                    dtype=torch.int32).item()
-        start_idx = g * group_size_m
-        end_idx = (g + 1) * group_size_m
+        start_idx = g * ALIGN_SIZE_M
+        end_idx = (g + 1) * ALIGN_SIZE_M
         expert_indices[start_idx:end_idx] = expert_idx
 
     # Create gradient for backward pass
@@ -828,8 +810,8 @@ def benchmark_cg_gemm_backward(
         # PyTorch reference implementation
         outputs_ref = torch.zeros((M_total, N), dtype=dtype, device=device)
         for g in range(num_groups):
-            group_start = g * group_size_m
-            group_end = (g + 1) * group_size_m
+            group_start = g * ALIGN_SIZE_M
+            group_end = (g + 1) * ALIGN_SIZE_M
             expert_idx = expert_indices[group_start].item()
 
             # Compute output for this group
@@ -843,7 +825,7 @@ def benchmark_cg_gemm_backward(
     def run_triton_backward():
         # Forward pass with our implementation
         outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices,
-                                  group_size_m)
+                                  ALIGN_SIZE_M)
 
         # Backward pass
         outputs.backward(grad_output)

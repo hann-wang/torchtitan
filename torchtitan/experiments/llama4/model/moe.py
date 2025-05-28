@@ -111,14 +111,12 @@ class GroupedExperts(nn.Module):
                     x,
                     w1.transpose(-1, -2).contiguous(),
                     m_indices,
-                    ALIGN_SIZE_M,
                     use_fp8=self.use_fp8,
                 )
                 up_proj = cg_grouped_gemm(
                     x,
                     w3.transpose(-1, -2).contiguous(),
                     m_indices,
-                    ALIGN_SIZE_M,
                     use_fp8=self.use_fp8,
                 )
                 # Apply activation
@@ -128,7 +126,6 @@ class GroupedExperts(nn.Module):
                     hidden_outputs,
                     w2.transpose(-1, -2).contiguous(),
                     m_indices,
-                    ALIGN_SIZE_M,
                     use_fp8=self.use_fp8,
                 )
             else:

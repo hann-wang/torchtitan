@@ -53,7 +53,7 @@ def parallelize_llama(
         ):
             raise RuntimeError("Async TP requires --training.compile")
 
-        enable_float8_linear = "float8" in job_config.model.converters
+        enable_float8_linear = "float8" in job_config.model.converters and job_config.float8.enable_fp8_linear
         float8_is_rowwise = job_config.float8.recipe_name in (
             "rowwise",
             "rowwise_with_gw_hp",

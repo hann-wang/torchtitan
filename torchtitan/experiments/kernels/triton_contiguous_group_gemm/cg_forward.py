@@ -9,19 +9,22 @@
 import logging
 
 import torch
-from torch.library import custom_op
+# from torch.library import triton_op, wrap_triton
+from torch.library import custom_op as triton_op
+wrap_triton = lambda x: x
 import triton
 import triton.language as tl
 
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotune import (
-    STANDARD_CONFIGS, )
+    STANDARD_CONFIGS,
+    ALIGN_SIZE_M,
+)
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-GROUP_SIZE_M = 128
 torch_dtype = torch.bfloat16
 
 # ============ Triton kernel for contiguous grouped GEMM ============
@@ -274,14 +277,13 @@ def _kernel_cg_forward_aligned(
 # =============== Forward Wrapper for CGGEMM =================
 
 
-@custom_op("torchtitan::cg_grouped_gemm_forward", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_forward", mutates_args={})
 def cg_grouped_gemm_forward(
     inputs: torch.Tensor,  # [M_bufferlen, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
     input_scales: torch.Tensor | None = None,  # [M_bufferlen, K // block_size] or None
     weight_scales: torch.Tensor | None = None,  # [num_experts, N // block_size, K // block_size] or None
-    group_size_m: int = 128,
 ) -> torch.Tensor:
     """
     contiguous grouped GEMM forward pass for MoE.
@@ -291,7 +293,6 @@ def cg_grouped_gemm_forward(
         inputs: Input tensor of shape [M_bufferlen, K]
         expert_weights: Expert weight tensor of shape [num_experts, N, K]
         expert_indices: Indices tensor of shape [M_total] mapping each token to its expert
-        group_size_m: Size of contiguous token blocks for each expert (default: 128)
         x_scale: Input tensor scales of shape [M_total, 1]
         w_scale: Expert weight tensor scales of shape [num_experts, N]
     Returns:
@@ -306,8 +307,8 @@ def cg_grouped_gemm_forward(
     M_bufferlen, K = inputs.shape
     M_total = expert_indices.shape[0]
     assert (
-        M_total % group_size_m == 0
-    ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
+        M_total % ALIGN_SIZE_M == 0
+    ), f"M_total ({M_total}) must be a multiple of group_size_m ({ALIGN_SIZE_M})"
 
     # Convert expert_indices to int32 if needed
     if expert_indices.dtype != torch.int32:
@@ -333,7 +334,7 @@ def cg_grouped_gemm_forward(
 
     grid = (NUM_SMS, 1, 1)
     # Launch kernel
-    _kernel_cg_persistent_forward[grid](
+    wrap_triton(_kernel_cg_persistent_forward)[grid](
         inputs,
         expert_weights,
         output,
@@ -344,7 +345,7 @@ def cg_grouped_gemm_forward(
         N=N,
         K=K,
         NUM_EXPERTS=num_experts,
-        GROUP_SIZE_M=group_size_m,
+        GROUP_SIZE_M=ALIGN_SIZE_M,
         NUM_SMS=NUM_SMS,
         SUPER_GROUP_M=32,
         USE_FP8=use_fp8,
@@ -361,7 +362,6 @@ def cg_grouped_gemm_forward_fake(
     | None = None,  # [M_bufferlen, K // block_size] or None
     b_scales: torch.Tensor
     | None = None,  # [num_experts, N // block_size, K // block_size] or None
-    group_size_m: int = 128,
 ) -> torch.Tensor:
     """
     Fake function for cg_grouped_gemm_forward.
@@ -374,12 +374,11 @@ def cg_grouped_gemm_forward_fake(
                        device=inputs.device)
 
 
-@custom_op("torchtitan::cg_grouped_gemm_forward_dynamic", mutates_args={})
+@triton_op("torchtitan::cg_grouped_gemm_forward_dynamic", mutates_args={})
 def cg_grouped_gemm_forward_dynamic(
     inputs: torch.Tensor,  # [M_total, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
-    group_size_m: int = 128,
 ) -> torch.Tensor:
     """
     contiguous grouped GEMM forward pass for MoE.
@@ -402,8 +401,8 @@ def cg_grouped_gemm_forward_dynamic(
     # Check if inputs are properly aligned
     M_total, K = inputs.shape
     assert (
-        M_total % group_size_m == 0
-    ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
+        M_total % ALIGN_SIZE_M == 0
+    ), f"M_total ({M_total}) must be a multiple of group_size_m ({ALIGN_SIZE_M})"
     # assert (
     #    expert_indices.shape[0] == M_total // group_size_m
     # ), "Expert indices length must match number of groups"
@@ -431,7 +430,7 @@ def cg_grouped_gemm_forward_dynamic(
     )
 
     # Launch kernel
-    _kernel_cg_forward_aligned[grid](
+    wrap_triton(_kernel_cg_forward_aligned)[grid](
         inputs,
         expert_weights,
         output,
@@ -440,7 +439,7 @@ def cg_grouped_gemm_forward_dynamic(
         N=N,
         K=K,
         NUM_EXPERTS=num_experts,
-        GROUP_SIZE_M=group_size_m,
+        GROUP_SIZE_M=ALIGN_SIZE_M,
     )
 
     return output
@@ -451,7 +450,6 @@ def cg_grouped_gemm_forward_dynamic_fake(
     inputs: torch.Tensor,  # [M_total, K]
     expert_weights: torch.Tensor,  # [num_experts, N, K]
     expert_indices: torch.Tensor,  # [M_total]
-    group_size_m: int = 128,
 ) -> torch.Tensor:
     """
     Fake function for cg_grouped_gemm_forward_dynamic.
@@ -471,14 +469,13 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs, expert_weights, expert_indices, group_size_m=128):
+    def forward(ctx, inputs, expert_weights, expert_indices):
         """Forward pass ."""
         return cg_grouped_gemm_forward(
             inputs=inputs,
             expert_weights=expert_weights,
             expert_indices=expert_indices,
             # use_tma=use_tma,
-            group_size_m=group_size_m,
         )
 
     @staticmethod
@@ -492,7 +489,6 @@ def cg_grouped_gemm(
     expert_weights: torch.Tensor,
     expert_indices: torch.Tensor,
     # use_tma: bool = True,
-    group_size_m: int = 128,
 ) -> torch.Tensor:
     """
     Interface for contiguous grouped GEMM.
@@ -501,7 +497,7 @@ def cg_grouped_gemm(
         expert_indices = expert_indices.to(torch.int32)
 
     return ContiguousGroupedGEMM.apply(
-        inputs, expert_weights, expert_indices, group_size_m
+        inputs, expert_weights, expert_indices
     )
 
 
