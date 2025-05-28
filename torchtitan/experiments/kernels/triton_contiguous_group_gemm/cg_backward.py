@@ -21,6 +21,7 @@ from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotu
 from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import (
     fp8_blockwise_act_quant,
     fp8_blockwise_weight_quant,
+    fp8_blockwise_act_dequant,
 )
 
 # ============ Triton kernel for contiguous grouped GEMM backward inputs ============
@@ -450,23 +451,25 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs, expert_weights, expert_indices, group_size_m=128):
+    def forward(ctx, inputs, expert_weights, expert_indices, group_size_m=128, use_fp8=False):
         """Forward pass for contiguous grouped GEMM."""
-
-        use_fp8 = False
 
         if use_fp8:
             inputs_fp8, input_scales = fp8_blockwise_act_quant(
                 inputs,
                 block_size=FIXED_BLOCK_SIZE_K,
+                axis=-1,
             )
             expert_weights_fp8, expert_weight_scales = fp8_blockwise_weight_quant(
                 expert_weights,
                 block_size=FIXED_BLOCK_SIZE_K,
             )
-
-        # Save for backward
-        ctx.save_for_backward(inputs, expert_weights, expert_indices)
+            # Save for backward
+            ctx.save_for_backward(inputs_fp8, input_scales, expert_weights_fp8,
+                                  expert_weight_scales, expert_indices)
+        else:
+            # Save for backward
+            ctx.save_for_backward(inputs, expert_weights, expert_indices)
         ctx.group_size_m = group_size_m
         ctx.use_fp8 = use_fp8
 
@@ -491,9 +494,13 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Backward pass for contiguous grouped GEMM."""
-        inputs, expert_weights, expert_indices = ctx.saved_tensors
+
         group_size_m = ctx.group_size_m
         use_fp8 = ctx.use_fp8
+        if use_fp8:
+            inputs_fp8, input_scales, expert_weights, expert_weight_scales, expert_indices = ctx.saved_tensors
+        else:
+            inputs, expert_weights, expert_indices = ctx.saved_tensors
 
         # Get number of experts
         num_experts = expert_weights.shape[0]
@@ -502,29 +509,29 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         grad_output = grad_output.contiguous()
 
         if use_fp8:
-            inputs_t, input_t_scales = fp8_blockwise_act_quant(
-                inputs.T.contiguous(),
+            inputs_dequant = fp8_blockwise_act_dequant(
+                inputs_fp8,
+                input_scales,
                 block_size=FIXED_BLOCK_SIZE_K,
+                axis=-1,
             )
-            inputs = inputs_t.T.contiguous()
-            input_scales = input_t_scales.T.contiguous()
-
-            expert_weights, expert_weight_scales = fp8_blockwise_weight_quant(
-                expert_weights,
+            inputs_fp8, input_scales = fp8_blockwise_act_quant(
+                inputs_dequant,
                 block_size=FIXED_BLOCK_SIZE_K,
+                axis=0,
             )
             grad_output_fp8, grad_output_scales = fp8_blockwise_act_quant(
                 grad_output,
                 block_size=FIXED_BLOCK_SIZE_K,
+                axis=-1,
             )
-            grad_output_t, grad_output_t_scales = fp8_blockwise_act_quant(
-                grad_output.T.contiguous(),
+            grad_output_fp8_m, grad_output_scales_m = fp8_blockwise_act_quant(
+                grad_output,
                 block_size=FIXED_BLOCK_SIZE_K,
+                axis=0,
             )
-            grad_output_fp8_m = grad_output_t.T.contiguous()
-            grad_output_scales_m = grad_output_t_scales.T.contiguous()
-
         else:
+            inputs_fp8 = inputs
             input_scales = None
             expert_weight_scales = None
             grad_output_fp8 = grad_output
@@ -541,10 +548,9 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
             go_scales=grad_output_scales,
             expert_weight_scales=expert_weight_scales,
         )
-
         grad_weights = cg_grouped_gemm_backward_weights(
             grad_output=grad_output_fp8_m,
-            inputs=inputs,
+            inputs=inputs_fp8,
             expert_indices=expert_indices,
             num_experts=num_experts,
             group_size_m=group_size_m,
@@ -558,7 +564,7 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         # No gradient for group_size_m (it's just a parameter)
         grad_group_size_m = None
 
-        return grad_inputs, grad_weights, grad_indices, grad_group_size_m
+        return grad_inputs, grad_weights, grad_indices, grad_group_size_m, None
 
 
 def cg_grouped_gemm(
@@ -566,6 +572,7 @@ def cg_grouped_gemm(
     expert_weights: torch.Tensor,
     expert_indices: torch.Tensor,
     group_size_m: int = 128,
+    use_fp8: bool = False,
 ) -> torch.Tensor:
     """
     Interface for contiguous grouped GEMM with full backward pass support.
@@ -582,9 +589,8 @@ def cg_grouped_gemm(
     if expert_indices.dtype != torch.int32:
         expert_indices = expert_indices.to(torch.int32)
 
-    return ContiguousGroupedGEMM.apply(
-        inputs, expert_weights, expert_indices, group_size_m
-    )
+    return ContiguousGroupedGEMM.apply(inputs, expert_weights, expert_indices,
+                                       group_size_m, use_fp8)
 
 
 # =============== Test functions for verifying correctness =================
@@ -592,15 +598,29 @@ def cg_grouped_gemm(
 def calc_snr(
     x: torch.Tensor,
     y: torch.Tensor,
-    eps: float = 1e-6,
 ) -> float:
     """
     Calculate the Signal-to-Noise Ratio (SNR) between two tensors.
-    SNR = 10 * log10(sum(x^2) / (sum((x - y)^2) + eps))
+    SNR = 10 * log10(sum(x^2) / (sum((x - y)^2)))
     """
     signal = torch.sum(x ** 2)
-    noise = torch.sum((x - y) ** 2) + eps
+    noise = torch.sum((x - y) ** 2)
     return 10 * torch.log10(signal / noise)
+
+def calc_cossim(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> float:
+    """
+    Calculate the cosine similarity between two tensors.
+    Cosine similarity = dot(x, y) / (norm(x) * norm(y))
+    """
+    x = x.reshape(-1)
+    y = y.reshape(-1)
+    dot_product = torch.sum(x * y)
+    norm_x = torch.norm(x)
+    norm_y = torch.norm(y)
+    return dot_product / (norm_x * norm_y)
 
 def verify_cg_gemm_backward(
     M_total=1024,
@@ -687,7 +707,7 @@ def verify_cg_gemm_backward(
     print(f"outputs={outputs}")
     print(f"outputs_ref={outputs_ref}")
     outputs_match = torch.allclose(outputs, outputs_ref, atol=atol, rtol=rtol)
-    print(f"Outputs match: {outputs_match} SNR={calc_snr(outputs, outputs_ref)}")
+    print(f"Outputs match: {outputs_match} SNR={calc_snr(outputs, outputs_ref)} cossim={calc_cossim(outputs, outputs_ref)}")
     if not outputs_match:
         # Compute max absolute difference for debugging
         max_diff = torch.max(torch.abs(outputs - outputs_ref))
@@ -710,8 +730,8 @@ def verify_cg_gemm_backward(
         expert_weights.grad, grad_weights_ref, atol=atol, rtol=rtol
     )
 
-    print(f"Input gradients match: {inputs_grad_match} SNR={calc_snr(inputs.grad, grad_inputs_ref)}")
-    print(f"Weight gradients match: {weights_grad_match} SNR={calc_snr(expert_weights.grad, grad_weights_ref)}")
+    print(f"Input gradients match: {inputs_grad_match} SNR={calc_snr(inputs.grad, grad_inputs_ref)} cossim={calc_cossim(inputs.grad, grad_inputs_ref)}")
+    print(f"Weight gradients match: {weights_grad_match} SNR={calc_snr(expert_weights.grad, grad_weights_ref)} cossim={calc_cossim(expert_weights.grad, grad_weights_ref)}")
 
     if not inputs_grad_match:
         # Compute max absolute difference for debugging
@@ -771,15 +791,22 @@ def benchmark_cg_gemm_backward(
     # Create test tensors
     torch.manual_seed(0)
     dtype = torch.bfloat16
-    inputs = torch.randn((M_total, K), device=device, dtype=dtype, requires_grad=True)
-    expert_weights = torch.randn((num_experts, N, K), dtype=dtype, device=device, requires_grad=True)
+    inputs = torch.randn((M_total, K),
+                         device=device,
+                         dtype=dtype,
+                         requires_grad=True)
+    expert_weights = torch.randn((num_experts, N, K),
+                                 dtype=dtype,
+                                 device=device,
+                                 requires_grad=True)
 
     # Create expert indices - each token in a group has the same expert
     expert_indices = torch.zeros(M_total, dtype=torch.int32, device=device)
     for g in range(num_groups):
-        expert_idx = torch.randint(
-            0, num_experts, (1,), device=device, dtype=torch.int32
-        ).item()
+        expert_idx = torch.randint(0,
+                                   num_experts, (1, ),
+                                   device=device,
+                                   dtype=torch.int32).item()
         start_idx = g * group_size_m
         end_idx = (g + 1) * group_size_m
         expert_indices[start_idx:end_idx] = expert_idx
@@ -798,8 +825,7 @@ def benchmark_cg_gemm_backward(
 
             # Compute output for this group
             outputs_ref[group_start:group_end] = (
-                inputs[group_start:group_end] @ expert_weights[expert_idx].t()
-            )
+                inputs[group_start:group_end] @ expert_weights[expert_idx].t())
 
         # Perform backward pass
         outputs_ref.backward(grad_output)
@@ -807,7 +833,8 @@ def benchmark_cg_gemm_backward(
     # Benchmark our Triton implementation
     def run_triton_backward():
         # Forward pass with our implementation
-        outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices, group_size_m)
+        outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices,
+                                  group_size_m)
 
         # Backward pass
         outputs.backward(grad_output)

@@ -136,7 +136,16 @@ STANDARD_CONFIGS = [
             "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
             "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K
         },
-        num_stages=1,
+        num_stages=2,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K
+        },
+        num_stages=2,
         num_warps=8,
     ),
 ]

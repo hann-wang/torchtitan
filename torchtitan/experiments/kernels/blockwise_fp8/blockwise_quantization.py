@@ -5,9 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-from typing import Tuple
+from typing import Tuple, List
 
 import torch
+from torch.library import custom_op
 import triton
 import triton.language as tl
 from triton import Config
@@ -111,8 +112,18 @@ def blockwise_fp8_gemm(
 
 
 @triton.jit
-def fp8_blockwise_act_quant_kernel(x_ptr, y_ptr, s_ptr,
-                                   BLOCK_SIZE: tl.constexpr):
+def fp8_blockwise_act_quant_kernel(
+    x_ptr,
+    y_ptr,
+    s_ptr,
+    stride_xm: tl.constexpr,
+    stride_xn: tl.constexpr,
+    stride_ym: tl.constexpr,
+    stride_yn: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sn: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
     """
     Quantizes the input tensor `x_ptr` and stores the result in `y_ptr` and the scaling factor in `s_ptr`.
 
@@ -125,20 +136,30 @@ def fp8_blockwise_act_quant_kernel(x_ptr, y_ptr, s_ptr,
     Returns:
         None
     """
-    pid = tl.program_id(axis=0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offs).to(tl.float32)
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    start_n = pid_n * BLOCK_SIZE
+
+    offs_x = pid_m * stride_xm + (start_n +
+                                  tl.arange(0, BLOCK_SIZE)) * stride_xn
+
+    x = tl.load(x_ptr + offs_x)
     s = tl.max(tl.abs(x)) / 240.0
     s = tl.where(s == 0.0, 1.0, s)  # Avoid division by zero
     y = x / s
     y = y.to(y_ptr.dtype.element_ty)
-    tl.store(y_ptr + offs, y)
-    tl.store(s_ptr + pid, s)
+    offs_y = pid_m * stride_ym + (start_n +
+                                  tl.arange(0, BLOCK_SIZE)) * stride_yn
+    offs_s = pid_m * stride_sm + pid_n * stride_sn
+    tl.store(y_ptr + offs_y, y)
+    tl.store(s_ptr + offs_s, s)
 
 
+@custom_op("torchtitan::fp8_blockwise_act_quant", mutates_args={})
 def fp8_blockwise_act_quant(
     x: torch.Tensor,
     block_size: int = 128,
+    axis: int = -1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization with block size being BLOCK_SIZEx1.
@@ -146,26 +167,192 @@ def fp8_blockwise_act_quant(
     Args:
         x (torch.Tensor): The input tensor to be quantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
         block_size (int, optional): The size of the blocks to be used for quantization. Default is 128.
-        dtype (torch.dtype, optional): The dtype to use for the quantized tensor. Default is `torch.float8_e4m3fn`.
-
+        axis (int, optional): The dimension along which to apply the quantization. Default is -1 (the last dimension).
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
-            - The quantized tensor with dtype `dtype`.
+            - The quantized tensor with FP8 dtype.
             - A tensor of scaling factors with dtype `torch.float32`.
     """
-    assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert x.size(-1) % block_size == 0, (
-        f"Last dimension size must be divisible by block_size (block_size={block_size})"
+    assert x.size(axis) % block_size == 0, (
+        f"Dimension size must be divisible by block_size (block_size={block_size})"
     )
-    dtype= torch.float8_e4m3fnuz
-    y = torch.empty_like(x, dtype=dtype)
-    s = x.new_empty(*x.size()[:-1],
-                    x.size(-1) // block_size,
-                    dtype=torch.float32)
-    grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]), )
-    fp8_blockwise_act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
+    assert x.dim() == 2, "Input tensor must have 2 dimensions"
+
+    dtype = torch.float8_e4m3fnuz
+
+    y = torch.zeros_like(x, dtype=dtype, memory_format=torch.contiguous_format)
+    scale_shape = list(x.shape)
+    scale_shape[axis] = scale_shape[axis] // block_size
+    s = torch.ones(scale_shape, device=x.device, dtype=torch.float32)
+    x = x.transpose(axis, -1)
+    y = y.transpose(axis, -1)
+    s = s.transpose(axis, -1)
+
+    stride_xm, stride_xn = x.stride()
+    stride_ym, stride_yn = y.stride()
+    stride_sm, stride_sn = s.stride()
+    M, N = x.shape
+    num_blocks_n = N // block_size
+    grid = (
+        M,
+        num_blocks_n,
+    )
+    fp8_blockwise_act_quant_kernel[grid](
+        x,
+        y,
+        s,
+        stride_xm,
+        stride_xn,
+        stride_ym,
+        stride_yn,
+        stride_sm,
+        stride_sn,
+        BLOCK_SIZE=block_size,
+    )
+
+    return y.transpose(-1, axis), s.transpose(-1, axis)
+
+
+@fp8_blockwise_act_quant.register_fake
+def fp8_blockwise_act_quant_fake(
+    x: torch.Tensor,
+    block_size: int = 128,
+    axis: int = -1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fake implementation of the block-wise quantization for testing purposes.
+    Returns the input tensor and a dummy scaling factor tensor.
+    """
+    assert x.size(axis) % block_size == 0, (
+        f"Dimension size must be divisible by block_size (block_size={block_size})"
+    )
+    assert x.dim() == 2, "Input tensor must have 2 dimensions"
+
+    dtype = torch.float8_e4m3fnuz
+    y = torch.zeros_like(x, dtype=dtype)
+    scale_shape = list(x.shape)
+    scale_shape[axis] = scale_shape[axis] // block_size
+    s = torch.ones(scale_shape, device=x.device, dtype=torch.float32)
     return y, s
+
+
+@triton.jit
+def fp8_blockwise_act_dequant_kernel(
+    x_ptr,
+    s_ptr,
+    y_ptr,
+    stride_xm: tl.constexpr,
+    stride_xn: tl.constexpr,
+    stride_ym: tl.constexpr,
+    stride_yn: tl.constexpr,
+    stride_sm: tl.constexpr,
+    stride_sn: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Dequantizes the input tensor `x_ptr` using the scaling factors from `s_ptr` and stores the result in `y_ptr`.
+
+    Args:
+        x_ptr (triton.Pointer): Pointer to the quantized input tensor.
+        s_ptr (triton.Pointer): Pointer to the scaling factors tensor.
+        y_ptr (triton.Pointer): Pointer to the output tensor where dequantized values will be stored.
+        BLOCK_SIZE (tl.constexpr): The size of the block to be processed by each program instance.
+
+    Returns:
+        None
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+    start_n = pid_n * BLOCK_SIZE
+
+    offs_x = pid_m * stride_xm + (start_n +
+                                  tl.arange(0, BLOCK_SIZE)) * stride_xn
+    x = tl.load(x_ptr + offs_x).to(y_ptr.dtype.element_ty)
+
+    s = tl.load(s_ptr + pid_m * stride_sm + pid_n * stride_sn)
+    y = x * s
+    y = y.to(y_ptr.dtype.element_ty)
+
+    offs_y = pid_m * stride_ym + (start_n +
+                                  tl.arange(0, BLOCK_SIZE)) * stride_yn
+    tl.store(y_ptr + offs_y, y)
+
+
+@custom_op("torchtitan::fp8_blockwise_act_dequant", mutates_args={})
+def fp8_blockwise_act_dequant(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+    axis: int = -1,
+) -> torch.Tensor:
+    """
+    Dequantizes the input tensor `x` using the provided scaling factors `s`.
+
+    Args:
+        x (torch.Tensor): The quantized tensor to be dequantized. Must be contiguous and its last dimension size must be divisible by `block_size`.
+        s (torch.Tensor): The scaling factors tensor. Must have the same shape as `x` but with the last dimension size divided by `block_size`.
+        block_size (int, optional): The size of the blocks used for quantization. Default is 128.
+        axis (int, optional): The dimension along which to apply the dequantization. Default is -1 (the last dimension).
+
+    Returns:
+        torch.Tensor: The dequantized tensor of the same shape as `x`.
+    """
+    assert x.size(axis) % block_size == 0, (
+        f"Dimension size must be divisible by block_size (block_size={block_size})"
+    )
+    assert x.dim() == 2, "Input tensor must have 2 dimensions"
+
+    y = torch.zeros_like(x,
+                         dtype=torch.get_default_dtype(),
+                         memory_format=torch.contiguous_format)
+
+    x = x.transpose(axis, -1)
+    s = s.transpose(axis, -1)
+    y = y.transpose(axis, -1)
+
+    stride_xm, stride_xn = x.stride()
+    stride_ym, stride_yn = y.stride()
+    stride_sm, stride_sn = s.stride()
+    M, N = x.shape
+    num_blocks_n = N // block_size
+    grid = (
+        M,
+        num_blocks_n,
+    )
+    fp8_blockwise_act_dequant_kernel[grid](
+        x,
+        s,
+        y,
+        stride_xm,
+        stride_xn,
+        stride_ym,
+        stride_yn,
+        stride_sm,
+        stride_sn,
+        BLOCK_SIZE=block_size,
+    )
+    return y.transpose(-1, axis)
+
+
+@fp8_blockwise_act_dequant.register_fake
+def fp8_blockwise_act_dequant_fake(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+    axis: int = -1,
+) -> torch.Tensor:
+    """
+    Fake implementation of the block-wise dequantization for testing purposes.
+    Returns the input tensor multiplied by the scaling factors tensor.
+    """
+    assert x.size(axis) % block_size == 0, (
+        f"Dimension size must be divisible by block_size (block_size={block_size})"
+    )
+    assert x.dim() == 2, "Input tensor must have 2 dimensions"
+
+    y = torch.zeros_like(x, dtype=torch.get_default_dtype())
+    return y
 
 
 @triton.jit
@@ -200,10 +387,11 @@ def fp8_blockwise_weight_quant_kernel(x_ptr, y_ptr, s_ptr, M, N,
     tl.store(s_ptr + pid_b * m * n + pid_m * n + pid_n, s)
 
 
+@custom_op("torchtitan::fp8_blockwise_weight_quant", mutates_args={})
 def fp8_blockwise_weight_quant(
-        x: torch.Tensor,
-        block_size: int = 128,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the given weight tensor using block-wise quantization with block size being BLOCK_SIZExBLOCK_SIZE.
 
@@ -228,8 +416,8 @@ def fp8_blockwise_weight_quant(
         B = 1
     else:
         B, M, N = x.size()
-    y = torch.empty_like(x, dtype=dtype)
-    s = x.new_empty(B, M // block_size, N // block_size, dtype=torch.float32)
+    y = torch.zeros_like(x, dtype=dtype)
+    s = x.new_ones(B, M // block_size, N // block_size, dtype=torch.float32)
     grid = lambda meta: (
         B,
         triton.cdiv(M, meta["BLOCK_SIZE"]),
@@ -241,6 +429,33 @@ def fp8_blockwise_weight_quant(
                                             M,
                                             N,
                                             BLOCK_SIZE=block_size)
+    if x.dim() == 2:
+        s = s.squeeze(0)
+    return y, s
+
+
+@fp8_blockwise_weight_quant.register_fake
+def fp8_blockwise_weight_quant_fake(
+    x: torch.Tensor,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Fake implementation of the block-wise weight quantization for testing purposes.
+    Returns the input tensor and a dummy scaling factor tensor.
+    """
+    assert x.is_contiguous(), "Input tensor must be contiguous"
+    assert x.dim() in [2, 3], "Input tensor must have 2 or 3 dimensions"
+    assert x.size(-2) % block_size == 0 and x.size(-1) % block_size == 0, (
+        f"Both dimensions of x must be divisible by block_size (block_size={block_size})"
+    )
+    dtype = torch.float8_e4m3fnuz
+    if x.dim() == 2:
+        M, N = x.size()
+        B = 1
+    else:
+        B, M, N = x.size()
+    y = torch.zeros_like(x, dtype=dtype)
+    s = x.new_ones(B, M // block_size, N // block_size, dtype=torch.float32)
     if x.dim() == 2:
         s = s.squeeze(0)
     return y, s
@@ -263,19 +478,22 @@ def fp8_blockwise_weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N,
     Returns:
         None
     """
-    pid_m = tl.program_id(axis=0)
-    pid_n = tl.program_id(axis=1)
+    pid_b = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+    pid_n = tl.program_id(axis=2)
+    m = tl.cdiv(M, BLOCK_SIZE)
     n = tl.cdiv(N, BLOCK_SIZE)
     offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    offs = offs_m[:, None] * N + offs_n[None, :]
+    offs = pid_b * M * N + offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-    s = tl.load(s_ptr + pid_m * n + pid_n)
+    s = tl.load(s_ptr + pid_b * m * n + pid_m * n + pid_n)
     y = x * s
     tl.store(y_ptr + offs, y, mask=mask)
 
 
+@custom_op("torchtitan::fp8_blockwise_weight_dequant", mutates_args={})
 def fp8_blockwise_weight_dequant(x: torch.Tensor,
                                  s: torch.Tensor,
                                  block_size: int = 128) -> torch.Tensor:
@@ -295,11 +513,17 @@ def fp8_blockwise_weight_dequant(x: torch.Tensor,
     """
     assert x.is_contiguous() and s.is_contiguous(
     ), "Input tensors must be contiguous"
-    assert x.dim() == 2 and s.dim(
-    ) == 2, "Input tensors must have 2 dimensions"
-    M, N = x.size()
-    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    assert (x.dim() == 2 and s.dim() == 2) or (
+        x.dim() == 3
+        and s.dim() == 3), "Input tensors must have 2 or 3 dimensions"
+    if x.dim() == 2:
+        M, N = x.size()
+        B = 1
+    else:
+        B, M, N = x.size()
+    y = torch.zeros_like(x, dtype=torch.get_default_dtype())
     grid = lambda meta: (
+        B,
         triton.cdiv(M, meta["BLOCK_SIZE"]),
         triton.cdiv(N, meta["BLOCK_SIZE"]),
     )
@@ -309,4 +533,23 @@ def fp8_blockwise_weight_dequant(x: torch.Tensor,
                                               M,
                                               N,
                                               BLOCK_SIZE=block_size)
+    return y
+
+
+@fp8_blockwise_weight_dequant.register_fake
+def fp8_blockwise_weight_dequant_fake(
+    x: torch.Tensor,
+    s: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """
+    Fake implementation of the block-wise weight dequantization for testing purposes.
+    Returns the input tensor multiplied by the scaling factor tensor.
+    """
+    assert x.is_contiguous() and s.is_contiguous(
+    ), "Input tensors must be contiguous"
+    assert (x.dim() == 2 and s.dim() == 2) or (
+        x.dim() == 3
+        and s.dim() == 3), "Input tensors must have 2 or 3 dimensions"
+    y = torch.zeros_like(x, dtype=torch.get_default_dtype())
     return y
