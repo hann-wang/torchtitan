@@ -127,39 +127,116 @@ class TmaDescriptorHelper:
 
 # ================== End of supporting functions ==================
 
-
-# Define standard configurations - simplified for robustness
 STANDARD_CONFIGS = [
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": 32,
             "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
         },
         num_stages=2,
         num_warps=8,
     ),
     triton.Config(
         {
-            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_M": 64,
             "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
-            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+        },
+        num_stages=2,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_K": FIXED_BLOCK_SIZE_K,
         },
         num_stages=2,
         num_warps=8,
     ),
 ]
 
-
-def early_config_prune(configs, args, **kwargs):
-    """Filter out configurations that would exceed shared memory capacity."""
-    k = kwargs.get("K", 0)
-    valid_configs = [
-        config for config in configs if config.kwargs.get("BLOCK_SIZE_K", 0) <= k
-    ]
-    # If all configs were filtered out, return at least one config
-    if not valid_configs and configs:
-        # Find the config with the smallest BLOCK_SIZE_K
-        return [min(configs, key=lambda c: c.kwargs.get("BLOCK_SIZE_K", float("inf")))]
-
-    return valid_configs
+STANDARD_DW_CONFIGS = [
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 32,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 32,
+        },
+        num_stages=2,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+        },
+        num_stages=2,
+        num_warps=8,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": FIXED_BLOCK_SIZE_K,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+        },
+        num_stages=2,
+        num_warps=8,
+    ),
+]

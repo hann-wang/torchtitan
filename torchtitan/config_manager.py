@@ -458,6 +458,9 @@ class Float8:
 
     fp8_fa_granularity: Literal["tensorwise", "blockwise"] = "blockwise"
     """Scale granularity for Q, K. (V is always tensorwise scaled)"""
+    
+    enable_fp8_gmm: bool = False
+    """Whether to use FP8 grouped_gemm Triton kernel"""
 
 
 @dataclass

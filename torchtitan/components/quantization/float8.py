@@ -50,6 +50,7 @@ class Float8Converter(ModelConverter):
         self.enabled = True
         self.filter_fqns = float8_config.filter_fqns
         self.enable_fp8_fa = float8_config.enable_fp8_fa
+        self.enable_fp8_gmm = float8_config.enable_fp8_gmm
         self.use_fp8_fa_block_scales = float8_config.fp8_fa_granularity == "blockwise"
 
         if float8_config.recipe_name is not None:
@@ -112,6 +113,8 @@ class Float8Converter(ModelConverter):
         )
         if self.enable_fp8_fa:
             self._add_attention_observer(model)
+        if self.enable_fp8_gmm:
+            self._add_gmm_observer(model)
 
     def _add_attention_observer(self, model: nn.Module):
         for mod in model.children():
@@ -123,6 +126,14 @@ class Float8Converter(ModelConverter):
                 )
             else:
                 self._add_attention_observer(mod)
+
+    def _add_gmm_observer(self, model: nn.Module):
+        for mod in model.children():
+            if mod.__class__.__name__.endswith("GroupedExperts"):
+                mod.use_fp8 = True
+                logger.info(f"Enable FP8 kernel for {mod.__class__.__name__}.")
+            else:
+                self._add_gmm_observer(mod)
 
     def post_optimizer_hook(self, model: nn.Module | list[nn.Module]):
         if not self.enabled:

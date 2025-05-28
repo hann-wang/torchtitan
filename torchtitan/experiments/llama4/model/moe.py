@@ -31,6 +31,7 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.use_grouped_mm = use_grouped_mm
+        self.use_fp8 = False
 
     def forward(
         self,
@@ -40,6 +41,7 @@ class GroupedExperts(nn.Module):
         # TODO: keeping this for loop implementation for comparison
         #       and readability, will remove later
         if not self.use_grouped_mm:
+            assert not self.use_fp8
             if num_local_tokens_per_expert is not None:
                 # a tuple of tensors indexed by experts
                 # each with shape (tokens_per_expert(varying), dim)
@@ -105,19 +107,32 @@ class GroupedExperts(nn.Module):
                 # Create indices from offsets without CPU-GPU sync
                 m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
                     offsets)
-                gate_proj = cg_grouped_gemm(x,
-                                            w1.transpose(-1, -2).contiguous(),
-                                            m_indices, ALIGN_SIZE_M)
-                up_proj = cg_grouped_gemm(x,
-                                          w3.transpose(-1, -2).contiguous(),
-                                          m_indices, ALIGN_SIZE_M)
+                gate_proj = cg_grouped_gemm(
+                    x,
+                    w1.transpose(-1, -2).contiguous(),
+                    m_indices,
+                    ALIGN_SIZE_M,
+                    use_fp8=self.use_fp8,
+                )
+                up_proj = cg_grouped_gemm(
+                    x,
+                    w3.transpose(-1, -2).contiguous(),
+                    m_indices,
+                    ALIGN_SIZE_M,
+                    use_fp8=self.use_fp8,
+                )
                 # Apply activation
                 hidden_outputs = F.silu(gate_proj) * up_proj
                 # Run the third GEMM (down projection)
-                out = cg_grouped_gemm(hidden_outputs,
-                                      w2.transpose(-1, -2).contiguous(),
-                                      m_indices, ALIGN_SIZE_M)
+                out = cg_grouped_gemm(
+                    hidden_outputs,
+                    w2.transpose(-1, -2).contiguous(),
+                    m_indices,
+                    ALIGN_SIZE_M,
+                    use_fp8=self.use_fp8,
+                )
             else:
+                assert not self.use_fp8
                 # FIXME: grouped_mm does not require padded m_sizes
                 from .grouped_mm_utils import gmm
                 num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(

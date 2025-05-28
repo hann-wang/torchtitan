@@ -14,12 +14,7 @@ import triton
 import triton.language as tl
 
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotune import (
-    early_config_prune,
-    STANDARD_CONFIGS,
-)
-
-
-# Configuration for autotuning
+    STANDARD_CONFIGS, )
 
 # Configure logging
 logging.basicConfig(
@@ -27,6 +22,7 @@ logging.basicConfig(
 )
 
 GROUP_SIZE_M = 128
+torch_dtype = torch.bfloat16
 
 # ============ Triton kernel for contiguous grouped GEMM ============
 
@@ -45,8 +41,13 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, super_group_m):
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["M_TOTAL", "N", "K", "USE_FP8"],
-    prune_configs_by={"early_config_prune": early_config_prune},
+    key=[
+        "M_TOTAL",
+        "N",
+        "K",
+        "GROUP_SIZE_M",
+        "USE_FP8",
+    ],
 )
 @triton.jit
 def _kernel_cg_persistent_forward(
@@ -171,8 +172,12 @@ def _kernel_cg_persistent_forward(
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["M_TOTAL", "N", "K"],
-    prune_configs_by={"early_config_prune": early_config_prune},
+    key=[
+        "M_TOTAL",
+        "N",
+        "K",
+        "GROUP_SIZE_M",
+    ],
 )
 @triton.jit
 def _kernel_cg_forward_aligned(
@@ -320,7 +325,7 @@ def cg_grouped_gemm_forward(
     # Create output tensor
     output = torch.zeros((M_bufferlen, N),
                          device=inputs.device,
-                         dtype=torch.bfloat16)
+                         dtype=torch_dtype)
 
     # Calculate grid size for the kernel
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
@@ -365,7 +370,7 @@ def cg_grouped_gemm_forward_fake(
     M_bufferlen, _ = inputs.shape
     _, N, _ = expert_weights.shape
     return torch.zeros((M_bufferlen, N),
-                       dtype=inputs.dtype,
+                       dtype=torch_dtype,
                        device=inputs.device)
 
 

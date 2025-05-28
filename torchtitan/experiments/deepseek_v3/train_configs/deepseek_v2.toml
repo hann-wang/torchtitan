@@ -7,7 +7,7 @@
 # DeepSeek V2 Lite
 
 [job]
-dump_folder = "./deepseek-v2-lite-fp8-linear-fa-outputs"
+dump_folder = "./deepseek-v2-lite-fp8-linear-fa-nonshared-outputs"
 description = "DeepSeek v2 training"
 
 [profiling]
@@ -73,3 +73,4 @@ precompute_float8_dynamic_scale_for_fsdp = false
 filter_fqns = ["output", "router.gate", "self_attn.q_a_proj", "self_attn.q_b_proj", "self_attn.kv_a_proj_with_mqa", "self_attn.kv_b_proj"]
 enable_fp8_fa = true
 fp8_fa_granularity = "blockwise"
+enable_fp8_gmm = true

@@ -14,9 +14,9 @@ import triton.language as tl
 
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_forward import cg_grouped_gemm_forward
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotune import (
-    early_config_prune,
     STANDARD_CONFIGS,
     FIXED_BLOCK_SIZE_K,
+    STANDARD_DW_CONFIGS,
 )
 from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import (
     fp8_blockwise_act_quant,
@@ -25,12 +25,17 @@ from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import 
 )
 
 # ============ Triton kernel for contiguous grouped GEMM backward inputs ============
-
+torch_dtype = torch.bfloat16
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["M_TOTAL", "N", "K", "USE_FP8"],
-    prune_configs_by={"early_config_prune": early_config_prune},
+    key=[
+        "M_TOTAL",
+        "N",
+        "K",
+        "GROUP_SIZE_M",
+        "USE_FP8",
+    ],
 )
 @triton.jit
 def _kernel_cg_backward_dx(
@@ -118,9 +123,9 @@ def _kernel_cg_backward_dx(
                 ni = n // BLOCK_SIZE_N
                 go_s_ptrs = go_s_ptr + offs_m * num_n_tiles + ni
                 b_s_ptrs = b_s_ptr + expert_idx * num_n_tiles * num_k_tiles + (
-                    offs_n // BLOCK_SIZE_N) * num_k_tiles + ni
+                    offs_k // BLOCK_SIZE_N) * num_k_tiles + ni
                 go_scale = tl.load(go_s_ptrs, mask=mask_m, other=1.0)
-                w_scale = tl.load(b_s_ptrs, mask=mask_n, other=1.0)
+                w_scale = tl.load(b_s_ptrs, mask=mask_k, other=1.0)
                 gow = gow * go_scale[:, None] * w_scale[None, :]
 
             # Compute partial gradient for this N tile: grad_input += grad_output @ weights
@@ -138,6 +143,17 @@ def _kernel_cg_backward_dx(
 
 # =============== Functions for backward pass =================
 # ==== simpler approach =============
+@triton.autotune(
+    configs=STANDARD_DW_CONFIGS,
+    key=[
+        "M_TOTAL",
+        "N",
+        "K",
+        "NUM_EXPERTS",
+        "GROUP_SIZE_M",
+        "USE_FP8",
+    ],
+)
 @triton.jit
 def _kernel_cg_backward_dw(
     # Pointers to matrices
@@ -289,22 +305,16 @@ def cg_grouped_gemm_backward_weights(
         expert_indices = expert_indices.to(torch.int32)
 
     # Create output tensor for gradients
-    grad_weights = torch.zeros(
-        (num_experts, N, K), device=grad_output.device, dtype=grad_output.dtype
-    )
-
-    # Define block sizes based on dimensions
-    # These are chosen to balance parallelism and shared memory usage
-    block_size_n = min(32, N)
-    block_size_k = min(32, K)
-    block_size_m = min(FIXED_BLOCK_SIZE_K, group_size_m)
+    grad_weights = torch.zeros((num_experts, N, K),
+                               device=grad_output.device,
+                               dtype=torch_dtype)
 
     # Calculate grid size for the kernel
     # Each thread block handles one expert's N-K tile
-    n_tiles = triton.cdiv(N, block_size_n)
-    k_tiles = triton.cdiv(K, block_size_k)
-    grid = (num_experts * n_tiles * k_tiles,)
-
+    grid = lambda meta: (
+            num_experts * triton.cdiv(N, meta["BLOCK_SIZE_N"]) * triton.cdiv(
+                K, meta["BLOCK_SIZE_K"]),
+    )
     use_fp8 = go_scales is not None and input_scales is not None
 
     # Launch kernel
@@ -320,9 +330,6 @@ def cg_grouped_gemm_backward_weights(
         K=K,
         NUM_EXPERTS=num_experts,
         GROUP_SIZE_M=group_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        BLOCK_SIZE_K=block_size_k,
-        BLOCK_SIZE_M=block_size_m,
         USE_FP8=use_fp8,
     )
 
@@ -346,7 +353,9 @@ def cg_grouped_gemm_backward_weights_fake(
     """
     _, N = grad_output.shape
     _, K = inputs.shape
-    return torch.zeros((num_experts, N, K), device=grad_output.device, dtype=grad_output.dtype)
+    return torch.zeros((num_experts, N, K),
+                       device=grad_output.device,
+                       dtype=torch_dtype)
 
 
 @custom_op("torchtitan::cg_grouped_gemm_backward_inputs", mutates_args={})
@@ -388,9 +397,9 @@ def cg_grouped_gemm_backward_inputs(
     ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
 
     # Create output tensor for gradients
-    grad_inputs = torch.zeros(
-        (M_bufferlen, K), device=grad_output.device, dtype=grad_output.dtype
-    )
+    grad_inputs = torch.zeros((M_bufferlen, K),
+                              device=grad_output.device,
+                              dtype=torch_dtype)
 
     # Calculate grid size for the kernel
     grid = lambda meta: (
@@ -438,7 +447,7 @@ def cg_grouped_gemm_backward_inputs_fake(
     _, _, K = expert_weights.shape
     return torch.zeros((M_bufferlen, K),
                        device=grad_output.device,
-                       dtype=grad_output.dtype)
+                       dtype=torch_dtype)
 
 
 # =============== Update the autograd function =================
@@ -644,7 +653,7 @@ def verify_cg_gemm_backward(
 
     # Create test tensors
     torch.manual_seed(0)
-    dtype = torch.bfloat16
+    dtype = torch_dtype
     inputs = torch.randn(
         (M_total, K),
         device=device,
@@ -790,7 +799,7 @@ def benchmark_cg_gemm_backward(
 
     # Create test tensors
     torch.manual_seed(0)
-    dtype = torch.bfloat16
+    dtype = torch_dtype
     inputs = torch.randn((M_total, K),
                          device=device,
                          dtype=dtype,
