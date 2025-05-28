@@ -34,6 +34,8 @@ from torchtitan.tools.profiling import (
 )
 
 
+torch.set_default_dtype(torch.bfloat16)
+
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     job_config: JobConfig
     gc_handler: utils.GarbageCollection

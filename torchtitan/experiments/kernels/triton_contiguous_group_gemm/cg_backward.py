@@ -32,7 +32,7 @@ torch_dtype = torch.bfloat16
 @triton.autotune(
     configs=STANDARD_CONFIGS,
     key=[
-        "M_TOTAL",
+        "M_BUFFERLEN",
         "N",
         "K",
         "GROUP_SIZE_M",
@@ -50,6 +50,7 @@ def _kernel_cg_backward_dx(
     # Matrix dimensions
     go_s_ptr, # [M_TOTAL, N // block_size] or None
     b_s_ptr, # [num_experts, N // block_size, K // block_size] or None
+    M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
     M_TOTAL: tl.constexpr,  # Total M dimension (sum of all groups)
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
@@ -70,9 +71,10 @@ def _kernel_cg_backward_dx(
     pid = tl.program_id(0)
 
     # number of tiles per matrix dimension
-    num_m_tiles = tl.cdiv(M_TOTAL, BLOCK_SIZE_M)
     num_k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
-    num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
+
+    b_s_n = N // BLOCK_SIZE_N
+    b_s_k = K // BLOCK_SIZE_N
 
     # 2D tile index from linear
     tile_m = pid // num_k_tiles
@@ -123,9 +125,8 @@ def _kernel_cg_backward_dx(
 
             if USE_FP8:
                 ni = n // BLOCK_SIZE_N
-                go_s_ptrs = go_s_ptr + offs_m * num_n_tiles + ni
-                b_s_ptrs = b_s_ptr + expert_idx * num_n_tiles * num_k_tiles + (
-                    offs_k // BLOCK_SIZE_N) * num_k_tiles + ni
+                go_s_ptrs = go_s_ptr + offs_m * b_s_n + ni
+                b_s_ptrs = b_s_ptr + expert_idx * b_s_n * b_s_k + ni * b_s_k + offs_k // BLOCK_SIZE_N
                 go_scale = tl.load(go_s_ptrs, mask=mask_m, other=1.0)
                 w_scale = tl.load(b_s_ptrs, mask=mask_k, other=1.0)
                 gow = gow * go_scale[:, None] * w_scale[None, :]
@@ -148,7 +149,7 @@ def _kernel_cg_backward_dx(
 @triton.autotune(
     configs=STANDARD_DW_CONFIGS,
     key=[
-        "M_TOTAL",
+        "M_BUFFERLEN",
         "N",
         "K",
         "NUM_EXPERTS",
@@ -166,6 +167,7 @@ def _kernel_cg_backward_dw(
     go_s_ptr,  # [M_TOTAL // block_size, N] or None
     a_s_ptr,  # [M_TOTAL // block_size, K] or None
     # Matrix dimensions
+    M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
     M_TOTAL: tl.constexpr,  # Total M dimension
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
@@ -297,7 +299,7 @@ def cg_grouped_gemm_backward_weights(
 
     # Get dimensions
     _, N = grad_output.shape
-    _, K = inputs.shape
+    M_bufferlen, K = inputs.shape
     M_total = expert_indices.shape[0]
 
     # Ensure expert_indices has the right dtype
@@ -316,6 +318,9 @@ def cg_grouped_gemm_backward_weights(
                 K, meta["BLOCK_SIZE_K"]),
     )
     use_fp8 = go_scales is not None and input_scales is not None
+    if use_fp8:
+        assert go_scales.is_contiguous()
+        assert input_scales.is_contiguous()
 
     # Launch kernel
     wrap_triton(_kernel_cg_backward_dw)[grid](
@@ -325,6 +330,7 @@ def cg_grouped_gemm_backward_weights(
         expert_indices,
         go_scales,
         input_scales,
+        M_BUFFERLEN=M_bufferlen,
         M_TOTAL=M_total,
         N=N,
         K=K,
@@ -405,6 +411,9 @@ def cg_grouped_gemm_backward_inputs(
     )
 
     use_fp8 = go_scales is not None and expert_weight_scales is not None
+    if use_fp8:
+        assert go_scales.is_contiguous()
+        assert expert_weight_scales.is_contiguous()
 
     # Launch kernel
     wrap_triton(_kernel_cg_backward_dx)[grid](
@@ -414,6 +423,7 @@ def cg_grouped_gemm_backward_inputs(
         expert_indices,
         go_scales,
         expert_weight_scales,
+        M_BUFFERLEN=M_bufferlen,
         M_TOTAL=M_total,
         N=N,
         K=K,
@@ -421,7 +431,14 @@ def cg_grouped_gemm_backward_inputs(
         GROUP_SIZE_M=ALIGN_SIZE_M,
         USE_FP8=use_fp8,
     )
-
+    # grad_output_nan = torch.isnan(grad_output).any()
+    # expert_weights_nan = torch.isnan(expert_weights).any()
+    # grad_inputs_nan = torch.isnan(grad_inputs).any()
+    # if grad_output_nan or expert_weights_nan or grad_inputs_nan:
+    #     print(
+    #         f"grad_output has NaNs: {torch.isnan(grad_output).any()}, expert_weights has NaNs: {torch.isnan(expert_weights).any()}, grad_inputs has NaNs: {torch.isnan(grad_inputs).any()}"
+    #     )
+    #     print(f"grad_output={grad_output}, grad_input={grad_inputs}")
     return grad_inputs
 
 
@@ -508,6 +525,7 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         grad_output = grad_output.contiguous()
 
         if use_fp8:
+            # dequant-quant as deepseek-v3 paper
             inputs_dequant = fp8_blockwise_act_dequant(
                 inputs_fp8,
                 input_scales,
@@ -519,6 +537,18 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
                 block_size=ALIGN_SIZE_M,
                 axis=0,
             )
+
+            # # quantify inputs/weights stored in high-precision format
+            # inputs_fp8, input_scales = fp8_blockwise_act_quant(
+            #     inputs,
+            #     block_size=ALIGN_SIZE_M,
+            #     axis=0,
+            # )
+            # expert_weights, expert_weight_scales = fp8_blockwise_weight_quant(
+            #     expert_weights,
+            #     block_size=ALIGN_SIZE_M,
+            # )
+
             grad_output_fp8, grad_output_scales = fp8_blockwise_act_quant(
                 grad_output,
                 block_size=ALIGN_SIZE_M,
@@ -565,7 +595,7 @@ def cg_grouped_gemm(
     inputs: torch.Tensor,
     expert_weights: torch.Tensor,
     expert_indices: torch.Tensor,
-    use_fp8: bool = True,
+    use_fp8: bool = False,
 ) -> torch.Tensor:
     """
     Interface for contiguous grouped GEMM with full backward pass support.
@@ -622,6 +652,7 @@ def verify_cg_gemm_backward(
     device="cuda",
     atol=1e-1,  # Absolute tolerance for validation
     rtol=1e-1,  # Relative tolerance for validation
+    use_fp8=False,
 ):
     """
     Verify the correctness of the CG-GEMM backward pass against PyTorch's backward pass.
@@ -690,8 +721,10 @@ def verify_cg_gemm_backward(
     expert_weights.grad.zero_()
 
     # Compute with our implementation
-    outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices,
-                              ALIGN_SIZE_M)
+    outputs = cg_grouped_gemm(inputs,
+                              expert_weights,
+                              expert_indices,
+                              use_fp8=use_fp8)
     loss = torch.nn.functional.mse_loss(outputs, target)
     loss.backward()
 
@@ -766,6 +799,7 @@ def benchmark_cg_gemm_backward(
     num_experts=8,
     device="cuda",
     num_runs=10,
+    use_fp8=False,
 ):
     """
     Benchmark the performance of the CG-GEMM backward pass against PyTorch's backward pass.
@@ -824,8 +858,7 @@ def benchmark_cg_gemm_backward(
     # Benchmark our Triton implementation
     def run_triton_backward():
         # Forward pass with our implementation
-        outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices,
-                                  ALIGN_SIZE_M)
+        outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices, use_fp8=use_fp8)
 
         # Backward pass
         outputs.backward(grad_output)
@@ -876,12 +909,20 @@ def benchmark_cg_gemm_backward(
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Test and benchmark CG-GEMM forward/backward pass.")
+    parser.add_argument("--use_fp8", action="store_true",
+                        help="Use FP8 quantization for inputs and weights")
+
+    args = parser.parse_args()
+    use_fp8 = args.use_fp8
+
     # Run verification test
     print("Verifying backward pass correctness...")
-    inputs_match, weights_match = verify_cg_gemm_backward()
+    inputs_match, weights_match = verify_cg_gemm_backward(use_fp8=use_fp8)
 
     if inputs_match and weights_match:
         print("\nAll gradients match! Running performance benchmark...")
-        benchmark_cg_gemm_backward()
+        benchmark_cg_gemm_backward(use_fp8=use_fp8)
     else:
         print("\nGradient tests failed. Skipping benchmark.")

@@ -145,10 +145,9 @@ def fp8_blockwise_act_quant_kernel(
                                   tl.arange(0, BLOCK_SIZE)) * stride_xn
 
     x = tl.load(x_ptr + offs_x)
-    s = tl.max(tl.abs(x)) / 240.0
-    s = tl.where(s == 0.0, 1.0, s)  # Avoid division by zero
-    y = x / s
-    y = y.to(y_ptr.dtype.element_ty)
+    s = (tl.max(tl.abs(x)) + 1e-7) / 240.0
+    # s = tl.where(s == 0.0, 1.0, s)  # Avoid division by zero
+    y = tl.clamp(x / s, -240.0, 240.0).to(y_ptr.dtype.element_ty)
     offs_y = pid_m * stride_ym + (start_n +
                                   tl.arange(0, BLOCK_SIZE)) * stride_yn
     offs_s = pid_m * stride_sm + pid_n * stride_sn
@@ -380,10 +379,9 @@ def fp8_blockwise_weight_quant_kernel(x_ptr, y_ptr, s_ptr, M, N,
     offs = pid_b * M * N + offs_m[:, None] * N + offs_n[None, :]
     mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     x = tl.load(x_ptr + offs, mask=mask).to(tl.float32)
-    s = tl.max(tl.abs(x)) / 240.0
-    s = tl.where(s == 0.0, 1.0, s)  # Avoid division by zero
-    y = x / s
-    y = y.to(y_ptr.dtype.element_ty)
+    s = (tl.max(tl.abs(x)) + 1e-7) / 240.0
+    # s = tl.where(s == 0.0, 1.0, s)  # Avoid division by zero
+    y = tl.clamp(x / s, -240.0, 240.0).to(y_ptr.dtype.element_ty)
     s = s.to(s_ptr.dtype.element_ty)
     tl.store(y_ptr + offs, y, mask=mask)
     tl.store(s_ptr + pid_b * m * n + pid_m * n + pid_n, s)
