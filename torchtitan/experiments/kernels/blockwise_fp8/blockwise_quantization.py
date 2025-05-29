@@ -674,7 +674,7 @@ def fp8_blockwise_weight_quant(
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert x.dim() in [2, 3], "Input tensor must have 2 or 3 dimensions"
     assert x.size(-2) % block_size == 0 and x.size(-1) % block_size == 0, (
-        f"Both dimensions of x must be divisible by block_size (block_size={block_size})"
+        f"Both dimensions of x ({x.shape}) must be divisible by block_size (block_size={block_size})"
     )
     dtype = torch.float8_e4m3fnuz
     if x.dim() == 2:
@@ -712,7 +712,7 @@ def fp8_blockwise_weight_quant_fake(
     assert x.is_contiguous(), "Input tensor must be contiguous"
     assert x.dim() in [2, 3], "Input tensor must have 2 or 3 dimensions"
     assert x.size(-2) % block_size == 0 and x.size(-1) % block_size == 0, (
-        f"Both dimensions of x must be divisible by block_size (block_size={block_size})"
+        f"Both dimensions of x ({x.shape}) must be divisible by block_size (block_size={block_size})"
     )
     dtype = torch.float8_e4m3fnuz
     if x.dim() == 2:

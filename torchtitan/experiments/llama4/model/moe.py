@@ -166,7 +166,7 @@ class GroupedExperts(nn.Module):
                     w1 = self.w1
                     w2 = self.w2
                     w3 = self.w3
-                    
+
                 x = x.squeeze(0)
                 gate_proj = cg_grouped_gemm(
                     x,
@@ -394,7 +394,7 @@ class MoE(nn.Module):
             self.tokens_per_expert.mean() - self.tokens_per_expert
         )
         expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
-        self.expert_bias = self.expert_bias + expert_bias_delta
+        self.expert_bias.add_(expert_bias_delta)
 
         self.tokens_per_expert.zero_()
 

@@ -238,7 +238,7 @@ class ModelArgs(BaseModelArgs):
 deepseek_v2_lite_config = ModelArgs(
     vocab_size=102400,
     hidden_size=2048,
-    intermediate_size=10944,
+    intermediate_size=10880, # the original 10944 is not divisible by 128
     moe_intermediate_size=1408,
     num_hidden_layers=27,
     num_attention_heads=16,
