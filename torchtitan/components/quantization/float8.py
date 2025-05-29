@@ -106,14 +106,15 @@ class Float8Converter(ModelConverter):
         if self.enable_fp8_linear:
             from torchao.float8.float8_linear_utils import convert_to_float8_training, swap_linear_layers
             if self.use_blockwise_fp8_linear:
-                from torchtitan.experiments.kernels.blockwise_fp8.blockwise_lienar import BlockwiseQuantLinear
-                from_float = lambda m: BlockwiseQuantLinear.from_float(m)
+                from torchtitan.experiments.kernels.blockwise_fp8.blockwise_lienar import BlockwiseFP8Linear
+                from_float = lambda m: BlockwiseFP8Linear.from_float(m)
                 swap_linear_layers(
                     model,
                     from_float,
                     module_filter_fn=partial(module_filter_fn,
                                              filter_fqns=self.filter_fqns),
                 )
+                logger.info("Swapped to BlockwiseFP8Linear layers")
             else:
                 # Mutates the model inplace replacing instances of nn.Linear with Float8Linear
                 convert_to_float8_training(

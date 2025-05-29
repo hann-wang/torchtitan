@@ -15,19 +15,19 @@ from triton import Config
 # Original implementation at https://github.com/deepseek-ai/DeepSeek-V3/blob/main/inference/kernel.py
 torch_dtype = torch.bfloat16
 
-fp8_gemm_configs = [
-    Config(
-        {
-            "BLOCK_SIZE_M": block_m,
-            "BLOCK_SIZE_N": block_n
-        },
-        num_stages=2,
-        num_warps=8,
-    ) for block_m in [128] for block_n in [128]
-]
 
-@triton.autotune(configs=fp8_gemm_configs,
-                 key=["M", "N", "K", "BLOCK_SIZE_K"])
+@triton.autotune(
+    configs=[
+        Config(
+            {
+                "BLOCK_SIZE_M": 128,
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
 @triton.jit
 def blockwise_fp8_gemm_kernel(
     a_ptr,
@@ -45,35 +45,33 @@ def blockwise_fp8_gemm_kernel(
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
     k = tl.cdiv(K, BLOCK_SIZE_K)
-    offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_n = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
-    b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
-    a_s_ptrs = a_s_ptr + offs_m * k
-    b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    mask_m = offs_m < M
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    mask_n = offs_n < N
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for i in range(k):
+        start_k = i * BLOCK_SIZE_K
+        offs_k = start_k + tl.arange(0, BLOCK_SIZE_K)
+        mask_k = offs_k < K
+        a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+        b_ptrs = b_ptr + offs_n[None, :] * K + offs_k[:, None]
+        a_s_ptrs = a_s_ptr + offs_m * k + i
+        b_s_ptrs = b_s_ptr + (offs_n // BLOCK_SIZE_K) * k + i
         a = tl.load(a_ptrs,
-                    mask=offs_k[None, :] < K - i * BLOCK_SIZE_K,
+                    mask=mask_m[:, None] & mask_k[None, :],
                     other=0.0)
         b = tl.load(b_ptrs,
-                    mask=offs_k[:, None] < K - i * BLOCK_SIZE_K,
+                    mask=mask_k[:, None] & mask_n[None, :],
                     other=0.0)
-        a_s = tl.load(a_s_ptrs)
-        b_s = tl.load(b_s_ptrs)
+        a_s = tl.load(a_s_ptrs, mask=mask_m, other=1.0)
+        b_s = tl.load(b_s_ptrs, mask=mask_n, other=1.0)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
-        a_ptrs += BLOCK_SIZE_K
-        b_ptrs += BLOCK_SIZE_K
-        a_s_ptrs += 1
-        b_s_ptrs += 1
 
     c = accumulator.to(c_ptr.dtype.element_ty)
-    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + offs_m[:, None] * N + offs_n[None, :]
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    mask = (mask_m[:, None] & mask_n[None, :])
     tl.store(c_ptrs, c, mask=mask)
 
 
@@ -93,7 +91,7 @@ def blockwise_fp8_gemm(
     c = a.new_zeros(*a.size()[:-1], N, dtype=torch_dtype)
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
-        triton.cdiv(N, META["BLOCK_SIZE_N"]),
+        triton.cdiv(N, block_size),
     )
     wrap_triton(blockwise_fp8_gemm_kernel)[grid](
         a,
@@ -104,6 +102,7 @@ def blockwise_fp8_gemm(
         M,
         N,
         K,
+        BLOCK_SIZE_N=block_size,
         BLOCK_SIZE_K=block_size,
     )
     return c
@@ -127,6 +126,258 @@ def blockwise_fp8_gemm_fake(
     N = b.size(0)
     c = a.new_zeros(*a.size()[:-1], N, dtype=torch_dtype)
     return c
+
+
+@triton.autotune(
+    configs=[
+        Config(
+            {
+                "BLOCK_SIZE_N": 128,
+                "BLOCK_SIZE_K": 128,
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def blockwise_fp8_gemm_backward_weight_kernel(
+    grad_output_ptr,
+    go_ptr,
+    go_s_ptr,
+    a_ptr,
+    a_s_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_n = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    mask_n = offs_n < N
+    mask_k = offs_k < K
+    accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=tl.float32)
+    for mi in range(tl.cdiv(M, BLOCK_SIZE_M)):
+        start_m = mi * BLOCK_SIZE_M
+        offs_m = start_m + tl.arange(0, BLOCK_SIZE_M)
+        mask_m = offs_m < M
+        go_ptrs = go_ptr + offs_m[None, :] * N + offs_n[:, None]
+        a_ptrs = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+
+        go_s_ptrs = go_s_ptr + mi * N + offs_n
+        a_s_ptrs = a_s_ptr + mi * K + offs_k
+        go = tl.load(go_ptrs,
+                     mask=mask_m[None, :] & mask_n[:, None],
+                     other=0.0)
+        a = tl.load(a_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        go_s = tl.load(go_s_ptrs, mask=mask_n, other=1.0)
+        a_s = tl.load(a_s_ptrs, mask=mask_k, other=1.0)
+        accumulator += tl.dot(go, a) * go_s[:, None] * a_s[None, :]
+
+    c = accumulator.to(grad_output_ptr.dtype.element_ty)
+    c_ptrs = grad_output_ptr + offs_n[:, None] * K + offs_k[None, :]
+    tl.store(c_ptrs, c, mask=mask_n[:, None] & mask_k[None, :])
+
+
+@triton_op("torchtitan::blockwise_fp8_gemm_backward_weight", mutates_args={})
+def blockwise_fp8_gemm_backward_weight(
+    grad_output: torch.Tensor,  # [M, N]
+    go_s: torch.Tensor,  # [M // block_size, N]
+    a: torch.Tensor,  # [M, K]
+    a_s: torch.Tensor,  # [M // block_size, K]
+    block_size: int = 128,
+) -> torch.Tensor:  # [N, K]
+    assert grad_output.is_contiguous() and go_s.is_contiguous(), "grad_output and go_s must be contiguous"
+    assert a.is_contiguous() and a_s.is_contiguous(), "a and a_s must be contiguous"
+    assert grad_output.dim() == 2 and a.dim() == 2, "Input tensors must have 2 dimensions"
+    assert grad_output.size(0) % block_size == 0, (
+        f"grad_output's first dimension must be divisible by block_size (block_size={block_size})"
+    )
+    assert a.size(0) % block_size == 0, (
+        f"a's first dimension must be divisible by block_size (block_size={block_size})"
+    )
+    M, N = grad_output.size()
+    _, K = a.size()
+    grad_weight = grad_output.new_zeros(N, K, dtype=torch_dtype)
+    grid = lambda meta: (
+        triton.cdiv(N, meta["BLOCK_SIZE_N"]),
+        triton.cdiv(K, meta["BLOCK_SIZE_K"]),
+    )
+    wrap_triton(blockwise_fp8_gemm_backward_weight_kernel)[grid](
+        grad_weight,
+        grad_output,
+        go_s,
+        a,
+        a_s,
+        M,
+        N,
+        K,
+        BLOCK_SIZE_M=block_size,
+    )
+    return grad_weight
+
+
+@blockwise_fp8_gemm_backward_weight.register_fake
+def blockwise_fp8_gemm_backward_weight_fake(
+    grad_output: torch.Tensor,  # [M, N]
+    go_s: torch.Tensor,  # [M // block_size, N]
+    a: torch.Tensor,  # [M, K]
+    a_s: torch.Tensor,  # [M // block_size, K]
+    block_size: int = 128,
+) -> torch.Tensor:
+    """
+    Fake implementation of the block-wise FP8 GEMM backward weight for testing purposes.
+    Returns a zero tensor of the appropriate shape.
+    """
+    assert grad_output.is_contiguous() and go_s.is_contiguous(), "grad_output and go_s must be contiguous"
+    assert a.is_contiguous() and a_s.is_contiguous(), "a and a_s must be contiguous"
+    assert grad_output.dim() == 2 and a.dim() == 2, "Input tensors must have 2 dimensions"
+    assert grad_output.size(0) % block_size == 0, (
+        f"grad_output's first dimension must be divisible by block_size (block_size={block_size})"
+    )
+    assert a.size(0) % block_size == 0, (
+        f"a's first dimension must be divisible by block_size (block_size={block_size})"
+    )
+
+    M, N = grad_output.size()
+    _, K = a.size()
+    grad_weight = grad_output.new_zeros(N, K, dtype=torch_dtype)
+    return grad_weight
+
+
+@triton.autotune(
+    configs=[
+        Config(
+            {
+                "BLOCK_SIZE_M": 128,
+            },
+            num_stages=2,
+            num_warps=8,
+        ),
+    ],
+    key=["M", "N", "K"],
+)
+@triton.jit
+def blockwise_fp8_gemm_backward_act_kernel(
+    grad_output_ptr,
+    go_ptr,
+    go_s_ptr,
+    b_ptr,
+    b_s_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+):
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+    offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    offs_k = pid_k * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
+    mask_m = offs_m < M
+    mask_k = offs_k < K
+    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+    for ni in range(tl.cdiv(N, BLOCK_SIZE_N)):
+        start_n = ni * BLOCK_SIZE_N
+        offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)
+        mask_n = offs_n < N
+        go_ptrs = go_ptr + offs_m[:, None] * N + offs_n[None, :]
+        b_ptrs = b_ptr + offs_n[:, None] * K + offs_k[None, :]
+
+        go_s_ptrs = go_s_ptr + offs_m * (N // BLOCK_SIZE_N) + ni
+        b_s_ptrs = b_s_ptr + ni * (K // BLOCK_SIZE_N) + offs_k // BLOCK_SIZE_N
+        go = tl.load(go_ptrs,
+                     mask=mask_m[:, None] & mask_n[None, :],
+                     other=0.0)
+        b = tl.load(b_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
+        go_s = tl.load(go_s_ptrs, mask=mask_m, other=1.0)
+        b_s = tl.load(b_s_ptrs, mask=mask_k, other=1.0)
+        accumulator += tl.dot(go, b) * go_s[:, None] * b_s[None, :]
+    c = accumulator.to(grad_output_ptr.dtype.element_ty)
+    c_ptrs = grad_output_ptr + offs_m[:, None] * K + offs_k[None, :]
+    mask = (mask_m[:, None] & mask_k[None, :])
+    tl.store(c_ptrs, c, mask=mask)
+
+
+@triton_op("torchtitan::blockwise_fp8_gemm_backward_act", mutates_args={})
+def blockwise_fp8_gemm_backward_act(
+    grad_output: torch.Tensor, # [M, N]
+    go_s: torch.Tensor, # [M, N // block_size]
+    b: torch.Tensor, # [N, K]
+    b_s: torch.Tensor, # [N // block_size, K // block_size]
+    block_size: int = 128,
+) -> torch.Tensor: # [M, K]
+    assert grad_output.is_contiguous() and go_s.is_contiguous(), "grad_output and go_s must be contiguous"
+    assert b.is_contiguous() and b_s.is_contiguous(), "b and b_s must be contiguous"
+    assert grad_output.dim() == 2 and b.dim() == 2, "Input tensors must have 3 and 2 dimensions respectively"
+    assert b.size(0) // block_size == b_s.size(0), (
+        f"b's first dimension divided by block_size must match b_s's first dimension (block_size={block_size})"
+    )
+    assert b.size(1) // block_size == b_s.size(1), (
+        f"b's second dimension divided by block_size must match b_s's second dimension (block_size={block_size})"
+    )
+    assert grad_output.size(1) // block_size == go_s.size(1), (
+        f"grad_output's second dimension divided by block_size must match go_s's second dimension (block_size={block_size})"
+    )
+
+    M, N = grad_output.size()
+    _, K = b.size()
+    grad_act = grad_output.new_zeros(M, K, dtype=torch_dtype)
+    grid = lambda meta: (
+        triton.cdiv(M, meta["BLOCK_SIZE_M"]),
+        triton.cdiv(K, block_size),
+    )
+    wrap_triton(blockwise_fp8_gemm_backward_act_kernel)[grid](
+        grad_act,
+        grad_output,
+        go_s,
+        b,
+        b_s,
+        M,
+        N,
+        K,
+        BLOCK_SIZE_N=block_size,
+        BLOCK_SIZE_K=block_size,
+    )
+    return grad_act
+
+
+@blockwise_fp8_gemm_backward_act.register_fake
+def blockwise_fp8_gemm_backward_act_fake(
+    grad_output: torch.Tensor,  # [M, N]
+    go_s: torch.Tensor,  # [M, N // block_size]
+    b: torch.Tensor,  # [N, K]
+    b_s: torch.Tensor,  # [N // block_size, K // block_size]
+    block_size: int = 128,
+) -> torch.Tensor:
+    """
+    Fake implementation of the block-wise FP8 GEMM backward activation for testing purposes.
+    Returns a zero tensor of the appropriate shape.
+    """
+    assert grad_output.is_contiguous() and go_s.is_contiguous(), "grad_output and go_s must be contiguous"
+    assert b.is_contiguous() and b_s.is_contiguous(), "b and b_s must be contiguous"
+    assert grad_output.dim() == 2 and b.dim() == 2, "Input tensors must have 2 dimensions"
+    assert b.size(0) // block_size == b_s.size(0), (
+        f"b's first dimension divided by block_size must match b_s's first dimension (block_size={block_size})"
+    )
+    assert b.size(1) // block_size == b_s.size(1), (
+        f"b's second dimension divided by block_size must match b_s's second dimension (block_size={block_size})"
+    )
+    assert grad_output.size(1) // block_size == go_s.size(1), (
+        f"grad_output's second dimension divided by block_size must match go_s's second dimension (block_size={block_size})"
+    )
+
+    M, N = grad_output.size()
+    _, K = b.size()
+    grad_act = grad_output.new_zeros(M, K, dtype=torch_dtype)
+    return grad_act
+
 
 @triton.jit
 def fp8_blockwise_act_quant_kernel(
