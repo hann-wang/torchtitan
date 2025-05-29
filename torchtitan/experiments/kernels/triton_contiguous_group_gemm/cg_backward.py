@@ -660,6 +660,9 @@ def verify_cg_gemm_backward(
     Returns:
         tuple: (inputs_passed, weights_passed) indicating if the respective gradients match
     """
+
+    STD = 1
+
     # Ensure M_total is a multiple of group_size_m
     M_total = (M_total // ALIGN_SIZE_M) * ALIGN_SIZE_M
     num_groups = M_total // ALIGN_SIZE_M
@@ -667,18 +670,18 @@ def verify_cg_gemm_backward(
     # Create test tensors
     torch.manual_seed(0)
     dtype = torch_dtype
-    inputs = torch.randn(
-        (M_total, K),
-        device=device,
-        dtype=dtype,
-        requires_grad=True,
-    )
-    expert_weights = torch.randn(
-        (num_experts, N, K),
-        dtype=dtype,
-        device=device,
-        requires_grad=True,
-    )
+    inputs = torch.nn.Parameter(
+        torch.randn(
+            (M_total, K),
+            device=device,
+            dtype=dtype,
+        ) * STD)
+    expert_weights = torch.nn.Parameter(
+        torch.randn(
+            (num_experts, N, K),
+            dtype=dtype,
+            device=device,
+        ) * STD)
 
     # Create expert indices - each token in a group has the same expert
     expert_indices = torch.zeros(
@@ -695,7 +698,7 @@ def verify_cg_gemm_backward(
         expert_indices[start_idx:end_idx] = expert_idx
 
     # Create a target for gradient computation
-    target = torch.randn((M_total, N), dtype=dtype, device=device)
+    target = torch.randn((M_total, N), dtype=dtype, device=device) * STD
 
     # PyTorch reference implementation
     outputs_ref = torch.zeros((M_total, N), dtype=dtype, device=device)

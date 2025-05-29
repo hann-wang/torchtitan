@@ -443,7 +443,7 @@ class Float8:
     for backward computation.
     """
 
-    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None
+    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp", "blockwise"] | None = None
     """If specified, creates float8 config from recipe name"""
 
     filter_fqns: list[str] = field(default_factory=list)

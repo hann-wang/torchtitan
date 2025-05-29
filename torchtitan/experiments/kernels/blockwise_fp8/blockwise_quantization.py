@@ -4,7 +4,6 @@
 # This source code is licensed under the BSD 3-Clause license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 from typing import Tuple
 
 import torch
@@ -22,15 +21,13 @@ fp8_gemm_configs = [
             "BLOCK_SIZE_M": block_m,
             "BLOCK_SIZE_N": block_n
         },
-        num_stages=num_stages,
+        num_stages=2,
         num_warps=8,
-    ) for block_m in [16, 32, 64, 128] for block_n in [32, 64, 128]
-    for num_stages in [3, 4, 5, 6]
+    ) for block_m in [128] for block_n in [128]
 ]
 
-
 @triton.autotune(configs=fp8_gemm_configs,
-                 key=["N", "K", "M_BUCKET", "BLOCK_SIZE_K"])
+                 key=["M", "N", "K", "BLOCK_SIZE_K"])
 @triton.jit
 def blockwise_fp8_gemm_kernel(
     a_ptr,
@@ -38,10 +35,9 @@ def blockwise_fp8_gemm_kernel(
     c_ptr,
     a_s_ptr,
     b_s_ptr,
-    M,
+    M: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
-    M_BUCKET: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -81,36 +77,56 @@ def blockwise_fp8_gemm_kernel(
     tl.store(c_ptrs, c, mask=mask)
 
 
+@triton_op("torchtitan::blockwise_fp8_gemm", mutates_args={})
 def blockwise_fp8_gemm(
     a: torch.Tensor,
     a_s: torch.Tensor,
     b: torch.Tensor,
     b_s: torch.Tensor,
     block_size: int = 128,
-):
+) -> torch.Tensor:
     assert a.is_contiguous() and b.is_contiguous()
     assert a_s.is_contiguous() and b_s.is_contiguous()
     K = a.size(-1)
     M = a.numel() // K
     N = b.size(0)
-    M_BUCKET = math.ceil(math.log2(M))
-    c = a.new_empty(*a.size()[:-1], N, dtype=torch_dtype)
+    c = a.new_zeros(*a.size()[:-1], N, dtype=torch_dtype)
     grid = lambda META: (
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
-    blockwise_fp8_gemm_kernel[grid](a,
-                                    b,
-                                    c,
-                                    a_s,
-                                    b_s,
-                                    M,
-                                    N,
-                                    K,
-                                    M_BUCKET,
-                                    BLOCK_SIZE_K=block_size)
+    wrap_triton(blockwise_fp8_gemm_kernel)[grid](
+        a,
+        b,
+        c,
+        a_s,
+        b_s,
+        M,
+        N,
+        K,
+        BLOCK_SIZE_K=block_size,
+    )
     return c
 
+@blockwise_fp8_gemm.register_fake
+def blockwise_fp8_gemm_fake(
+    a: torch.Tensor,
+    a_s: torch.Tensor,
+    b: torch.Tensor,
+    b_s: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """
+    Fake implementation of the block-wise FP8 GEMM for testing purposes.
+    Returns a zero tensor of the appropriate shape.
+    """
+    assert a.is_contiguous() and b.is_contiguous()
+    assert a_s.is_contiguous() and b_s.is_contiguous()
+    K = a.size(-1)
+    M = a.numel() // K
+    N = b.size(0)
+    c = a.new_zeros(*a.size()[:-1], N, dtype=torch_dtype)
+    return c
 
 @triton.jit
 def fp8_blockwise_act_quant_kernel(
@@ -398,7 +414,6 @@ def fp8_blockwise_weight_quant(
     Args:
         x (torch.Tensor): The weight tensor to be quantized.
         block_size (int, optional): The block size to use for quantization. Defaults to 128.
-        dtype (torch.dtype, optional): The dtype to use for the quantized tensor. Defaults to `torch.float8_e4m3fn`.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: A tuple containing:

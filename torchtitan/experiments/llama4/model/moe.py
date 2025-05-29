@@ -81,9 +81,9 @@ class GroupedExperts(nn.Module):
                 x.dtype == self.w1.dtype == self.w2.dtype == self.w3.dtype == torch.bfloat16
             ), "torch._grouped_mm only supports bf16 dtypes"
 
-            device_mesh = None
+            tp_mesh = None
             if isinstance(x, DTensor):
-                device_mesh = x.device_mesh
+                tp_mesh = x.device_mesh
                 num_local_tokens_per_expert = num_local_tokens_per_expert.to_local()
                 x = x.to_local()
                 w1 = self.w1.to_local()
@@ -142,23 +142,68 @@ class GroupedExperts(nn.Module):
                 out = gmm(h, w2, num_local_tokens_per_expert_cpu)
 
 
-            if device_mesh is not None:
+            if tp_mesh is not None:
                 out = DTensor.from_local(
                     out,
-                    device_mesh,
+                    tp_mesh,
                     (Partial(), ),
                     run_check=False,
                 )
         else:
-            offsets = None
-            # fall back to regular bmm between 3D tensors
             assert x.dim() == 3
+            if USE_CG_GROUPED_GEMM:
+                m_total = x.shape[1]
+                m_indices = torch.zeros(m_total, dtype=torch.int32, device=x.device)
 
-            # x shape (num_experts, tokens_per_expert, dim)
-            h = F.silu(torch.bmm(x, self.w1))
-            h = h * torch.bmm(x, self.w3)
-            # out shape (num_experts, tokens_per_expert, dim)
-            out = torch.bmm(h, self.w2)
+                tp_mesh = None
+                if isinstance(x, DTensor):
+                    tp_mesh = x.device_mesh
+                    x = x.to_local()
+                    w1 = self.w1.to_local()
+                    w2 = self.w2.to_local()
+                    w3 = self.w3.to_local()
+                else:
+                    w1 = self.w1
+                    w2 = self.w2
+                    w3 = self.w3
+                    
+                x = x.squeeze(0)
+                gate_proj = cg_grouped_gemm(
+                    x,
+                    w1.transpose(-1, -2).contiguous(),
+                    m_indices,
+                    use_fp8=self.use_fp8,
+                )
+                up_proj = cg_grouped_gemm(
+                    x,
+                    w3.transpose(-1, -2).contiguous(),
+                    m_indices,
+                    use_fp8=self.use_fp8,
+                )
+                # Apply activation
+                hidden_outputs = F.silu(gate_proj) * up_proj
+                # Run the third GEMM (down projection)
+                out = cg_grouped_gemm(
+                    hidden_outputs,
+                    w2.transpose(-1, -2).contiguous(),
+                    m_indices,
+                    use_fp8=self.use_fp8,
+                ).unsqueeze(0)
+
+                if tp_mesh is not None:
+                    out = DTensor.from_local(
+                        out,
+                        tp_mesh,
+                        (Partial(), ),
+                        run_check=False,
+                    )
+            else:
+                # fall back to regular bmm between 3D tensors
+                # x shape (num_experts, tokens_per_expert, dim)
+                h = F.silu(torch.bmm(x, self.w1))
+                h = h * torch.bmm(x, self.w3)
+                # out shape (num_experts, tokens_per_expert, dim)
+                out = torch.bmm(h, self.w2)
         return out
 
     def init_weights(self, init_std: float):
