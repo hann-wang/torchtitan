@@ -31,7 +31,6 @@ class OverrideDefinitions:
     test_descr: str = "default"
     test_name: str = "default"
     ngpu: int = 4
-    model_flavor: str = "debugmodel"
 
     def __repr__(self):
         return self.test_descr
@@ -483,6 +482,19 @@ def build_test_list():
             "Optional checkpoint",
             "optional_checkpoint",
         ),
+        OverrideDefinitions(
+            [
+                [
+                    "--model.converters float8",
+                    "--float8.enable_fsdp_float8_all_gather",
+                    "--float8.precompute_float8_dynamic_scale_for_fsdp",
+                    "--float8.force_recompute_fp8_weight_in_bwd",
+                    "--float8.emulate",
+                ],
+            ],
+            "Float8 emulation test",
+            "float8_emulation",
+        ),
     ]
     return integration_tests_flavors
 
@@ -495,7 +507,6 @@ def run_test(test_flavor: OverrideDefinitions, full_path: str, output_dir: str):
     # run_test supports sequence of tests.
     test_name = test_flavor.test_name
     dump_folder_arg = f"--job.dump_folder {output_dir}/{test_name}"
-    model_flavor_arg = f"--model.flavor {test_flavor.model_flavor}"
     all_ranks = ",".join(map(str, range(test_flavor.ngpu)))
 
     for idx, override_arg in enumerate(test_flavor.override_args):
@@ -508,7 +519,6 @@ def run_test(test_flavor: OverrideDefinitions, full_path: str, output_dir: str):
                 "./scripts/estimate/run_memory_estimation.sh"
             )
         cmd += " " + dump_folder_arg
-        cmd += " " + model_flavor_arg
         if override_arg:
             cmd += " " + " ".join(override_arg)
         logger.info(

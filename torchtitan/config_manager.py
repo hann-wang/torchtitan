@@ -227,6 +227,14 @@ class Training:
     gc_freq: int = 50
     """Python garbage control scheduling interval, in steps"""
 
+    gc_debug: bool = False
+    """
+    Enable GC debugging mode. This will perform gc.collect() at every step to
+    detect if there is a reference cycle that includes a CUDA Tensor.
+    Note that you may want to lower the training steps to avoid generating too
+    many temporary files.
+    """
+
     seed: int | None = None
     """Choose the base RNG seed used for training"""
 
@@ -465,6 +473,13 @@ class Float8:
     enable_fp8_linear: bool = True
     """Whether to use FP8 Linear module"""
 
+    emulate: bool = False
+    """
+    If True, emulation is used instead of hardware accelerated gemm. This is for test purpose only,
+    as the current CI does not have sm_89 capability, required by Float8.
+    Not compatible with torch.compile.
+    """
+
 
 @dataclass
 class MX:
@@ -474,11 +489,12 @@ class MX:
     recipe_name: Literal["mxfp8"] = "mxfp8"
     """If specified, creates float8 config from recipe name"""
 
-    filter_fqns: list[str] = field(default_factory=list)
+    filter_fqns: list[str] = field(default_factory=lambda: ["output"])
     """
     Comma-separated list of fully qualified names of modules to skip applying mxfloat8 training to.
-    nn.Linear modules with any dim size not divisible by 16 are always skipped due to hardware requirements.
-    Example: --MXFloat8.filter_fqns "attention.wq,attention.wk,attention.wv,output"
+    nn.Linear modules with any dim size not divisible by 16 are also always skipped due to hardware requirements.
+    By default we always skip the output layer.
+    Example: --mx.filter_fqns "attention.wq,attention.wk,attention.wv,output"
     """
 
 
@@ -632,7 +648,6 @@ class ConfigManager:
         return self.config
 
     def _maybe_load_toml(self, args: list[str]) -> dict[str, Any] | None:
-
         # 1. Check CLI
         valid_keys = {"--job.config-file", "--job.config_file"}
         for i, arg in enumerate(args):

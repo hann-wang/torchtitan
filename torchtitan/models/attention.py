@@ -181,24 +181,35 @@ class FlexAttention(torch.nn.Module):
 
 
 class ScaledDotProductAttention(torch.nn.Module):
+    backends: ClassVar[list[SDPBackend]] = []
+
     def __init__(self, attn_mask_type: str) -> None:
         super().__init__()
         if attn_mask_type != "causal":
             raise ValueError(
                 "TorchTitan with SDPA currently only supports causal mask."
             )
-        base_backends = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+
+        ScaledDotProductAttention._init_backend()
+
+    @classmethod
+    def _init_backend(cls) -> None:
+        if cls.backends:
+            return
+
+        # Add CuDNN on B200 w/ highest priority
+        cls.backends = [
+            SDPBackend.FLASH_ATTENTION,
+            SDPBackend.EFFICIENT_ATTENTION,
+            SDPBackend.MATH,
+        ]
         if has_cuda_capability(10, 0):
-            self.backends = [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-            ] + base_backends
-        else:
-            self.backends = [SDPBackend.FLASH_ATTENTION] + base_backends
+            cls.backends.insert(0, SDPBackend.CUDNN_ATTENTION)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
     ) -> torch.Tensor:
+        assert self.backends, "SDPA Backends should not be empty."
         with sdpa_kernel(self.backends, set_priority=True):
             return F.scaled_dot_product_attention(q, k, v, is_causal=True)
 

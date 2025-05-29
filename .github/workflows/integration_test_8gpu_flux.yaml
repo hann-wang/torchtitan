@@ -1,9 +1,13 @@
-name: 8 GPU Integration Test
+name: Flux 8 GPU Integration Test
 
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'torchtitan/experiments/flux/**'
   pull_request:
+    paths:
+      - 'torchtitan/experiments/flux/**'
   schedule:
     # Runs every 6 hours
     - cron: '0 */6 * * *'
@@ -38,7 +42,5 @@ jobs:
 
         python -m pip install --force-reinstall --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
 
-        USE_CPP=0 python -m pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu126
-
         mkdir artifacts-to-be-uploaded
-        python ./tests/integration_tests.py artifacts-to-be-uploaded --ngpu 8
+        python -m torchtitan.experiments.flux.tests.integration_tests artifacts-to-be-uploaded --ngpu 8
