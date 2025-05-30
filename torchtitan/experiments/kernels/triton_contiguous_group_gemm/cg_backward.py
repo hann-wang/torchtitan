@@ -7,9 +7,7 @@
 
 import torch
 import triton
-# from torch.library import triton_op, wrap_triton
-from torch.library import custom_op as triton_op
-wrap_triton = lambda x: x
+from torch.library import triton_op, wrap_triton
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
@@ -51,7 +49,7 @@ def _kernel_cg_backward_dx(
     go_s_ptr, # [M_TOTAL, N // block_size] or None
     b_s_ptr, # [num_experts, N // block_size, K // block_size] or None
     M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
-    M_TOTAL: tl.constexpr,  # Total M dimension (sum of all groups)
+    M_TOTAL,  # Total M dimension (sum of all groups)
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
     # Number of experts
@@ -168,7 +166,7 @@ def _kernel_cg_backward_dw(
     a_s_ptr,  # [M_TOTAL // block_size, K] or None
     # Matrix dimensions
     M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
-    M_TOTAL: tl.constexpr,  # Total M dimension
+    M_TOTAL,  # Total M dimension
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
     # Number of experts
@@ -301,6 +299,13 @@ def cg_grouped_gemm_backward_weights(
     _, N = grad_output.shape
     M_bufferlen, K = inputs.shape
     M_total = expert_indices.shape[0]
+    torch._check_is_size(M_total)
+    torch._check(M_total % ALIGN_SIZE_M == 0)
+
+    # Check if dimensions match
+    assert (
+        M_total % ALIGN_SIZE_M == 0
+    ), f"M_total ({M_total}) must be a multiple of group_size_m ({ALIGN_SIZE_M})"
 
     # Ensure expert_indices has the right dtype
     if expert_indices.dtype != torch.int32:
@@ -393,6 +398,8 @@ def cg_grouped_gemm_backward_inputs(
     M_bufferlen, N = grad_output.shape
     num_experts, _, K = expert_weights.shape
     M_total = expert_indices.shape[0]
+    torch._check_is_size(M_total)
+    torch._check(M_total % ALIGN_SIZE_M == 0)
 
     # Check if dimensions match
     assert (

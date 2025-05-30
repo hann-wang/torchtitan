@@ -9,9 +9,7 @@
 import logging
 
 import torch
-# from torch.library import triton_op, wrap_triton
-from torch.library import custom_op as triton_op
-wrap_triton = lambda x: x
+from torch.library import triton_op, wrap_triton
 import triton
 import triton.language as tl
 
@@ -65,7 +63,7 @@ def _kernel_cg_persistent_forward(
         b_s_ptr,
         # Matrix dimensions
         M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
-        M_TOTAL: tl.constexpr,  # Total M dimension (sum of all groups)
+        M_TOTAL,  # Total M dimension (sum of all groups)
         N: tl.constexpr,  # N dimension
         K: tl.constexpr,  # K dimension
         NUM_EXPERTS: tl.constexpr,  # Number of experts
@@ -310,6 +308,8 @@ def cg_grouped_gemm_forward(
     # Check if inputs are properly aligned
     M_bufferlen, K = inputs.shape
     M_total = expert_indices.shape[0]
+    torch._check_is_size(M_total)
+    torch._check(M_total % ALIGN_SIZE_M == 0)
     assert (
         M_total % ALIGN_SIZE_M == 0
     ), f"M_total ({M_total}) must be a multiple of group_size_m ({ALIGN_SIZE_M})"
