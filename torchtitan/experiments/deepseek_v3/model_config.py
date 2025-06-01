@@ -238,7 +238,44 @@ class ModelArgs(BaseModelArgs):
 deepseek_v2_lite_config = ModelArgs(
     vocab_size=102400,
     hidden_size=2048,
-    intermediate_size=10880, # the original 10944 is not divisible by 128
+    intermediate_size=10944,
+    moe_intermediate_size=1408,
+    num_hidden_layers=27,
+    num_attention_heads=16,
+    num_key_value_heads=16,
+    n_shared_experts=2,
+    n_routed_experts=64,
+    routed_scaling_factor=1.0,
+    kv_lora_rank=512,
+    q_lora_rank=None,
+    qk_rope_head_dim=64,
+    v_head_dim=128,
+    qk_nope_head_dim=128,
+    topk_method="greedy",
+    n_group=1,
+    topk_group=1,
+    num_experts_per_tok=6,
+    first_k_dense_replace=1,
+    norm_topk_prob=False,
+    scoring_func="softmax",
+    max_position_embeddings=4096,
+    rope_scaling={
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "factor": 40,
+        "mscale": 0.707,
+        "mscale_all_dim": 0.707,
+        "original_max_position_embeddings": 4096,
+        "type": "yarn",
+    },
+)
+
+
+# This is the configuration for deepseek-ai/DeepSeek-V2-Lite.
+deepseek_v3_lite_config = ModelArgs(
+    vocab_size=102400,
+    hidden_size=2048,
+    intermediate_size=10880,  # the original 10944 is not divisible by 128
     moe_intermediate_size=1408,
     num_hidden_layers=27,
     num_attention_heads=16,

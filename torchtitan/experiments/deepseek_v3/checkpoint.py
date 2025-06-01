@@ -26,6 +26,7 @@ PARAM_MAPPING = {
     "moe.shared_expert.w1": "mlp.shared_experts.gate_proj.weight",
     "moe.shared_expert.w2": "mlp.shared_experts.down_proj.weight",
     "moe.shared_expert.w3": "mlp.shared_experts.up_proj.weight",
+    "moe.shared_expert": "mlp.shared_experts",
     ".moe.": ".mlp.",
     ".feed_forward.": ".mlp.",
     r"^model.tok_embeddings": "model.embed_tokens",
@@ -183,7 +184,7 @@ def load_safetensor_weights(
             sd_key = param_key_reverse_mapping.get(key, key)
             # Check shape
             hf_tensor = checkpoint[key]
-            if ".shared_experts." in key:
+            if ".shared_experts.w" in sd_key:
                 hf_tensor = hf_tensor.T.unsqueeze(0).contiguous()
             if model_state_dict[sd_key].shape != hf_tensor.shape:
                 raise ValueError(

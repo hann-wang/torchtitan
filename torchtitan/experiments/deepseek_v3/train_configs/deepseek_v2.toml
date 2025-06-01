@@ -23,7 +23,7 @@ enable_wandb = false
 
 [model]
 name = "DeepSeek"
-flavor = "V2-Lite"
+flavor = "V3-Lite"
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
 converters = ["float8"]
 

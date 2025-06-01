@@ -55,11 +55,14 @@ def parallelize_deepseek(
             "rowwise",
             "rowwise_with_gw_hp",
         )
+        float8_is_blockwise = job_config.float8.recipe_name in (
+            "blockwise",
+        )
 
         # For now, float8 all-gather with TP is only supported for tensorwise
         # float8 scaling recipes. For rowwise recipes, we use regular TP and
         # all-gather happens in high precision.
-        enable_float8_tensorwise_tp = enable_float8_linear and not float8_is_rowwise
+        enable_float8_tensorwise_tp = enable_float8_linear and not float8_is_rowwise and not float8_is_blockwise
 
         apply_tp(
             model,
@@ -69,8 +72,6 @@ def parallelize_deepseek(
             enable_async_tp=job_config.parallelism.
             enable_async_tensor_parallel,
         )
-
-        apply_moe_tp(model, world_mesh["tp"])
 
     if job_config.activation_checkpoint.mode != "none":
         apply_ac(model, job_config.activation_checkpoint)
@@ -147,40 +148,6 @@ def parallelize_deepseek(
                     break
 
     return model
-
-
-def apply_moe_tp(
-    model: nn.Module,
-    tp_mesh: DeviceMesh,
-):
-    from torchtitan.experiments.llama4.infra.expert_parallel import NoParallel, TensorParallel
-
-    for transformer_block in model.model.layers.values():
-        moe_layer_plan = {
-            # input / output sharding on the seqlen dim
-            # all-gather for input, reduce-scatter for output
-            "moe":
-            PrepareModuleInputOutput(
-                input_layouts=(Shard(1), ),
-                desired_input_layouts=(Replicate(), ),
-                use_local_input=True,
-                output_layouts=(Partial(), ),
-                desired_output_layouts=(Shard(1), ),
-            ),
-            # replicate computation for the router
-            "moe.router.gate":
-            NoParallel(),
-            # input Replicate, output Partial
-            "moe.experts":
-            TensorParallel(output_layout=Partial()),
-            "moe.shared_expert":
-            TensorParallel(output_layout=Partial()),
-        }
-        parallelize_module(
-            module=transformer_block,
-            device_mesh=tp_mesh,
-            parallelize_plan=moe_layer_plan,
-        )
 
 
 def apply_tp(
@@ -282,6 +249,33 @@ def apply_tp(
             "feed_forward.down_proj":
             rowwise_parallel(output_layouts=Shard(1)),
             "feed_forward.up_proj":
+            colwise_parallel(),
+            # input / output sharding on the seqlen dim
+            # all-gather for input, reduce-scatter for output
+            "moe":
+            PrepareModuleInputOutput(
+                input_layouts=(Shard(1), ),
+                desired_input_layouts=(Replicate(), ),
+                use_local_input=True,
+                output_layouts=(Partial(), ),
+                desired_output_layouts=(Shard(1), ),
+            ),
+            # replicate computation for the router
+            "moe.router.gate":
+            NoParallel(),
+            # input Replicate, output Partial
+            "moe.experts":
+            TensorParallel(output_layout=Partial()),
+            "moe.shared_expert":
+            prepare_module_input(
+                input_layouts=(Partial(), ),
+                desired_input_layouts=(Replicate(), ),
+            ),
+            "moe.shared_expert.gate_proj":
+            colwise_parallel(),
+            "moe.shared_expert.down_proj":
+            rowwise_parallel(output_layouts=Partial(), ),
+            "moe.shared_expert.up_proj":
             colwise_parallel(),
         }
 
