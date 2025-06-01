@@ -11,10 +11,12 @@ from torch import nn
 
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import ModelProtocol
+from torchtitan.experiments.kernels.blockwise_fp8.blockwise_fa import flash_attention_forward
 
 from .args import TransformerModelArgs
 from .moe import MoE
 
+USE_SDPA = True
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
     """
@@ -232,8 +234,8 @@ class AttentionFlashAttention2(Attention):
 
     def __init__(self, model_args: TransformerModelArgs):
         super().__init__(model_args)
-        self.descale_q = self.descale_k = self.descale_v = None
         self.use_fp8 = False
+        self.use_fp8_fa_block_scales = True
 
     @property
     def q_proj(self):
@@ -277,76 +279,28 @@ class AttentionFlashAttention2(Attention):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        if self.use_fp8:
-            # freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
-            # freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
-            # assert freqs_cis.shape == (
-            #     1, seqlen, xq.shape[-1]
-            # ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-            # xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
-            #     xq, xk, freqs_cis.real, freqs_cis.imag, 64)
-
-            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-            if USE_CLIP:
-                xq = clip_outlier(xq)
-                xk = clip_outlier(xk)
-                xv = clip_outlier(xv)
-
-            if USE_HADAMARD:
-                xq = hadamard_transform(xq)
-                xk = hadamard_transform(xk)
-
-            xq_hp = xq
-            xk_hp = xk
-            with torch.no_grad():
-                xq, descale_q = block_scaling_node(xq)
-                xk, descale_k = block_scaling_node(xk)
-        else:
-            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-            xq_hp = xq
-            xk_hp = xk
-            descale_q = None
-            descale_k = None
-
-        xv_hp = xv
-        with torch.no_grad():
-            if self.use_fp8:
-                descale_v = 240. / xv_hp.max()
-                xv = torch.clamp((xv_hp * descale_v), -240.,
-                                 240.).to(torch.float8_e4m3fnuz)
-            else:
-                descale_v = None
-
-        if self.use_fp8:
-            output = _flash_attention_forward(
-                xq_hp,
-                xk_hp,
-                xv_hp,
-                xq,
-                xk,
-                xv,
-                None,
-                seqlen,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                position_ids=None,
-                dropout=0.0,
-                sliding_window=None,
-                use_top_left_mask=False,
-                is_causal=True,
-            )
-        else:
-            xk = repeat_kv(xk, self.n_rep)
-            xv = repeat_kv(xv, self.n_rep)
+        if not self.use_fp8 and USE_SDPA:
             output = F.scaled_dot_product_attention(
                 xq.transpose(1, 2),
                 xk.transpose(1, 2),
                 xv.transpose(1, 2),
                 dropout_p=0.0,
                 is_causal=True,
+                enable_gqa=self.n_rep > 1,
             ).transpose(1, 2)
+        else:
+            if self.use_fp8:
+                assert self.use_fp8_fa_block_scales
+            output = flash_attention_forward(
+                xq,
+                xk,
+                xv,
+                dropout=0.0,
+                is_causal=True,
+                use_fp8=self.use_fp8,
+            )
 
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)

@@ -43,8 +43,7 @@ from torchtitan.experiments.llama4.model.moe import MoE as Llama4MoE, GroupedExp
 from torchtitan.experiments.deepseek_v3.attn_mask_utils import _prepare_4d_causal_attention_mask
 from torchtitan.experiments.deepseek_v3.model_config import ModelArgs
 
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
-from transformers.triton_flash_attention_fp8_block import block_scaling_node, FIXED_BLOCK_M, FIXED_BLOCK_N
+from torchtitan.experiments.kernels.blockwise_fp8.blockwise_fa import flash_attention_forward
 
 USE_SDPA = True
 
@@ -669,84 +668,30 @@ class AttentionFlashAttention2(Attention):
                     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
                 )
 
-        xq_hp = query_states.transpose(1, 2)
-        xk_hp = key_states.transpose(1, 2)
-        xv_hp = value_states.transpose(1, 2)
-        if self.use_fp8:
-            with torch.no_grad():
-                if self.use_fp8_fa_block_scales:
-                    xq, descale_q = block_scaling_node(xq_hp,
-                                                       FIXED_BLOCK_M)
-                    xk, descale_k = block_scaling_node(xk_hp, FIXED_BLOCK_N)
-                else:
-                    descale_q = 240. / xq_hp.abs().max()
-                    xq = check_and_convert(xq_hp, descale_q)
-                    descale_k = 240. / xk_hp.abs().max()
-                    xk = check_and_convert(xk_hp, descale_k)
-                descale_v = 240. / xv_hp.abs().max()
-                xv = check_and_convert(xv_hp, descale_v)
-        else:
-            descale_q = None
-            descale_k = None
-            descale_v = None
-            xq = query_states
-            xk = key_states
-            xv = value_states
-
         assert attention_mask is None
         assert q_len == kv_seq_len
 
-        if self.use_fp8:
-            attn_output = _flash_attention_forward(
-                xq_hp,
-                xk_hp,
-                xv_hp,
-                xq,
-                xk,
-                xv,
-                None,
-                q_len,
-                softmax_scale=self.softmax_scale,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                position_ids=None,
-                dropout=0.0,
-                sliding_window=None,
-                use_top_left_mask=False,
+        if not self.use_fp8 and USE_SDPA:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                dropout_p=0.0,
                 is_causal=True,
-                use_fp8_perblock=self.use_fp8_fa_block_scales,
-            )
+                scale=self.softmax_scale,
+            ).transpose(1, 2)
         else:
-            if USE_SDPA:
-                attn_output = torch.nn.functional.scaled_dot_product_attention(
-                    xq,
-                    xk,
-                    xv,
-                    dropout_p=0.0,
-                    is_causal=True,
-                    scale=self.softmax_scale,
-                ).transpose(1, 2)
-            else:
-                attn_output = _flash_attention_forward(
-                    xq_hp,
-                    xk_hp,
-                    xv_hp,
-                    xq_hp,
-                    xk_hp,
-                    xv_hp,
-                    None,
-                    q_len,
-                    softmax_scale=self.softmax_scale,
-                    descale_q=descale_q,
-                    descale_k=descale_k,
-                    descale_v=descale_v,
-                    position_ids=None,
-                    dropout=0.0,
-                    sliding_window=None,
-                    use_top_left_mask=False,
-                    is_causal=True,
-                )
+            if self.use_fp8:
+                assert self.use_fp8_fa_block_scales
+            attn_output = flash_attention_forward(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                softmax_scale=self.softmax_scale,
+                dropout=0.0,
+                is_causal=True,
+                use_fp8=self.use_fp8,
+            )
 
         attn_output = attn_output.reshape(bsz, q_len,
                                           current_num_heads * self.v_head_dim)

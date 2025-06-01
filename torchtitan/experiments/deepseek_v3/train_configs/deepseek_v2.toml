@@ -7,7 +7,7 @@
 # DeepSeek V2 Lite
 
 [job]
-dump_folder = "./deepseek-v2-lite-fp8-linearblk-fa-nonshared-shared-outputs"
+dump_folder = "./deepseek-v2-lite-fp8-linearblk-fa-nonshared-shared-f8bwd-refactor-outputs"
 description = "DeepSeek v2 training"
 
 [profiling]

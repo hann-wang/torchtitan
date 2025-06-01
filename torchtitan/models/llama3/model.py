@@ -18,21 +18,10 @@ from torchtitan.config_manager import JobConfig
 from torchtitan.models.attention import build_attention, init_attention_mask
 from torchtitan.protocols.train_spec import BaseModelArgs, ModelProtocol
 
-from transformers.modeling_flash_attention_utils import _flash_attention_forward
-from transformers.triton_hadamard_transform import hadamard_transform
-from transformers.triton_rope import rope_with_scaling_qk
-from transformers.outlier_clipping import clip_outlier
-from transformers.triton_flash_attention_fp8_block import block_scaling_node, FIXED_BLOCK_M, FIXED_BLOCK_N
+from torchtitan.experiments.kernels.blockwise_fp8.blockwise_fa import flash_attention_forward
 
-USE_CLIP = False
-USE_HADAMARD = False
 USE_SDPA = True
 
-def check_and_convert(t, scale):
-    float8_fw = torch.float8_e4m3fnuz
-    finfo = torch.finfo(float8_fw)
-    return ((t * scale).clamp(min=finfo.min, max=finfo.max).to(
-        dtype=float8_fw) if t.dtype != float8_fw else t)
 
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
@@ -344,103 +333,28 @@ class AttentionFlashAttention2(Attention):
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        if self.use_fp8:
-            # freqs_cis = freqs_cis[0:seqlen].unsqueeze(0)
-            # freqs_cis = torch.cat((freqs_cis, freqs_cis), dim=-1)
-            # assert freqs_cis.shape == (
-            #     1, seqlen, xq.shape[-1]
-            # ), f"shape of freqs_cis ({freqs_cis.shape}) does not match (1, {seqlen}, {xq.shape[-1]})"
-            # assert FIXED_BLOCK_M == FIXED_BLOCK_N
-            # xq_hp, xk_hp, xq, xk, descale_q, descale_k = rope_with_scaling_qk(
-            #     xq, xk, freqs_cis.real, freqs_cis.imag, FIXED_BLOCK_M, "bshd")
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-            if USE_CLIP:
-                xq = clip_outlier(xq)
-                xk = clip_outlier(xk)
-                xv = clip_outlier(xv)
-
-            if USE_HADAMARD:
-                xq = hadamard_transform(xq)
-                xk = hadamard_transform(xk)
-
-            xq_hp = xq
-            xk_hp = xk
-            with torch.no_grad():
-                if self.use_fp8_fa_block_scales:
-                    xq, descale_q = block_scaling_node(xq, FIXED_BLOCK_M)
-                    xk, descale_k = block_scaling_node(xk, FIXED_BLOCK_N)
-                else:
-                    descale_q = 240. / xq_hp.abs().max()
-                    xq = check_and_convert(xq_hp, descale_q)
-                    descale_k = 240. / xk_hp.abs().max()
-                    xk = check_and_convert(xk_hp, descale_k)
-
+        if not self.use_fp8 and USE_SDPA:
+            output = F.scaled_dot_product_attention(
+                xq.transpose(1, 2),
+                xk.transpose(1, 2),
+                xv.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=True,
+                enable_gqa=self.n_rep > 1,
+            ).transpose(1, 2)
         else:
-            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
-            xq_hp = xq
-            xk_hp = xk
-            descale_q = None
-            descale_k = None
-
-        xv_hp = xv
-        with torch.no_grad():
             if self.use_fp8:
-                descale_v = 240. / xv_hp.abs().max()
-                xv = check_and_convert(xv_hp, descale_v)
-            else:
-                descale_v = None
-
-        if self.use_fp8:
-            output = _flash_attention_forward(
-                xq_hp,
-                xk_hp,
-                xv_hp,
+                assert self.use_fp8_fa_block_scales
+            output = flash_attention_forward(
                 xq,
                 xk,
                 xv,
-                None,
-                seqlen,
-                descale_q=descale_q,
-                descale_k=descale_k,
-                descale_v=descale_v,
-                position_ids=None,
                 dropout=0.0,
-                sliding_window=None,
-                use_top_left_mask=False,
                 is_causal=True,
-                use_fp8_perblock=self.use_fp8_fa_block_scales,
+                use_fp8=self.use_fp8,
             )
-        else:
-            if USE_SDPA:
-                xk = repeat_kv(xk, self.n_rep)
-                xv = repeat_kv(xv, self.n_rep)
-                output = F.scaled_dot_product_attention(
-                    xq.transpose(1, 2),
-                    xk.transpose(1, 2),
-                    xv.transpose(1, 2),
-                    dropout_p=0.0,
-                    is_causal=True,
-                ).transpose(1, 2)
-            else:
-                output = _flash_attention_forward(
-                    xq_hp,
-                    xk_hp,
-                    xv_hp,
-                    xq,
-                    xk,
-                    xv,
-                    None,
-                    seqlen,
-                    descale_q=descale_q,
-                    descale_k=descale_k,
-                    descale_v=descale_v,
-                    position_ids=None,
-                    dropout=0.0,
-                    sliding_window=None,
-                    use_top_left_mask=False,
-                    is_causal=True,
-                )
 
         output = output.view(bs, seqlen, -1).contiguous()
         return self.wo(output)
