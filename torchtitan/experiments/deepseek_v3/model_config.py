@@ -272,7 +272,7 @@ deepseek_v2_lite_config = ModelArgs(
 
 
 # This is the configuration for deepseek-ai/DeepSeek-V2-Lite.
-deepseek_v3_lite_config = ModelArgs(
+deepseek_v2_dim10880_config = ModelArgs(
     vocab_size=102400,
     hidden_size=2048,
     intermediate_size=10880,  # the original 10944 is not divisible by 128
@@ -307,11 +307,15 @@ deepseek_v3_lite_config = ModelArgs(
     },
 )
 
+deepseek_v3_lite_config = ModelArgs(num_hidden_layers=12)
+
+deepseek_v3_config = ModelArgs()
 
 # Model configuration registry
 # Key is the model distribution ID on HuggingFace Hub
 deepseek_config_registry = {
     "deepseek-ai/DeepSeek-V2-Lite": deepseek_v2_lite_config,
     "deepseek-ai/DeepSeek-V2-Lite-Chat": deepseek_v2_lite_config,
-    "deepseek-ai/deepseek-v3": ModelArgs(),
+    "deepseek-ai/deepseek-v3": deepseek_v3_config,
+    "deepseek-ai/DeepSeek-V3-0324": deepseek_v3_config,
 }

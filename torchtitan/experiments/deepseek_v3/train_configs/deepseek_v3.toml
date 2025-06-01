@@ -7,8 +7,8 @@
 # DeepSeek V2 Lite
 
 [job]
-dump_folder = "./deepseek-v2-lite-fp8-linearblk-fa-nonshared-shared-f8bwd-refactor-outputs"
-description = "DeepSeek v2 training"
+dump_folder = "./deepseek-v3-bf16-outputs"
+description = "DeepSeek v3 training"
 
 [profiling]
 enable_profiling = false
@@ -23,13 +23,13 @@ enable_wandb = false
 
 [model]
 name = "DeepSeek"
-flavor = "V2-Dim10880"
+flavor = "V3-Lite"
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
-converters = ["float8"]
+# converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
-lr = 4.2e-4
+lr = 2.2e-4
 eps = 1e-15
 # B1 = 0.9 / B2 = 0.95
 
@@ -40,19 +40,19 @@ decay_type = "linear"
 lr_min = 0.1
 
 [training]
-batch_size = 1
+batch_size = 4
 seq_len = 4096
 max_norm = 1.0  # grad norm clipping
 steps = 3000
-compile = true
+compile = false
 dataset = "c4"
 
 [parallelism]
 data_parallel_replicate_degree = 1
 data_parallel_shard_degree = -1
-tensor_parallel_degree = 1
+tensor_parallel_degree = 8
 enable_async_tensor_parallel = false
-pipeline_parallel_degree = 1
+pipeline_parallel_degree = 2
 context_parallel_degree = 1
 enable_compiled_autograd = false
 

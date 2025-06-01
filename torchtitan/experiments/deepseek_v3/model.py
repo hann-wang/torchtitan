@@ -102,7 +102,7 @@ class MoE(Llama4MoE):
         # to make initialization and checkpointing code simpler
         self.register_buffer(
             "expert_bias",
-            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            torch.randn(num_experts, dtype=torch.get_default_dtype()),
             persistent=True,
         )
         self.register_buffer(

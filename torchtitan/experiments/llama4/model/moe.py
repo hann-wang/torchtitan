@@ -337,7 +337,7 @@ class MoE(nn.Module):
         # to make initialization and checkpointing code simpler
         self.register_buffer(
             "expert_bias",
-            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            torch.randn(num_experts, dtype=torch.get_default_dtype()),
             persistent=True,
         )
 
@@ -468,7 +468,7 @@ class MoE(nn.Module):
             buffer_device = next(self.router.parameters()).device
 
         with torch.device(buffer_device):
-            self.expert_bias = torch.zeros(
+            self.expert_bias = torch.randn(
                 self.experts.num_experts,
                 dtype=torch.get_default_dtype(),
             )
