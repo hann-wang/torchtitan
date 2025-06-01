@@ -184,7 +184,7 @@ def load_safetensor_weights(
             sd_key = param_key_reverse_mapping.get(key, key)
             # Check shape
             hf_tensor = checkpoint[key]
-            if ".shared_experts.w" in sd_key:
+            if ".shared_expert.w" in sd_key:
                 hf_tensor = hf_tensor.T.unsqueeze(0).contiguous()
             if model_state_dict[sd_key].shape != hf_tensor.shape:
                 raise ValueError(

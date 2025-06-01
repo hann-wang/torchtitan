@@ -91,22 +91,18 @@ class GroupedExperts(nn.Module):
             if USE_CG_GROUPED_GEMM:
                 from torchtitan.experiments.deepseek_v3 import dsgemm_utils
 
-                w1 = self.w1.transpose(-1, -2).contiguous()
-                w2 = self.w2.transpose(-1, -2).contiguous()
-                w3 = self.w3.transpose(-1, -2).contiguous()
-
                 # Create indices from offsets without CPU-GPU sync
                 m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
                     offsets)
                 gate_proj = cg_grouped_gemm(
                     x,
-                    w1,
+                    self.w1,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
                 up_proj = cg_grouped_gemm(
                     x,
-                    w3,
+                    self.w3,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
@@ -115,7 +111,7 @@ class GroupedExperts(nn.Module):
                 # Run the third GEMM (down projection)
                 out = cg_grouped_gemm(
                     hidden_outputs,
-                    w2,
+                    self.w2,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
@@ -133,44 +129,13 @@ class GroupedExperts(nn.Module):
                 out = gmm(h, self.w2, num_local_tokens_per_expert_cpu)
         else:
             assert x.dim() == 3
-            raise NotImplementedError("Please use nn.Linear instead of grouped mm for 3D tensors")
-            if USE_CG_GROUPED_GEMM:
-                m_total = x.shape[1]
-                m_indices = torch.zeros(m_total, dtype=torch.int32, device=x.device)
-
-                w1 = self.w1
-                w2 = self.w2
-                w3 = self.w3
-
-                x = x.squeeze(0)
-                gate_proj = cg_grouped_gemm(
-                    x,
-                    w1.transpose(-1, -2).contiguous(),
-                    m_indices,
-                    use_fp8=self.use_fp8,
-                )
-                up_proj = cg_grouped_gemm(
-                    x,
-                    w3.transpose(-1, -2).contiguous(),
-                    m_indices,
-                    use_fp8=self.use_fp8,
-                )
-                # Apply activation
-                hidden_outputs = F.silu(gate_proj) * up_proj
-                # Run the third GEMM (down projection)
-                out = cg_grouped_gemm(
-                    hidden_outputs,
-                    w2.transpose(-1, -2).contiguous(),
-                    m_indices,
-                    use_fp8=self.use_fp8,
-                ).unsqueeze(0)
-            else:
-                # fall back to regular bmm between 3D tensors
-                # x shape (num_experts, tokens_per_expert, dim)
-                h = F.silu(torch.bmm(x, self.w1))
-                h = h * torch.bmm(x, self.w3)
-                # out shape (num_experts, tokens_per_expert, dim)
-                out = torch.bmm(h, self.w2)
+            assert not self.use_fp8
+            # fall back to regular bmm between 3D tensors
+            # x shape (num_experts, tokens_per_expert, dim)
+            h = F.silu(torch.bmm(x, self.w1))
+            h = h * torch.bmm(x, self.w3)
+            # out shape (num_experts, tokens_per_expert, dim)
+            out = torch.bmm(h, self.w2)
         return out
 
     def init_weights(self, init_std: float):

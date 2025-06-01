@@ -192,11 +192,11 @@ def generate_permute_indices(
               |  4 |  2 |  1 |  3 |  1 |  2 |  3 |  4 |
     """
 
-    # device_mesh = None
-    # if isinstance(tokens_per_expert_group, DTensor):
-    #     assert tokens_per_expert_group.placements == (Replicate(), )
-    #     device_mesh = tokens_per_expert_group.device_mesh
-    #     tokens_per_expert_group = tokens_per_expert_group.to_local()
+    device_mesh = None
+    if isinstance(tokens_per_expert_group, DTensor):
+        assert tokens_per_expert_group.placements == (Replicate(), )
+        device_mesh = tokens_per_expert_group.device_mesh
+        tokens_per_expert_group = tokens_per_expert_group.to_local()
 
     # prefix sum to get start index of each expert (parallel scan kernel in future?)
     start_index_values = (
@@ -241,25 +241,25 @@ def generate_permute_indices(
 
     m_offsets = m_offsets.to(torch.int32)
 
-    # if device_mesh is not None:
-    #     permuted_indices = DTensor.from_local(
-    #         permuted_indices,
-    #         device_mesh=device_mesh,
-    #         placements=(Replicate(),),
-    #         run_check=False,
-    #     )
-    #     m_sizes = DTensor.from_local(
-    #         m_sizes,
-    #         device_mesh=device_mesh,
-    #         placements=(Replicate(),),
-    #         run_check=False,
-    #     )
-    #     m_offsets = DTensor.from_local(
-    #         m_offsets,
-    #         device_mesh=device_mesh,
-    #         placements=(Replicate(),),
-    #         run_check=False,
-    #     )
+    if device_mesh is not None:
+        permuted_indices = DTensor.from_local(
+            permuted_indices,
+            device_mesh=device_mesh,
+            placements=(Replicate(),),
+            run_check=False,
+        )
+        m_sizes = DTensor.from_local(
+            m_sizes,
+            device_mesh=device_mesh,
+            placements=(Replicate(),),
+            run_check=False,
+        )
+        m_offsets = DTensor.from_local(
+            m_offsets,
+            device_mesh=device_mesh,
+            placements=(Replicate(),),
+            run_check=False,
+        )
 
     return permuted_indices, m_sizes, m_offsets
 

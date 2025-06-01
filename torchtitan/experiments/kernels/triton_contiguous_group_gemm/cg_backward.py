@@ -657,30 +657,31 @@ def cg_grouped_gemm(
     if expert_indices.dtype != torch.int32:
         expert_indices = expert_indices.to(torch.int32)
 
-    # tp_mesh = None
-    # if isinstance(inputs, DTensor):
-    #     tp_mesh = inputs.device_mesh
-    #     output_placement = None
-    #     for available_placement in single_mesh_dim_strategies:
-    #         if available_placement[1:] == [inputs.placements[-1], expert_weights.placements[-1], expert_indices.placements[-1]]:
-    #             output_placement = available_placement[0]
-    #             break
-    #     assert output_placement is not None, "No suitable placement found for CG-Grouped-Gemm"
-    #     inputs = inputs.to_local()
-    #     expert_weights = expert_weights.to_local()
-    #     expert_indices = expert_indices.to_local()
+    tp_mesh = None
+    if isinstance(inputs, DTensor):
+        tp_mesh = inputs.device_mesh
+        output_placement = None
+        for available_placement in single_mesh_dim_strategies:
+            if available_placement[1:] == [inputs.placements[-1], expert_weights.placements[-1], expert_indices.placements[-1]]:
+                output_placement = available_placement[0]
+                break
+        assert output_placement is not None, "No suitable placement found for CG-Grouped-Gemm"
+        inputs = inputs.to_local()
+        expert_weights = expert_weights.to_local()
+        expert_indices = expert_indices.to_local()
 
+    expert_weights = expert_weights.transpose(-1, -2).contiguous()
     res = ContiguousGroupedGEMM.apply(inputs, expert_weights, expert_indices,
                                        use_fp8)
 
-    # if tp_mesh is not None:
-    #     # Convert result to DTensor with appropriate placements
-    #     res = DTensor.from_local(
-    #         res,
-    #         device_mesh=tp_mesh,
-    #         placements=(output_placement,),
-    #         run_check=False,
-    #     )
+    if tp_mesh is not None:
+        # Convert result to DTensor with appropriate placements
+        res = DTensor.from_local(
+            res,
+            device_mesh=tp_mesh,
+            placements=(output_placement,),
+            run_check=False,
+        )
     return res
 
 

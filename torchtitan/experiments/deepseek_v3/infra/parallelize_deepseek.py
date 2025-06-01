@@ -266,11 +266,8 @@ def apply_tp(
             # input Replicate, output Partial
             "moe.experts":
             TensorParallel(output_layout=Partial()),
-            "moe.shared_expert":
-            prepare_module_input(
-                input_layouts=(Partial(), ),
-                desired_input_layouts=(Replicate(), ),
-            ),
+            # "moe.shared_expert":
+            # TensorParallel(output_layout=Partial()),
             "moe.shared_expert.gate_proj":
             colwise_parallel(),
             "moe.shared_expert.down_proj":

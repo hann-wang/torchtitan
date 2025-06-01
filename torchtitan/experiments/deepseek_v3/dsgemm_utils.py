@@ -117,14 +117,15 @@ def create_indices_from_offsets_nosync_internal(
 
     return indices
 
-@create_indices_from_offsets_nosync_internal.register_fake
-def create_indices_from_offsets_nosync_internal(
-    m_offsets: torch.Tensor, ) -> torch.Tensor:
-    total_size = m_offsets[-1]
-    indices = torch.empty(total_size,
-                          device=m_offsets.device,
-                          dtype=torch.int32)
-    return indices
+# @create_indices_from_offsets_nosync_internal.register_fake
+# def create_indices_from_offsets_nosync_internal(
+#     m_offsets: torch.Tensor, ) -> torch.Tensor:
+#     total_size = m_offsets[-1]
+#     indices = torch.empty(total_size,
+#                           device=m_offsets.device,
+#                           dtype=torch.int32)
+#     return indices
+
 
 def create_indices_from_offsets_nosync(
         m_offsets: torch.Tensor) -> torch.Tensor:
@@ -139,20 +140,20 @@ def create_indices_from_offsets_nosync(
         m_indices: Tensor mapping each row to its group index
     """
 
-    # device_mesh = None
-    # if isinstance(m_offsets, DTensor):
-    #     assert m_offsets.placements == (Replicate(), )
-    #     device_mesh = m_offsets.device_mesh
-    #     m_offsets = m_offsets.to_local()
+    device_mesh = None
+    if isinstance(m_offsets, DTensor):
+        assert m_offsets.placements == (Replicate(), )
+        device_mesh = m_offsets.device_mesh
+        m_offsets = m_offsets.to_local()
 
     res = create_indices_from_offsets_nosync_internal(m_offsets)
-    # if device_mesh is not None:
-    #     res = DTensor.from_local(
-    #         res,
-    #         device_mesh,
-    #         (Replicate(), ),
-    #         run_check=False,
-    #     )
+    if device_mesh is not None:
+        res = DTensor.from_local(
+            res,
+            device_mesh,
+            (Replicate(), ),
+            run_check=False,
+        )
     return res
 
 def create_m_indices_from_offsets(m_offsets: torch.Tensor) -> torch.Tensor:
