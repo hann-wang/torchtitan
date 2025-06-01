@@ -22,7 +22,7 @@ _DEFAULT_SAFETENSOR_FILE_NAME = "model.safetensors.index.json"
 
 PARAM_MAPPING = {
     r"\.moe\.router\.gate\.weight$": ".mlp.gate.weight",
-    # r"\.mlp\.expert_bias": ".mlp.gate.e_score_correction_bias","
+    r"\.moe\.expert_bias": ".mlp.gate.e_score_correction_bias",
     "moe.shared_expert.w1": "mlp.shared_experts.gate_proj.weight",
     "moe.shared_expert.w2": "mlp.shared_experts.down_proj.weight",
     "moe.shared_expert.w3": "mlp.shared_experts.up_proj.weight",
@@ -121,6 +121,8 @@ def combine_expert_weights(
                 w = state_dict[sd_key]
                 w.data[expert_id, :, :] = expert_weights[k].T
         updated_states.add(key)
+        updated_states.add(f"{sd_key_prefix}.tokens_per_expert")
+        updated_states.add(f"{sd_key_prefix}.expert_bias")
 
 
 def load_safetensor_weights(

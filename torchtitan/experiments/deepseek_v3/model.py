@@ -79,6 +79,8 @@ class MoE(Llama4MoE):
             norm_topk_prob=model_args.norm_topk_prob,
             routed_scaling_factor=model_args.routed_scaling_factor,
             topk_method=model_args.topk_method,
+            n_group=model_args.n_group,
+            topk_group=model_args.topk_group,
         )
 
         # self.shared_expert = (GroupedExperts(
@@ -95,24 +97,24 @@ class MoE(Llama4MoE):
 
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
-        if self.topk_method == "balanced":
-            # the fields below are defined even when load_balance_coeff is None
-            # to make initialization and checkpointing code simpler
-            self.register_buffer(
-                "expert_bias",
-                torch.zeros(num_experts, dtype=torch.float32),
-                persistent=True,
-            )
-            self.register_buffer(
-                "tokens_per_expert",
-                torch.zeros(num_experts, dtype=torch.float32),
-                persistent=True,
-            )
 
-            # NOTE: forward hook, forward pre hook, or backward pre hook
-            #       would conflict with activation checkpointing
-            if self.load_balance_coeff is not None and self.load_balance_coeff > 0:
-                self.register_full_backward_hook(self._update_expert_bias)
+        # the fields below are defined even when load_balance_coeff is None
+        # to make initialization and checkpointing code simpler
+        self.register_buffer(
+            "expert_bias",
+            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            persistent=True,
+        )
+        self.register_buffer(
+            "tokens_per_expert",
+            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            persistent=True,
+        )
+
+        # NOTE: forward hook, forward pre hook, or backward pre hook
+        #       would conflict with activation checkpointing
+        if self.load_balance_coeff is not None and self.load_balance_coeff > 0:
+            self.register_full_backward_hook(self._update_expert_bias)
         else:
             self.expert_bias = None
 
