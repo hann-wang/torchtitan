@@ -92,39 +92,46 @@ def prepare_fp8_weight(w):
     return (w_fp8, w_scales)
 
 
-@torch.library.custom_op("torchtitan::create_indices_from_offsets_nosync_internal", mutates_args=())
+# def create_indices_from_offsets_nosync_internal(
+#         m_offsets: torch.Tensor) -> torch.Tensor:
+#     # Get total size from the last offset
+#     total_size = m_offsets[-1]
+
+#     # Pre-allocate output tensor
+#     indices = torch.empty(total_size, device=m_offsets.device, dtype=torch.int32)
+
+#     # Create a range tensor for each section
+#     prev_offset = torch.zeros(1, device=m_offsets.device, dtype=m_offsets.dtype)
+
+#     for i in range(len(m_offsets)):
+#         # Calculate current section size
+#         section_size = m_offsets[i] - prev_offset
+
+#         # Only fill if section has elements
+#         if section_size > 0:
+#             indices[prev_offset : m_offsets[i]] = i
+
+#         # Update prev_offset for next iteration
+#         prev_offset = m_offsets[i]
+
+#     return indices
+
+
 def create_indices_from_offsets_nosync_internal(
         m_offsets: torch.Tensor) -> torch.Tensor:
-    # Get total size from the last offset
+    """
+    Create indices tensor from offsets tensor, compatible with torch.compile.
+    Args:
+        m_offsets: 1D tensor of offsets, shape [num_groups], monotonically increasing.
+    Returns:
+        indices: 1D tensor of shape [m_offsets[-1]], where each position contains its group index.
+    """
     total_size = m_offsets[-1]
-
-    # Pre-allocate output tensor
-    indices = torch.empty(total_size, device=m_offsets.device, dtype=torch.int32)
-
-    # Create a range tensor for each section
-    prev_offset = torch.zeros(1, device=m_offsets.device, dtype=m_offsets.dtype)
-
-    for i in range(len(m_offsets)):
-        # Calculate current section size
-        section_size = m_offsets[i] - prev_offset
-
-        # Only fill if section has elements
-        if section_size > 0:
-            indices[prev_offset : m_offsets[i]] = i
-
-        # Update prev_offset for next iteration
-        prev_offset = m_offsets[i]
-
-    return indices
-
-# @create_indices_from_offsets_nosync_internal.register_fake
-# def create_indices_from_offsets_nosync_internal(
-#     m_offsets: torch.Tensor, ) -> torch.Tensor:
-#     total_size = m_offsets[-1]
-#     indices = torch.empty(total_size,
-#                           device=m_offsets.device,
-#                           dtype=torch.int32)
-#     return indices
+    all_indices = torch.arange(total_size,
+                               device=m_offsets.device,
+                               dtype=m_offsets.dtype)
+    indices = torch.bucketize(all_indices, m_offsets, right=True)
+    return indices.to(torch.int32)
 
 
 def create_indices_from_offsets_nosync(
