@@ -20,6 +20,8 @@
 
 #SBATCH --cpus-per-task=128
 
+#SBATCH --partition=AIG_Models
+
 nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
 nodes_array=($nodes)
 head_node=${nodes_array[0]}
@@ -47,6 +49,8 @@ export PYTHONFAULTHANDLER=1
 # #export TORCH_DIST_INIT_BARRIER=1
 # export FI_EFA_SET_CUDA_SYNC_MEMOPS=0
 
+export LOG_RANK=${LOG_RANK:-0}
+
 CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/experiments/deepseek_v3/train_configs/deepseek_v3.toml"}
 
 DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 300177:110 \
@@ -62,6 +66,10 @@ DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 300177:110 \
     -e HOME="/home/hanwang2" \
     -e HF_HOME="/huggingface" \
     -e TORCH_EXTENSIONS_DIR="/home/hanwang2/.local/share/torch_extensions" \
+    -e LOG_RANK="$LOG_RANK" \
+    -e NCCL_DEBUG="$NCCL_DEBUG" \
+    -e PYTHONFAULTHANDLER="$PYTHONFAULTHANDLER" \
+    -e LOGLEVEL="$LOGLEVEL" \
     -v /home/Han.Wang@amd.com/workspace:/workspace \
     -v /home/Han.Wang@amd.com/docker-home:/home/hanwang2 \
     -v /home/Han.Wang@amd.com/huggingface:/huggingface \

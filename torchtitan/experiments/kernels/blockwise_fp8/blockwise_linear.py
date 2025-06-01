@@ -6,6 +6,13 @@
 
 import torch
 from torch import nn
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor._op_schema import PlacementList
+from torch.distributed.tensor.placement_types import (
+    Partial,
+    Replicate,
+    Shard,
+)
 
 from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import (
     blockwise_fp8_gemm,
@@ -133,6 +140,20 @@ class BlockwiseFP8LinearFunction(torch.autograd.Function):
         return grad_inputs.view(*original_shape[:-1], -1), grad_weights, None
 
 
+single_mesh_dim_strategies = []
+colwise: PlacementList = [
+    Shard(-1),
+    Replicate(),  # x
+    Shard(0),  # w
+]
+rowwise: PlacementList = [
+    Partial(),
+    Shard(-1),  # x
+    Shard(1),  # w
+]
+single_mesh_dim_strategies.extend([colwise, rowwise])
+
+
 class BlockwiseFP8Linear(nn.Linear):
     """
     Custom linear layer with support for quantized weights and optional bias.
@@ -158,6 +179,7 @@ class BlockwiseFP8Linear(nn.Linear):
                          dtype=dtype)
 
         self.block_size = block_size
+        assert not self.bias, "Bias is not supported in BlockwiseFP8Linear"
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -170,9 +192,36 @@ class BlockwiseFP8Linear(nn.Linear):
         Returns:
             torch.Tensor: Transformed tensor after linear computation.
         """
-        y = BlockwiseFP8LinearFunction.apply(x, self.weight, self.block_size)
-        if self.bias is not None:
-            y += self.bias
+
+        device_mesh = None
+        if isinstance(x, DTensor):
+            device_mesh = x.device_mesh
+            output_placement = None
+
+            rowwise_abs: PlacementList = [
+                Partial(),
+                Shard(x.dim() - 1),  # x
+                Shard(1),  # w
+            ]
+            for acceptable_placement in single_mesh_dim_strategies + [
+                    rowwise_abs
+            ]:
+                if acceptable_placement[1:] == [x.placements[-1], self.weight.placements[-1]]:
+                    output_placement = acceptable_placement[0]
+                    break
+            assert output_placement is not None, \
+                f"Unsupported placement strategy for BlockwiseFP8Linear: {x.placements} and {self.weight.placements}"
+            x = x.to_local()
+            w = self.weight.to_local()
+        else:
+            w = self.weight
+        y = BlockwiseFP8LinearFunction.apply(x, w, self.block_size)
+
+        if device_mesh is not None:
+            y = DTensor.from_local(y,
+                                   device_mesh=device_mesh,
+                                   placements=(output_placement, ))
+
         return y
 
     @classmethod

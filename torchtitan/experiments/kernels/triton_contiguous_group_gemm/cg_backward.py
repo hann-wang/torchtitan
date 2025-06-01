@@ -9,28 +9,9 @@ import torch
 import triton
 from torch.library import triton_op, wrap_triton
 from torch.distributed.tensor import DTensor
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor._dtensor_spec import DTensorSpec
-from torch.distributed.tensor._op_schema import (
-    OpSchema,
-    OpStrategy,
-    PlacementList,
-    PlacementStrategy,
-    RuntimeSchemaInfo,
-)
-from torch.distributed.tensor._ops._einsum_strategy import gen_einsum_strategies
-from torch.distributed.tensor._ops.utils import (
-    expand_to_full_mesh_op_strategy,
-    generate_redistribute_costs,
-    infer_broadcast_dims_map,
-    is_tensor_shardable,
-    map_placements_after_broadcast,
-    prod,
-    register_op_strategy,
-)
+from torch.distributed.tensor._op_schema import PlacementList
 from torch.distributed.tensor.placement_types import (
     Partial,
-    Placement,
     Replicate,
     Shard,
 )
