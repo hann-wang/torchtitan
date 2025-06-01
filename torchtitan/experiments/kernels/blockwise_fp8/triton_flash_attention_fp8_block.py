@@ -19,7 +19,7 @@ Not currently supported:
 1) Non power of two head dims
 
 """
-from typing import Sequence, List, Optional
+from typing import List, Optional
 import os
 import math
 import torch
@@ -109,18 +109,7 @@ def get_input_shapes():
 
 
 def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
-
-def is_cdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target(
-    ).arch in ('gfx940', 'gfx941', 'gfx942', 'gfx90a', 'gfx908')
-
-
-def is_rdna():
-    return is_hip() and triton.runtime.driver.active.get_current_target(
-    ).arch in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200",
-               "gfx1201")
+    return torch.version.hip is not None
 
 
 def get_f8_fwd_dtype():
@@ -2356,7 +2345,6 @@ def block_scaling_node(tensor,
     return tensor, 1. / scale.to(torch.float32).contiguous()
 
 
-@torch._dynamo.allow_in_graph
 class _triton_attention_block(torch.autograd.Function):
 
     @staticmethod
