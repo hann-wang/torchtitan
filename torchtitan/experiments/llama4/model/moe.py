@@ -81,19 +81,6 @@ class GroupedExperts(nn.Module):
                 x.dtype == self.w1.dtype == self.w2.dtype == self.w3.dtype == torch.bfloat16
             ), "torch._grouped_mm only supports bf16 dtypes"
 
-            tp_mesh = None
-            if isinstance(x, DTensor):
-                tp_mesh = x.device_mesh
-                num_local_tokens_per_expert = num_local_tokens_per_expert.to_local()
-                x = x.to_local()
-                w1 = self.w1.to_local()
-                w2 = self.w2.to_local()
-                w3 = self.w3.to_local()
-            else:
-                w1 = self.w1
-                w2 = self.w2
-                w3 = self.w3
-
             # https://github.com/pytorch/pytorch/pull/150374
             # NOTE: torch._gouped_mm requires bf16 dtypes
             #       and shapes to be multiple of 8
@@ -104,18 +91,22 @@ class GroupedExperts(nn.Module):
             if USE_CG_GROUPED_GEMM:
                 from torchtitan.experiments.deepseek_v3 import dsgemm_utils
 
+                w1 = self.w1.transpose(-1, -2).contiguous()
+                w2 = self.w2.transpose(-1, -2).contiguous()
+                w3 = self.w3.transpose(-1, -2).contiguous()
+
                 # Create indices from offsets without CPU-GPU sync
                 m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
                     offsets)
                 gate_proj = cg_grouped_gemm(
                     x,
-                    w1.transpose(-1, -2).contiguous(),
+                    w1,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
                 up_proj = cg_grouped_gemm(
                     x,
-                    w3.transpose(-1, -2).contiguous(),
+                    w3,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
@@ -124,7 +115,7 @@ class GroupedExperts(nn.Module):
                 # Run the third GEMM (down projection)
                 out = cg_grouped_gemm(
                     hidden_outputs,
-                    w2.transpose(-1, -2).contiguous(),
+                    w2,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
@@ -134,38 +125,22 @@ class GroupedExperts(nn.Module):
                 from .grouped_mm_utils import gmm
                 num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
                     dtype=torch.int64, device="cpu")
-                g = gmm(x.contiguous(), w1.contiguous(),
+                g = gmm(x.contiguous(), self.w1.contiguous(),
                         num_local_tokens_per_expert_cpu.contiguous())
                 assert not torch.isnan(g).any(), "NaN detected in grouped mm gate projection"
                 h = F.silu(g)
-                h = h * gmm(x, w3, num_local_tokens_per_expert_cpu)
-                out = gmm(h, w2, num_local_tokens_per_expert_cpu)
-
-
-            if tp_mesh is not None:
-                out = DTensor.from_local(
-                    out,
-                    tp_mesh,
-                    (Partial(), ),
-                    run_check=False,
-                )
+                h = h * gmm(x, self.w3, num_local_tokens_per_expert_cpu)
+                out = gmm(h, self.w2, num_local_tokens_per_expert_cpu)
         else:
             assert x.dim() == 3
+            raise NotImplementedError("Please use nn.Linear instead of grouped mm for 3D tensors")
             if USE_CG_GROUPED_GEMM:
                 m_total = x.shape[1]
                 m_indices = torch.zeros(m_total, dtype=torch.int32, device=x.device)
 
-                tp_mesh = None
-                if isinstance(x, DTensor):
-                    tp_mesh = x.device_mesh
-                    x = x.to_local()
-                    w1 = self.w1.to_local()
-                    w2 = self.w2.to_local()
-                    w3 = self.w3.to_local()
-                else:
-                    w1 = self.w1
-                    w2 = self.w2
-                    w3 = self.w3
+                w1 = self.w1
+                w2 = self.w2
+                w3 = self.w3
 
                 x = x.squeeze(0)
                 gate_proj = cg_grouped_gemm(
@@ -189,14 +164,6 @@ class GroupedExperts(nn.Module):
                     m_indices,
                     use_fp8=self.use_fp8,
                 ).unsqueeze(0)
-
-                if tp_mesh is not None:
-                    out = DTensor.from_local(
-                        out,
-                        tp_mesh,
-                        (Partial(), ),
-                        run_check=False,
-                    )
             else:
                 # fall back to regular bmm between 3D tensors
                 # x shape (num_experts, tokens_per_expert, dim)

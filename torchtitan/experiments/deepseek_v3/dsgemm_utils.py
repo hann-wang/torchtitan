@@ -16,6 +16,8 @@
 from typing import Tuple
 
 import torch
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 
 _num_sms = None
 
@@ -90,18 +92,9 @@ def prepare_fp8_weight(w):
     return (w_fp8, w_scales)
 
 
-@torch.library.custom_op("torchtitan::create_indices_from_offsets_nosync", mutates_args=())
-def create_indices_from_offsets_nosync(m_offsets: torch.Tensor) -> torch.Tensor:
-    """
-    Create m_indices tensor from m_offsets tensor without CPU-GPU sync points.
-
-    Args:
-        m_offsets: Tensor containing cumulative offsets for each group
-            e.g., [128, 128, 256, 384, 640, ...]
-
-    Returns:
-        m_indices: Tensor mapping each row to its group index
-    """
+@torch.library.custom_op("torchtitan::create_indices_from_offsets_nosync_internal", mutates_args=())
+def create_indices_from_offsets_nosync_internal(
+        m_offsets: torch.Tensor) -> torch.Tensor:
     # Get total size from the last offset
     total_size = m_offsets[-1]
 
@@ -124,16 +117,43 @@ def create_indices_from_offsets_nosync(m_offsets: torch.Tensor) -> torch.Tensor:
 
     return indices
 
-@create_indices_from_offsets_nosync.register_fake
-def create_indices_from_offsets_nosync_fake(
-    m_offsets: torch.Tensor,
-) -> torch.Tensor:
+@create_indices_from_offsets_nosync_internal.register_fake
+def create_indices_from_offsets_nosync_internal(
+    m_offsets: torch.Tensor, ) -> torch.Tensor:
     total_size = m_offsets[-1]
     indices = torch.empty(total_size,
                           device=m_offsets.device,
                           dtype=torch.int32)
     return indices
 
+def create_indices_from_offsets_nosync(
+        m_offsets: torch.Tensor) -> torch.Tensor:
+    """
+    Create m_indices tensor from m_offsets tensor without CPU-GPU sync points.
+
+    Args:
+        m_offsets: Tensor containing cumulative offsets for each group
+            e.g., [128, 128, 256, 384, 640, ...]
+
+    Returns:
+        m_indices: Tensor mapping each row to its group index
+    """
+
+    # device_mesh = None
+    # if isinstance(m_offsets, DTensor):
+    #     assert m_offsets.placements == (Replicate(), )
+    #     device_mesh = m_offsets.device_mesh
+    #     m_offsets = m_offsets.to_local()
+
+    res = create_indices_from_offsets_nosync_internal(m_offsets)
+    # if device_mesh is not None:
+    #     res = DTensor.from_local(
+    #         res,
+    #         device_mesh,
+    #         (Replicate(), ),
+    #         run_check=False,
+    #     )
+    return res
 
 def create_m_indices_from_offsets(m_offsets: torch.Tensor) -> torch.Tensor:
     """

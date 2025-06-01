@@ -5,6 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from torch.library import triton_op, wrap_triton
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 import triton
 import triton.language as tl
 
@@ -66,6 +69,7 @@ def _fill_indices_kernel(
 # ==============
 
 
+#@triton_op("torchtitan::fill_indices_wrapper", mutates_args={})
 def fill_indices_wrapper(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
@@ -75,7 +79,7 @@ def fill_indices_wrapper(
     max_len: int,
     block_size: int = 128,
     max_blocks: int = 1024,  # cap on total number of blocks to launch
-):
+) -> torch.Tensor:
     # preallocate output
     permuted_indices = torch.full(
         (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
@@ -98,6 +102,25 @@ def fill_indices_wrapper(
     )
     return permuted_indices
 
+
+# @fill_indices_wrapper.register_fake
+# def fill_indices_wrapper_fake(
+#     tokens_per_expert_group: torch.Tensor,
+#     start_index_values: torch.Tensor,
+#     write_offsets: torch.Tensor,
+#     experts_per_rank: int,
+#     num_ranks: int,
+#     max_len: int,
+#     block_size: int = 128,
+#     max_blocks: int = 1024,  # cap on total number of blocks to launch
+# ):
+#     """
+#     Fake implementation of the fill_indices_wrapper for testing purposes.
+#     It simply returns a tensor filled with -1, simulating the output of the kernel.
+#     """
+#     return torch.full(
+#         (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
+#     )
 
 # reference
 def fill_indices_cpu(
@@ -169,6 +192,12 @@ def generate_permute_indices(
               |  4 |  2 |  1 |  3 |  1 |  2 |  3 |  4 |
     """
 
+    # device_mesh = None
+    # if isinstance(tokens_per_expert_group, DTensor):
+    #     assert tokens_per_expert_group.placements == (Replicate(), )
+    #     device_mesh = tokens_per_expert_group.device_mesh
+    #     tokens_per_expert_group = tokens_per_expert_group.to_local()
+
     # prefix sum to get start index of each expert (parallel scan kernel in future?)
     start_index_values = (
         torch.cumsum(tokens_per_expert_group, 0) - tokens_per_expert_group
@@ -210,7 +239,29 @@ def generate_permute_indices(
             max_len,
         )
 
-    return permuted_indices, m_sizes, m_offsets.to(torch.int32)
+    m_offsets = m_offsets.to(torch.int32)
+
+    # if device_mesh is not None:
+    #     permuted_indices = DTensor.from_local(
+    #         permuted_indices,
+    #         device_mesh=device_mesh,
+    #         placements=(Replicate(),),
+    #         run_check=False,
+    #     )
+    #     m_sizes = DTensor.from_local(
+    #         m_sizes,
+    #         device_mesh=device_mesh,
+    #         placements=(Replicate(),),
+    #         run_check=False,
+    #     )
+    #     m_offsets = DTensor.from_local(
+    #         m_offsets,
+    #         device_mesh=device_mesh,
+    #         placements=(Replicate(),),
+    #         run_check=False,
+    #     )
+
+    return permuted_indices, m_sizes, m_offsets
 
 
 # Below is for testing only
