@@ -8,6 +8,8 @@
 import torch
 import triton
 from torch.library import triton_op, wrap_triton
+# from torch.library import custom_op as triton_op
+# wrap_triton = lambda x: x
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor._op_schema import PlacementList
 from torch.distributed.tensor.placement_types import (
@@ -37,7 +39,6 @@ torch_dtype = torch.bfloat16
 @triton.autotune(
     configs=STANDARD_CONFIGS,
     key=[
-        "M_BUFFERLEN",
         "N",
         "K",
         "GROUP_SIZE_M",
@@ -55,7 +56,6 @@ def _kernel_cg_backward_dx(
     # Matrix dimensions
     go_s_ptr, # [M_TOTAL, N // block_size] or None
     b_s_ptr, # [num_experts, N // block_size, K // block_size] or None
-    M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
     M_TOTAL,  # Total M dimension (sum of all groups)
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
@@ -154,7 +154,6 @@ def _kernel_cg_backward_dx(
 @triton.autotune(
     configs=STANDARD_DW_CONFIGS,
     key=[
-        "M_BUFFERLEN",
         "N",
         "K",
         "NUM_EXPERTS",
@@ -172,7 +171,6 @@ def _kernel_cg_backward_dw(
     go_s_ptr,  # [M_TOTAL // block_size, N] or None
     a_s_ptr,  # [M_TOTAL // block_size, K] or None
     # Matrix dimensions
-    M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
     M_TOTAL,  # Total M dimension
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
@@ -342,7 +340,6 @@ def cg_grouped_gemm_backward_weights(
         expert_indices,
         go_scales,
         input_scales,
-        M_BUFFERLEN=M_bufferlen,
         M_TOTAL=M_total,
         N=N,
         K=K,
@@ -437,7 +434,6 @@ def cg_grouped_gemm_backward_inputs(
         expert_indices,
         go_scales,
         expert_weight_scales,
-        M_BUFFERLEN=M_bufferlen,
         M_TOTAL=M_total,
         N=N,
         K=K,

@@ -379,9 +379,8 @@ class MoE(nn.Module):
             num_local_tokens_per_expert,
         ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
 
-        if self.topk_method == "noaux":
-            # will be used to update the expert bias for load balancing
-            self.tokens_per_expert += num_local_tokens_per_expert
+        # will be used to update the expert bias for load balancing
+        self.tokens_per_expert += num_local_tokens_per_expert
 
         # shape (bs*slen*top_k, dim)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)

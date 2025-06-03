@@ -43,7 +43,6 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, super_group_m):
 @triton.autotune(
     configs=STANDARD_CONFIGS,
     key=[
-        "M_BUFFERLEN",
         "N",
         "K",
         "GROUP_SIZE_M",
@@ -62,7 +61,6 @@ def _kernel_cg_persistent_forward(
         a_s_ptr,
         b_s_ptr,
         # Matrix dimensions
-        M_BUFFERLEN: tl.constexpr,  # Total M dimension (buffer length)
         M_TOTAL,  # Total M dimension (sum of all groups)
         N: tl.constexpr,  # N dimension
         K: tl.constexpr,  # K dimension
@@ -304,7 +302,6 @@ def cg_grouped_gemm_forward(
     assert inputs.is_contiguous(), "Input tensor must be contiguous"
     assert expert_weights.is_contiguous(), "Expert weights tensor must be contiguous"
     assert expert_indices.is_contiguous(), "Expert indices tensor must be contiguous"
-
     # Check if inputs are properly aligned
     M_bufferlen, K = inputs.shape
     M_total = expert_indices.shape[0]
@@ -348,7 +345,6 @@ def cg_grouped_gemm_forward(
         expert_indices,
         input_scales,
         weight_scales,
-        M_BUFFERLEN=M_bufferlen,
         M_TOTAL=M_total,
         N=N,
         K=K,

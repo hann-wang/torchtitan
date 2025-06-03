@@ -12,9 +12,9 @@
 
 #SBATCH --job-name=dsv3_torchtitan_multi_node
 
-#SBATCH --ntasks=2
+#SBATCH --ntasks=4
 
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 
 #SBATCH --gpus-per-task=8
 
@@ -66,6 +66,7 @@ DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 300177:110 \
     -e HOME="/home/hanwang2" \
     -e HF_HOME="/huggingface" \
     -e TORCH_EXTENSIONS_DIR="/home/hanwang2/.local/share/torch_extensions" \
+    -e PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
     -e LOG_RANK="$LOG_RANK" \
     -e NCCL_DEBUG="$NCCL_DEBUG" \
     -e PYTHONFAULTHANDLER="$PYTHONFAULTHANDLER" \
@@ -88,5 +89,5 @@ done
 # dcgmi profile --pause
 # adjust sbatch --ntasks and sbatch --nodes above and --nnodes below
 # to your specific node count, and update target launch file.
-srun $DOCKER_RUN_CMD torchrun --nnodes 2 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./torchtitan/train.py --job.config_file ${CONFIG_FILE}
+srun $DOCKER_RUN_CMD torchrun --nnodes 4 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./torchtitan/train.py --job.config_file ${CONFIG_FILE}
 # dcgmi profile --resume

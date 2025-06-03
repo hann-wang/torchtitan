@@ -8,6 +8,8 @@ from typing import Tuple
 
 import torch
 from torch.library import triton_op, wrap_triton
+# from torch.library import custom_op as triton_op
+# wrap_triton = lambda x: x
 import triton
 import triton.language as tl
 from triton import Config
