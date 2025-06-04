@@ -7,7 +7,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor, Shard, Replicate
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
     cg_grouped_gemm, )
 
@@ -335,11 +335,13 @@ class MoE(nn.Module):
         # the fields below are defined even when load_balance_coeff is None
         # to make initialization and checkpointing code simpler
         if self.topk_method == "noaux_tc":
-            self.expert_bias = nn.Parameter(
-                # Changed from torch.empty to torch.rand to avoid non-even
-                # distribution for runs without actual weigths
-                torch.rand(num_experts,
-                           dtype=torch.get_default_dtype()))
+            # Changed from torch.empty to torch.rand to avoid non-even
+            # distribution for runs without actual weigths
+            self.register_parameter(
+                "expert_bias",
+                torch.nn.Parameter(
+                    torch.randn(num_experts, dtype=torch.get_default_dtype())),
+            )
         else:
             self.register_buffer(
                 "expert_bias",
@@ -376,6 +378,12 @@ class MoE(nn.Module):
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
         """
         bs, slen, dim = x.shape
+        
+        if isinstance(self.expert_bias, DTensor):
+            assert self.expert_bias.placements == (Replicate(),)
+            expert_bias = self.expert_bias.to_local()
+        else:
+            expert_bias = self.expert_bias
 
         # top_scores and selected_indices shape (bs*slen*top_k,)
         # num_local_tokens_per_expert shape (num_experts,)
@@ -383,10 +391,11 @@ class MoE(nn.Module):
             top_scores,
             token_indices,
             num_local_tokens_per_expert,
-        ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
+        ) = self.router(x.reshape(bs * slen, dim), expert_bias)
 
-        # will be used to update the expert bias for load balancing
-        self.tokens_per_expert += num_local_tokens_per_expert
+        if self.topk_method == "noaux":
+            # will be used to update the expert bias for load balancing
+            self.tokens_per_expert += num_local_tokens_per_expert
 
         # shape (bs*slen*top_k, dim)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
@@ -476,15 +485,5 @@ class MoE(nn.Module):
         if self.shared_expert is not None:
             self.shared_expert.init_weights(init_std)
 
-        if buffer_device is None:
-            buffer_device = next(self.router.parameters()).device
-
-        with torch.device(buffer_device):
-            self.expert_bias = torch.randn(
-                self.experts.num_experts,
-                dtype=torch.get_default_dtype(),
-            )
-            self.tokens_per_expert = torch.zeros(
-                self.experts.num_experts,
-                dtype=torch.get_default_dtype(),
-            )
+        nn.init.normal_(self.expert_bias)
+        nn.init.zeros_(self.tokens_per_expert)
