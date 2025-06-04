@@ -71,6 +71,7 @@ def parallelize_deepseek(
             enable_float8_tensorwise_tp=enable_float8_tensorwise_tp,
             enable_async_tp=job_config.parallelism.
             enable_async_tensor_parallel,
+            enable_tp2ep=job_config.parallelism.enable_tp2ep,
         )
 
     if job_config.activation_checkpoint.mode != "none":
@@ -156,6 +157,7 @@ def apply_tp(
     loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
     enable_async_tp: bool,
+    enable_tp2ep: bool = True,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first
@@ -163,7 +165,8 @@ def apply_tp(
     # 2. Parallelize the root norm layer over the sequence dim
     # 3. Parallelize the final linear output layer
 
-    from torchtitan.experiments.llama4.infra.expert_parallel import NoParallel, TensorParallel
+    from torchtitan.experiments.llama4.infra.expert_parallel import (
+        NoParallel, TensorParallel, ExpertParallel)
 
     parallelize_module(
         model,
@@ -263,11 +266,6 @@ def apply_tp(
             # replicate computation for the router
             "moe.router.gate":
             NoParallel(),
-            # input Replicate, output Partial
-            "moe.experts":
-            TensorParallel(output_layout=Partial()),
-            # "moe.shared_expert":
-            # TensorParallel(output_layout=Partial()),
             "moe.shared_expert.gate_proj":
             colwise_parallel(),
             "moe.shared_expert.down_proj":
@@ -275,6 +273,11 @@ def apply_tp(
             "moe.shared_expert.up_proj":
             colwise_parallel(),
         }
+
+        if enable_tp2ep:
+            layer_plan["moe.experts"] = ExpertParallel()
+        else:
+            layer_plan["moe.experts"] = TensorParallel(output_layout=Partial())
 
         parallelize_module(
             module=transformer_block,

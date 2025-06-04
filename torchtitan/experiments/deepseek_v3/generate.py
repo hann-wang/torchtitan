@@ -29,8 +29,8 @@ from torchtitan.config_manager import JobConfig, ConfigManager
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 
 # Uncomment the model you want to run.
-# model_id, model_path, config_file = "deepseek-ai/DeepSeek-V2-Lite-Chat", None, "train_configs/debug_model.toml"
-model_id, model_path, config_file = "deepseek-ai/DeepSeek-V3-0324", None, "train_configs/deepseek_v3.toml"
+model_id, model_path, config_file = "deepseek-ai/DeepSeek-V2-Lite-Chat", None, "train_configs/debug_model.toml"
+# model_id, model_path, config_file = "deepseek-ai/DeepSeek-V3-0324", None, "train_configs/deepseek_v3.toml"
 
 if not model_path:
     model_path = model_id

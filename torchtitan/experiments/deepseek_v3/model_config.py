@@ -263,11 +263,11 @@ deepseek_v2_lite_config = ModelArgs(
 
 
 # This is the configuration for deepseek-ai/DeepSeek-V2-Lite.
-deepseek_v2_dim10880_config = ModelArgs(
+deepseek_v2_dim10752_config = ModelArgs(
     vocab_size=102400,
     hidden_size=2048,
-    intermediate_size=10880,  # the original 10944 is not divisible by 128
-    moe_intermediate_size=1408,
+    intermediate_size=10752,  # the original 10944 is not divisible by 128
+    moe_intermediate_size=1280,
     num_hidden_layers=27,
     num_attention_heads=16,
     num_key_value_heads=16,

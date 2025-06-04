@@ -7,8 +7,7 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.tensor import DTensor, Partial
-
+from torch.distributed.tensor import DTensor, Shard
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
     cg_grouped_gemm, )
 
@@ -406,6 +405,12 @@ class MoE(nn.Module):
                 generate_permute_indices,
             )
 
+            if isinstance(self.experts.w1, DTensor) and self.experts.w1.placements == (Shard(0),):
+                # expert parallel enabled
+                num_ranks = self.experts.w1.device_mesh.size()
+            else:
+                num_ranks = 1
+
             with torch.no_grad():
                 (
                     permuted_indices,
@@ -413,9 +418,10 @@ class MoE(nn.Module):
                     _,
                 ) = generate_permute_indices(
                     num_local_tokens_per_expert,
-                    self.experts.num_experts,
-                    1,
-                    token_indices.shape[0] + self.experts.num_experts * ALIGN_SIZE_M,
+                    self.experts.num_experts // num_ranks,
+                    num_ranks,
+                    token_indices.shape[0] +
+                    self.experts.num_experts * ALIGN_SIZE_M,
                     ALIGN_SIZE_M,
                 )
             token_indices_appended = torch.vstack(

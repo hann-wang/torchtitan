@@ -16,7 +16,7 @@ from .infra.parallelize_deepseek import parallelize_deepseek
 from .model_config import (
     ModelArgs,
     deepseek_config_registry,
-    deepseek_v2_dim10880_config,
+    deepseek_v2_dim10752_config,
     deepseek_v3_lite_config,
 )
 from .model import DeepseekForCausalLM
@@ -68,8 +68,8 @@ deepseek_configs = {
     deepseek_config_registry["deepseek-ai/DeepSeek-V2-Lite"],
     "V3":
     deepseek_config_registry["deepseek-ai/deepseek-v3"],
-    "V2-Dim10880":
-    deepseek_v2_dim10880_config,
+    "V2-Dim10752":
+    deepseek_v2_dim10752_config,
     "V3-Lite":
     deepseek_v3_lite_config,
 }

@@ -601,10 +601,10 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
 
 single_mesh_dim_strategies = []
 replicate_colwise_2x3: PlacementList = [
-        Shard(1),
-        Replicate(),  # mat1
-        Shard(2),  # mat2
-        Replicate(),  # offs
+    Shard(1),
+    Replicate(),  # mat1
+    Shard(2),  # mat2
+    Replicate(),  # offs
 ]
 colwise_rowwise_2x3: PlacementList = [
     Partial(),
@@ -612,7 +612,14 @@ colwise_rowwise_2x3: PlacementList = [
     Shard(1),  # mat2
     Replicate(),  # offs
 ]
-single_mesh_dim_strategies.extend([replicate_colwise_2x3, colwise_rowwise_2x3])
+expertwise_2x3: PlacementList = [
+    Replicate(),
+    Replicate(),  # mat1
+    Shard(0),  # mat2
+    Replicate(),  # offs
+]
+single_mesh_dim_strategies.extend(
+    [replicate_colwise_2x3, colwise_rowwise_2x3, expertwise_2x3])
 
 def cg_grouped_gemm(
     inputs: torch.Tensor,
@@ -639,7 +646,10 @@ def cg_grouped_gemm(
         tp_mesh = inputs.device_mesh
         output_placement = None
         for available_placement in single_mesh_dim_strategies:
-            if available_placement[1:] == [inputs.placements[-1], expert_weights.placements[-1], expert_indices.placements[-1]]:
+            if available_placement[1:] == [
+                    inputs.placements[-1], expert_weights.placements[-1],
+                    expert_indices.placements[-1]
+            ]:
                 output_placement = available_placement[0]
                 break
         assert output_placement is not None, "No suitable placement found for CG-Grouped-Gemm"
