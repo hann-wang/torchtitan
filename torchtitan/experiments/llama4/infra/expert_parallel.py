@@ -19,7 +19,7 @@ from torch.distributed.tensor import (
     Shard,
     Partial,
 )
-from torch.distributed.tensor.parallel import ParallelStyle
+from torch.distributed.tensor.parallel import ParallelStyle, PrepareModuleInputOutput
 from torch.distributed.tensor.placement_types import Placement
 
 
@@ -236,3 +236,18 @@ class ExpertParallel(ParallelStyle):
             partial(self._prepare_output_fn, self.output_layout,
                     self.use_local_output),
         )
+
+
+class PrepareModuleInputOutputWithParams(PrepareModuleInputOutput):
+
+    def _partition_fn(self, name, module, device_mesh):
+        for name, param in module.named_parameters(recurse=False):
+            dist_param = nn.Parameter(
+                distribute_tensor(param, device_mesh, [Replicate()]))
+            module.register_parameter(name, dist_param)
+
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
+        super()._apply(module, device_mesh)
+        self._partition_fn("", module, device_mesh)
+
+        return module

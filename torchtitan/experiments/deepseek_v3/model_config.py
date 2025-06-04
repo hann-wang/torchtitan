@@ -298,7 +298,18 @@ deepseek_v2_dim10752_config = ModelArgs(
     },
 )
 
-deepseek_v3_lite_config = ModelArgs(num_hidden_layers=12)
+deepseek_v3_lite_config = ModelArgs(
+    vocab_size=102400,
+    hidden_size=2048,
+    intermediate_size=10752,  # the original 10944 is not divisible by 128
+    moe_intermediate_size=1280,
+    num_hidden_layers=27,
+    num_attention_heads=16,
+    num_key_value_heads=16,
+    n_shared_experts=1,
+    n_routed_experts=64,
+    first_k_dense_replace=1,
+)
 
 deepseek_v3_config = ModelArgs()
 

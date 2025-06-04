@@ -10,7 +10,6 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 from torch.distributed.tensor.parallel import (
     parallelize_module,
-    PrepareModuleInputOutput,
     PrepareModuleInput,
     ColwiseParallel,
     RowwiseParallel,
@@ -166,7 +165,8 @@ def apply_tp(
     # 3. Parallelize the final linear output layer
 
     from torchtitan.experiments.llama4.infra.expert_parallel import (
-        NoParallel, TensorParallel, ExpertParallel)
+        NoParallel, TensorParallel, ExpertParallel,
+        PrepareModuleInputOutputWithParams)
 
     parallelize_module(
         model,
@@ -256,7 +256,7 @@ def apply_tp(
             # input / output sharding on the seqlen dim
             # all-gather for input, reduce-scatter for output
             "moe":
-            PrepareModuleInputOutput(
+            PrepareModuleInputOutputWithParams(
                 input_layouts=(Shard(1), ),
                 desired_input_layouts=(Replicate(), ),
                 use_local_input=True,

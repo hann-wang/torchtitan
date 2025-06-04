@@ -334,11 +334,18 @@ class MoE(nn.Module):
         self.load_balance_coeff = model_args.load_balance_coeff
         # the fields below are defined even when load_balance_coeff is None
         # to make initialization and checkpointing code simpler
-        self.register_buffer(
-            "expert_bias",
-            torch.randn(num_experts, dtype=torch.get_default_dtype()),
-            persistent=True,
-        )
+        if self.topk_method == "noaux_tc":
+            self.expert_bias = nn.Parameter(
+                # Changed from torch.empty to torch.rand to avoid non-even
+                # distribution for runs without actual weigths
+                torch.rand(num_experts,
+                           dtype=torch.get_default_dtype()))
+        else:
+            self.register_buffer(
+                "expert_bias",
+                torch.randn(num_experts, dtype=torch.get_default_dtype()),
+                persistent=True,
+            )
 
         self.register_buffer(
             "tokens_per_expert",
