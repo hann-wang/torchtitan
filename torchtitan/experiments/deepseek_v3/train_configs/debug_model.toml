@@ -44,7 +44,7 @@ batch_size = 2
 seq_len = 4096
 max_norm = 1.0  # grad norm clipping
 steps = 10
-compile = false
+compile = true
 dataset = "c4_test"
 seed = 1
 
@@ -56,7 +56,7 @@ enable_async_tensor_parallel = false
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
 enable_compiled_autograd = false
-enable_tp2ep = true
+enable_tp2ep = false
 
 [checkpoint]
 enable_checkpoint = false

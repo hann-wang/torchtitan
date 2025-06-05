@@ -75,6 +75,7 @@ def parallelize_llama(
 
         # NOTE: needed for torch.compile to work with dynamic shapes in token-choice MoE
         torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
     dp_mesh: DeviceMesh | None = None
     if (

@@ -461,6 +461,8 @@ class MoE(nn.Module):
                     ep_group,
                 )
             else:
+                # TODO: unify with all_to_all_single_autograd after
+                # https://github.com/pytorch/pytorch/issues/154370 is resolved
                 gathered_num_tokens = output_splits.sum()
                 gathered_tokens = routed_input.new_empty(
                     (gathered_num_tokens, dim))
@@ -546,6 +548,8 @@ class MoE(nn.Module):
                     ep_group,
                 )
             else:
+                # TODO: unify with all_to_all_single_autograd after
+                # https://github.com/pytorch/pytorch/issues/154370 is resolved
                 returned_tokens = routed_output.new_empty(
                     (input_splits.sum(), dim))
                 dist.all_to_all_single(
