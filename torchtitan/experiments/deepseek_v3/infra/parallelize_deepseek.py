@@ -266,6 +266,8 @@ def apply_tp(
             # replicate computation for the router
             "moe.router.gate":
             NoParallel(),
+            "moe.experts":
+            TensorParallel(output_layout=Partial()),
             "moe.shared_expert.gate_proj":
             colwise_parallel(),
             "moe.shared_expert.down_proj":
@@ -276,8 +278,15 @@ def apply_tp(
 
         if enable_tp2ep:
             layer_plan["moe.experts"] = ExpertParallel()
-        else:
-            layer_plan["moe.experts"] = TensorParallel(output_layout=Partial())
+            layer_plan["moe.shared_expert.down_proj"] = rowwise_parallel(
+                output_layouts=Replicate(), )
+            layer_plan["moe"] = PrepareModuleInputOutputWithParams(
+                input_layouts=(Shard(1), ),
+                desired_input_layouts=(Replicate(), ),
+                use_local_input=True,
+                output_layouts=(Replicate(), ),
+                desired_output_layouts=(Shard(1), ),
+            )
 
         parallelize_module(
             module=transformer_block,

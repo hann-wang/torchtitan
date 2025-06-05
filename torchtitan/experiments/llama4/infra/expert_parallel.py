@@ -176,39 +176,16 @@ class NoParallel(ParallelStyle):
 
 class ExpertParallel(ParallelStyle):
 
-    def __init__(
-        self,
-        *,
-        input_layouts: Optional[Tuple[Optional[Placement]]] = None,
-        output_layout: Optional[Placement] = None,
-        use_local_output: bool = True,
-    ):
+    def __init__(self, ):
         super().__init__()
-        self.input_layouts = input_layouts or (Replicate(), Replicate())
-        self.output_layout = output_layout or Replicate()
-        self.desired_input_layouts = (Replicate(), Replicate())
-        self.use_local_output = use_local_output
 
     @staticmethod
-    def _prepare_input_fn(
-        input_layouts, desired_input_layouts, mod, inputs, device_mesh
-    ):
-        prepared_inputs = []
-        # annotate module input placements/sharding with input_layouts
-        for inp, input_layout, desired_input_layout in zip(
-            inputs, input_layouts, desired_input_layouts
-        ):
+    def _prepare_input_fn(mod, inputs, device_mesh):
+        for inp in inputs:
             if isinstance(inp, torch.Tensor):
-                if not isinstance(inp, DTensor):
-                    inp = DTensor.from_local(
-                        inp, device_mesh, (input_layout,), run_check=False
-                    )
-                if input_layout != desired_input_layout:
-                    inp = inp.redistribute(
-                        placements=(desired_input_layout,), async_op=True
-                    )
-            prepared_inputs.append(inp)
-        return tuple(prepared_inputs)
+                assert not isinstance(
+                    inp, DTensor), "ExpertParallel expects local tensor inputs."
+        return inputs
 
     def _partition_fn(self, name, module, device_mesh):
         # shard on the expert dimension
@@ -218,23 +195,18 @@ class ExpertParallel(ParallelStyle):
             module.register_parameter(name, dist_param)
 
     @staticmethod
-    def _prepare_output_fn(output_layout, use_local_output, mod, outputs,
-                           device_mesh):
-        if outputs.placements != (output_layout, ):
-            outputs = outputs.redistribute(placements=(output_layout, ),
-                                           async_op=True)
-        # back to local tensor
-        return outputs.to_local() if use_local_output else outputs
+    def _prepare_output_fn(mod, outputs, device_mesh):
+        assert not isinstance(
+            outputs, DTensor), "ExpertParallel expects local tensor outputs."
+        return outputs
 
     def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
         return distribute_module(
             module,
             device_mesh,
             self._partition_fn,
-            partial(self._prepare_input_fn, self.input_layouts,
-                    self.desired_input_layouts),
-            partial(self._prepare_output_fn, self.output_layout,
-                    self.use_local_output),
+            self._prepare_input_fn,
+            self._prepare_output_fn,
         )
 
 

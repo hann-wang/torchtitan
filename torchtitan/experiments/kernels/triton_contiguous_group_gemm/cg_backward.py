@@ -612,14 +612,8 @@ colwise_rowwise_2x3: PlacementList = [
     Shard(1),  # mat2
     Replicate(),  # offs
 ]
-expertwise_2x3: PlacementList = [
-    Replicate(),
-    Replicate(),  # mat1
-    Shard(0),  # mat2
-    Replicate(),  # offs
-]
 single_mesh_dim_strategies.extend(
-    [replicate_colwise_2x3, colwise_rowwise_2x3, expertwise_2x3])
+    [replicate_colwise_2x3, colwise_rowwise_2x3])
 
 def cg_grouped_gemm(
     inputs: torch.Tensor,

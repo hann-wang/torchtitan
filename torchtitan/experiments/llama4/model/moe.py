@@ -7,6 +7,8 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
+import torch.distributed as dist
+from torch.distributed._functional_collectives import all_to_all_single_autograd
 from torch.distributed.tensor import DTensor, Shard, Replicate
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
     cg_grouped_gemm, )
@@ -39,6 +41,19 @@ class GroupedExperts(nn.Module):
     ) -> torch.Tensor:
         # TODO: keeping this for loop implementation for comparison
         #       and readability, will remove later
+        if isinstance(self.w1, DTensor) and self.w1.placements == (Shard(0),) and self.w1.device_mesh.size() > 1:
+            # expert parallel enabled
+            w1 = self.w1.to_local()
+            w2 = self.w2.to_local()
+            w3 = self.w3.to_local()
+            experts_per_rank = self.num_experts // self.w1.device_mesh.size()
+        else:
+            # expert parallel disabled
+            w1 = self.w1
+            w2 = self.w2
+            w3 = self.w3
+            experts_per_rank = self.num_experts
+
         if not self.use_grouped_mm:
             assert not self.use_fp8
             if num_local_tokens_per_expert is not None:
@@ -51,23 +66,24 @@ class GroupedExperts(nn.Module):
                 )
                 out_experts_splits = []
                 for expert_idx, x_expert in enumerate(x):
-                    w1, w2, w3 = (
-                        self.w1[expert_idx],
-                        self.w2[expert_idx],
-                        self.w3[expert_idx],
+                    expert_idx = expert_idx % experts_per_rank
+                    current_w1, current_w2, current_w3 = (
+                        w1[expert_idx],
+                        w2[expert_idx],
+                        w3[expert_idx],
                     )
-                    h = F.silu(torch.matmul(x_expert, w1))
-                    h = h * torch.matmul(x_expert, w3)
-                    h = torch.matmul(h, w2)
+                    h = F.silu(torch.matmul(x_expert, current_w1))
+                    h = h * torch.matmul(x_expert, current_w3)
+                    h = torch.matmul(h, current_w2)
                     # h shape (tokens_per_expert(varying), dim)
                     out_experts_splits.append(h)
                 out = torch.cat(out_experts_splits, dim=0)
             else:
                 # x shape (num_experts, tokens_per_expert, dim)
-                h = F.silu(torch.bmm(x, self.w1))
-                h = h * torch.bmm(x, self.w3)
+                h = F.silu(torch.bmm(x, w1))
+                h = h * torch.bmm(x, w3)
                 # out shape (num_experts, tokens_per_expert, dim)
-                out = torch.bmm(h, self.w2)
+                out = torch.bmm(h, w2)
 
             return out
 
@@ -95,13 +111,13 @@ class GroupedExperts(nn.Module):
                     offsets)
                 gate_proj = cg_grouped_gemm(
                     x,
-                    self.w1,
+                    w1,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
                 up_proj = cg_grouped_gemm(
                     x,
-                    self.w3,
+                    w3,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
@@ -110,7 +126,7 @@ class GroupedExperts(nn.Module):
                 # Run the third GEMM (down projection)
                 out = cg_grouped_gemm(
                     hidden_outputs,
-                    self.w2,
+                    w2,
                     m_indices,
                     use_fp8=self.use_fp8,
                 )
@@ -120,21 +136,21 @@ class GroupedExperts(nn.Module):
                 from .grouped_mm_utils import gmm
                 num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
                     dtype=torch.int64, device="cpu")
-                g = gmm(x.contiguous(), self.w1.contiguous(),
+                g = gmm(x.contiguous(), w1.contiguous(),
                         num_local_tokens_per_expert_cpu.contiguous())
                 assert not torch.isnan(g).any(), "NaN detected in grouped mm gate projection"
                 h = F.silu(g)
-                h = h * gmm(x, self.w3, num_local_tokens_per_expert_cpu)
-                out = gmm(h, self.w2, num_local_tokens_per_expert_cpu)
+                h = h * gmm(x, w3, num_local_tokens_per_expert_cpu)
+                out = gmm(h, w2, num_local_tokens_per_expert_cpu)
         else:
             assert x.dim() == 3
             assert not self.use_fp8
             # fall back to regular bmm between 3D tensors
             # x shape (num_experts, tokens_per_expert, dim)
-            h = F.silu(torch.bmm(x, self.w1))
-            h = h * torch.bmm(x, self.w3)
+            h = F.silu(torch.bmm(x, w1))
+            h = h * torch.bmm(x, w3)
             # out shape (num_experts, tokens_per_expert, dim)
-            out = torch.bmm(h, self.w2)
+            out = torch.bmm(h, w2)
         return out
 
     def init_weights(self, init_std: float):
@@ -209,12 +225,14 @@ class TokenChoiceTopKRouter(nn.Module):
                     scores,
                     k=self.top_k,
                     dim=1,
+                    sorted=False,
                 )
             case "noaux":
                 _, selected_experts_indices = torch.topk(
                     scores + expert_bias,
                     k=self.top_k,
                     dim=1,
+                    sorted=False,
                 )
                 # top scores shape (bs*slen, top_k)
                 # NOTE: The expert_bias is only used for routing. The gating value
@@ -246,6 +264,7 @@ class TokenChoiceTopKRouter(nn.Module):
                     tmp_scores,
                     k=self.top_k,
                     dim=-1,
+                    sorted=False,
                 )
                 top_scores = scores.gather(1, selected_experts_indices)
             case _:
@@ -378,7 +397,8 @@ class MoE(nn.Module):
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
         """
         bs, slen, dim = x.shape
-        
+        original_dtype = x.dtype
+
         if isinstance(self.expert_bias, DTensor):
             assert self.expert_bias.placements == (Replicate(),)
             expert_bias = self.expert_bias.to_local()
@@ -408,9 +428,67 @@ class MoE(nn.Module):
             ),  # FIXME: avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
         )
 
+        ep_size = 1
+        ep_group = None
+        if isinstance(
+                self.experts.w1, DTensor) and self.experts.w1.placements == (
+                    Shard(0), ) and self.experts.w1.device_mesh.size() > 1:
+            # expert parallel enabled
+            ep_size = self.experts.w1.device_mesh.size()
+            ep_group = self.experts.w1.device_mesh.get_group()
+            assert num_local_tokens_per_expert is not None
+            with torch.no_grad():
+                tokens_per_expert_group = num_local_tokens_per_expert.new_empty(
+                    num_local_tokens_per_expert.shape[0])
+                dist.all_to_all_single(tokens_per_expert_group,
+                                       num_local_tokens_per_expert,
+                                       group=ep_group)
+                input_splits = num_local_tokens_per_expert.view(ep_size,
+                                                                -1).sum(dim=1)
+                output_splits = tokens_per_expert_group.view(ep_size,
+                                                             -1).sum(dim=1)
+            if self.training:
+                gathered_tokens = all_to_all_single_autograd(
+                    routed_input,
+                    output_splits.tolist(),
+                    input_splits.tolist(),
+                    ep_group,
+                )
+                gathered_top_scores = all_to_all_single_autograd(
+                    top_scores,
+                    output_splits.tolist(),
+                    input_splits.tolist(),
+                    ep_group,
+                )
+            else:
+                gathered_num_tokens = output_splits.sum()
+                gathered_tokens = routed_input.new_empty(
+                    (gathered_num_tokens, dim))
+                dist.all_to_all_single(
+                    gathered_tokens,
+                    routed_input,
+                    output_splits.tolist(),
+                    input_splits.tolist(),
+                    group=ep_group,
+                )
+                gathered_top_scores = top_scores.new_empty(
+                    gathered_num_tokens, )
+                dist.all_to_all_single(
+                    gathered_top_scores,
+                    top_scores,
+                    output_splits.tolist(),
+                    input_splits.tolist(),
+                    group=ep_group,
+                )
+        else:
+            # expert parallel disabled
+            gathered_tokens = routed_input
+            gathered_top_scores = top_scores
+            tokens_per_expert_group = num_local_tokens_per_expert
+
         if self.scoring_before_experts:
-            routed_input = (routed_input.to(torch.float32) *
-                            top_scores.reshape(-1, 1)).to(x.dtype)
+            gathered_tokens = (gathered_tokens.to(torch.float32) *
+                               gathered_top_scores.reshape(-1, 1)).to(original_dtype)
 
         if self.use_grouped_mm:
             # NOTE: In order to use torch._grouped_mm, we need to make sure
@@ -421,47 +499,65 @@ class MoE(nn.Module):
                 generate_permute_indices,
             )
 
-            if isinstance(self.experts.w1, DTensor) and self.experts.w1.placements == (Shard(0),):
-                # expert parallel enabled
-                num_ranks = self.experts.w1.device_mesh.size()
-            else:
-                num_ranks = 1
-
             with torch.no_grad():
+                experts_per_rank = self.experts.num_experts // ep_size
                 (
                     permuted_indices,
-                    num_local_tokens_per_expert,
+                    tokens_per_expert_group,
                     _,
                 ) = generate_permute_indices(
-                    num_local_tokens_per_expert,
-                    self.experts.num_experts // num_ranks,
-                    num_ranks,
-                    token_indices.shape[0] +
-                    self.experts.num_experts * ALIGN_SIZE_M,
+                    tokens_per_expert_group,
+                    experts_per_rank,
+                    ep_size,
+                    gathered_tokens.shape[0] + experts_per_rank * ALIGN_SIZE_M,
                     ALIGN_SIZE_M,
                 )
-            token_indices_appended = torch.vstack(
-                (token_indices, token_indices.new_zeros((dim)))
-            )  # FIXME: renamed to avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
-            token_indices = token_indices_appended[permuted_indices, :]
+            gathered_tokens_appended = torch.vstack(
+                (gathered_tokens, gathered_tokens.new_zeros((dim))))
+            buffer_shape = gathered_tokens_appended.shape
+            gathered_tokens = gathered_tokens_appended[permuted_indices, :]
 
-            routed_input = torch.vstack(
-                (routed_input, routed_input.new_zeros((dim))))
-            routed_input = routed_input[permuted_indices, :]
-
-            top_scores = torch.cat(
-                (top_scores, top_scores.new_zeros(1))
-            )
-            top_scores = top_scores[permuted_indices]
+            gathered_top_scores = torch.cat(
+                (gathered_top_scores, gathered_top_scores.new_zeros(1)))
+            gathered_top_scores = gathered_top_scores[permuted_indices]
         else:
             # NOTE: this would incur a synchronization between device and host
-            if num_local_tokens_per_expert is not None:
-                num_local_tokens_per_expert = num_local_tokens_per_expert.tolist()
+            if tokens_per_expert_group is not None:
+                tokens_per_expert_group = tokens_per_expert_group.tolist()
 
         # shape (bs*slen*top_k, dim)
-        routed_output = self.experts(routed_input, num_local_tokens_per_expert)
+        routed_output = self.experts(gathered_tokens, tokens_per_expert_group)
         if not self.scoring_before_experts:
-            routed_output = (routed_output * top_scores.reshape(-1, 1)).to(x.dtype)
+            routed_output = (routed_output * gathered_top_scores.reshape(-1, 1)).to(original_dtype)
+
+        if self.use_grouped_mm:
+            gathered_tokens_buffer = routed_output.new_empty(buffer_shape)
+            gathered_tokens_buffer[permuted_indices, :] = routed_output
+            routed_output = gathered_tokens_buffer[:(buffer_shape[0] - 1), :]
+
+        if ep_size > 1:
+            # expert parallel enabled, we need to gather the output
+            # from all experts
+            if self.training:
+                returned_tokens = all_to_all_single_autograd(
+                    routed_output,
+                    input_splits.tolist(),
+                    output_splits.tolist(),
+                    ep_group,
+                )
+            else:
+                returned_tokens = routed_output.new_empty(
+                    (input_splits.sum(), dim))
+                dist.all_to_all_single(
+                    returned_tokens,
+                    routed_output,
+                    input_splits.tolist(),
+                    output_splits.tolist(),
+                    group=ep_group,
+                )
+        else:
+            # expert parallel disabled, no need to gather
+            returned_tokens = routed_output
 
         # shared expert
         if self.shared_expert is not None:
@@ -471,7 +567,7 @@ class MoE(nn.Module):
         else:
             out = torch.zeros_like(x.reshape(bs * slen, dim))
 
-        out = out.scatter_add(dim=0, index=token_indices, src=routed_output)
+        out = out.scatter_add(dim=0, index=token_indices, src=returned_tokens)
         out = out.reshape(bs, slen, dim)
         return out
 
