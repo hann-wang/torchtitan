@@ -192,8 +192,13 @@ class Training:
     loaded from this path instead of downloaded.
     """
 
-    batch_size: int = 8
-    """Batch size"""
+    local_batch_size: int = 8
+    """Local batch size (i.e., per-device batch size)"""
+
+    global_batch_size: int = -1
+    """
+    Global batch size (defaults to `training.local_batch_size * data-parallel degree`)
+    """
 
     seq_len: int = 2048
     """Sequence length"""
@@ -336,7 +341,7 @@ class Parallelism:
     pipeline_parallel_microbatch_size: int = 1
     """
     The size of each pipeline parallel microbatch (default 1).
-    This value is used to compute the total number of microbatches by dividing batch_size with
+    This value is used to compute the total number of microbatches by dividing local_batch_size with
     pipeline_parallel_microbatch_size.
     The global training batch size must be evenly divisible by pipeline_parallel_microbatch_size.
     """
@@ -739,7 +744,7 @@ class ConfigManager:
         # Only in Custom
         for name, f in c_map.items():
             if name not in b_map:
-                result.append((name, f.type, field(default_factory=f.type)))
+                result.append((name, f.type, f))
 
         return make_dataclass(f"Merged{base.__name__}", result, bases=(base,))
 

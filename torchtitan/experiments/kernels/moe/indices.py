@@ -4,6 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Note: We did not merge the changes proposed by
+#       https://github.com/pytorch/torchtitan/pull/1254
+#       because it is not compatible with torch.compile
+
 import torch
 from torch.library import triton_op, wrap_triton
 from torch.distributed.tensor import DTensor

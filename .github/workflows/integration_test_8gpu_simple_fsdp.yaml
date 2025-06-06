@@ -1,9 +1,13 @@
-name: 8 GPU Integration Test
+name: SimpleFSDP 8 GPU Integration Test
 
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'torchtitan/experiments/simple_fsdp/**'
   pull_request:
+    paths:
+      - 'torchtitan/experiments/simple_fsdp/**'
   schedule:
     # Runs every 6 hours
     - cron: '0 */6 * * *'
@@ -17,7 +21,7 @@ defaults:
 
 jobs:
   build-test:
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    uses: pytorch/test-infra/.github/workflows/linux_job.yml@main
     with:
       runner: linux.g5.48xlarge.nvidia.gpu
       gpu-arch-type: cuda
@@ -38,7 +42,5 @@ jobs:
 
         python -m pip install --force-reinstall --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
 
-        USE_CPP=0 python -m pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu126
-
         mkdir artifacts-to-be-uploaded
-        python ./tests/integration_tests.py artifacts-to-be-uploaded --ngpu 8
+        python -m torchtitan.experiments.simple_fsdp.tests.integration_tests artifacts-to-be-uploaded --ngpu 8
