@@ -79,12 +79,14 @@ class GroupedExperts(nn.Module):
                     out_experts_splits.append(h)
                 out = torch.cat(out_experts_splits, dim=0)
             else:
+                bs, slen, dim = x.shape
+                x = x.reshape(1, bs * slen, dim)
                 # x shape (num_experts, tokens_per_expert, dim)
                 h = F.silu(torch.bmm(x, w1))
                 h = h * torch.bmm(x, w3)
                 # out shape (num_experts, tokens_per_expert, dim)
                 out = torch.bmm(h, w2)
-
+                out = out.reshape(bs, slen, dim)
             return out
 
         # grouped mm implementation
@@ -143,7 +145,8 @@ class GroupedExperts(nn.Module):
                 h = h * gmm(x, w3, num_local_tokens_per_expert_cpu)
                 out = gmm(h, w2, num_local_tokens_per_expert_cpu)
         else:
-            assert x.dim() == 3
+            bs, slen, dim = x.shape
+            x = x.reshape(1, bs * slen, dim)
             assert not self.use_fp8
             # fall back to regular bmm between 3D tensors
             # x shape (num_experts, tokens_per_expert, dim)
@@ -151,6 +154,7 @@ class GroupedExperts(nn.Module):
             h = h * torch.bmm(x, w3)
             # out shape (num_experts, tokens_per_expert, dim)
             out = torch.bmm(h, w2)
+            out = out.reshape(bs, slen, dim)
         return out
 
     def init_weights(self, init_std: float):
@@ -397,7 +401,6 @@ class MoE(nn.Module):
             out (torch.Tensor): Output tensor with shape ``(bs, slen, dim)``.
         """
         bs, slen, dim = x.shape
-        original_dtype = x.dtype
 
         if isinstance(self.expert_bias, DTensor):
             assert self.expert_bias.placements == (Replicate(),)
@@ -490,7 +493,7 @@ class MoE(nn.Module):
 
         if self.scoring_before_experts:
             gathered_tokens = (gathered_tokens.to(torch.float32) *
-                               gathered_top_scores.reshape(-1, 1)).to(original_dtype)
+                               gathered_top_scores.reshape(-1, 1)).to(x.dtype)
 
         if self.use_grouped_mm:
             # NOTE: In order to use torch._grouped_mm, we need to make sure
@@ -530,7 +533,7 @@ class MoE(nn.Module):
         # shape (bs*slen*top_k, dim)
         routed_output = self.experts(gathered_tokens, tokens_per_expert_group)
         if not self.scoring_before_experts:
-            routed_output = (routed_output * gathered_top_scores.reshape(-1, 1)).to(original_dtype)
+            routed_output = (routed_output * gathered_top_scores.reshape(-1, 1)).to(x.dtype)
 
         if self.use_grouped_mm:
             gathered_tokens_buffer = routed_output.new_empty(buffer_shape)
@@ -565,11 +568,9 @@ class MoE(nn.Module):
 
         # shared expert
         if self.shared_expert is not None:
-            out = self.shared_expert(x.reshape(1, bs * slen, dim)).reshape(
-                bs * slen, dim
-            )
+            out = self.shared_expert(x).reshape(bs * slen, dim)
         else:
-            out = torch.zeros_like(x.reshape(bs * slen, dim))
+            out = x.new_zeros((bs * slen, dim))
 
         out = out.scatter_add(dim=0, index=token_indices, src=returned_tokens)
         out = out.reshape(bs, slen, dim)

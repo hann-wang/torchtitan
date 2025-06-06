@@ -286,13 +286,17 @@ def apply_tp(
         if enable_tp2ep:
             layer_plan["moe.experts"] = ExpertParallel()
             layer_plan["moe.shared_expert.down_proj"] = rowwise_parallel(
-                output_layouts=Replicate(), )
+                output_layouts=Shard(1), )
             layer_plan["moe"] = PrepareModuleInputOutputWithParams(
                 input_layouts=(Shard(1), ),
-                desired_input_layouts=(Replicate(), ),
+                desired_input_layouts=(Shard(1), ),
                 use_local_input=True,
-                output_layouts=(Replicate(), ),
+                output_layouts=(Shard(1), ),
                 desired_output_layouts=(Shard(1), ),
+            )
+            layer_plan["moe.shared_expert"] = prepare_module_input(
+                input_layouts=(Shard(1), ),
+                desired_input_layouts=(Replicate(), ),
             )
 
         parallelize_module(
