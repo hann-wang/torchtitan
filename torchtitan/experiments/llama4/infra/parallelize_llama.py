@@ -64,7 +64,11 @@ def parallelize_llama(
             enable_async_tp=job_config.parallelism.enable_async_tensor_parallel,
         )
 
-        apply_moe_tp(model, world_mesh["tp"])
+        apply_moe_tp(
+            model,
+            world_mesh["tp"],
+            enable_tp2ep=job_config.parallelism.enable_tp2ep,
+        )
 
     if job_config.activation_checkpoint.mode != "none":
         apply_ac(model, job_config.activation_checkpoint)
@@ -146,6 +150,7 @@ def parallelize_llama(
 def apply_moe_tp(
     model: nn.Module,
     tp_mesh: DeviceMesh,
+    enable_tp2ep: bool = False,
 ):
     from torch.distributed.tensor import Partial, Replicate, Shard
     from torch.distributed.tensor.parallel import (
@@ -153,25 +158,58 @@ def apply_moe_tp(
         PrepareModuleInputOutput,
     )
 
-    from .expert_parallel import NoParallel, TensorParallel
+    from .expert_parallel import (
+        NoParallel,
+        TensorParallel,
+        ExpertParallel,
+    )
 
     for transformer_block in model.layers.values():
-        moe_layer_plan = {
-            # input / output sharding on the seqlen dim
-            # all-gather for input, reduce-scatter for output
-            "moe": PrepareModuleInputOutput(
-                input_layouts=(Shard(1),),
-                desired_input_layouts=(Replicate(),),
-                use_local_input=True,
-                output_layouts=(Partial(),),
-                desired_output_layouts=(Shard(1),),
-            ),
-            # replicate computation for the router
-            "moe.router.gate": NoParallel(),
-            # input Replicate, output Partial
-            "moe.experts": TensorParallel(output_layout=Partial()),
-            "moe.shared_expert": TensorParallel(output_layout=Partial()),
-        }
+        if enable_tp2ep:
+            moe_layer_plan = {
+                # input / output sharding on the seqlen dim
+                # all-gather for input, reduce-scatter for output
+                "moe":
+                PrepareModuleInputOutput(
+                    input_layouts=(Shard(1), ),
+                    desired_input_layouts=(Shard(1), ),
+                    use_local_input=True,
+                    output_layouts=(Shard(1), ),
+                    desired_output_layouts=(Shard(1), ),
+                ),
+                # replicate computation for the router
+                "moe.router.gate":
+                NoParallel(),
+                # input Replicate, output Partial
+                "moe.experts":
+                ExpertParallel(),
+                "moe.shared_expert":
+                TensorParallel(
+                    input_layouts=(Shard(1), None),
+                    output_layout=Shard(1),
+                ),
+            }
+        else:
+            moe_layer_plan = {
+                # input / output sharding on the seqlen dim
+                # all-gather for input, reduce-scatter for output
+                "moe":
+                PrepareModuleInputOutput(
+                    input_layouts=(Shard(1), ),
+                    desired_input_layouts=(Replicate(), ),
+                    use_local_input=True,
+                    output_layouts=(Partial(), ),
+                    desired_output_layouts=(Shard(1), ),
+                ),
+                # replicate computation for the router
+                "moe.router.gate":
+                NoParallel(),
+                # input Replicate, output Partial
+                "moe.experts":
+                TensorParallel(output_layout=Partial()),
+                "moe.shared_expert":
+                TensorParallel(output_layout=Partial()),
+            }
         parallelize_module(
             module=transformer_block,
             device_mesh=tp_mesh,

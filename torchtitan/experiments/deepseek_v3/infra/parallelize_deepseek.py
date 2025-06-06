@@ -163,7 +163,7 @@ def apply_tp(
     loss_parallel: bool,
     enable_float8_tensorwise_tp: bool,
     enable_async_tp: bool,
-    enable_tp2ep: bool = True,
+    enable_tp2ep: bool = False,
 ):
     """Apply tensor parallelism."""
     # 1. Parallelize the embedding and shard its outputs (which are the first

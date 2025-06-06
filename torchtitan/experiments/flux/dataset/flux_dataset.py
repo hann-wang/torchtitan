@@ -249,6 +249,7 @@ class FluxDataset(IterableDataset, Stateful):
             if dropout_prob > 0.0:
                 if torch.rand(1).item() < dropout_prob:
                     sample_dict["t5_tokens"] = self._t5_empty_token
+                if torch.rand(1).item() < dropout_prob:
                     sample_dict["clip_tokens"] = self._clip_empty_token
 
             self._sample_idx += 1
@@ -277,7 +278,7 @@ def build_flux_dataloader(
     """Build a data loader for HuggingFace datasets."""
     dataset_name = job_config.training.dataset
     dataset_path = job_config.training.dataset_path
-    batch_size = job_config.training.batch_size
+    batch_size = job_config.training.local_batch_size
 
     t5_tokenizer, clip_tokenizer = build_flux_tokenizer(job_config)
 
