@@ -83,17 +83,17 @@ class MoE(Llama4MoE):
             topk_group=model_args.topk_group,
         )
 
-        # self.shared_expert = (GroupedExperts(
-        #     dim=dim,
-        #     hidden_dim=hidden_dim * model_args.n_shared_experts,
-        #     num_experts=1,
-        #     use_grouped_mm=self.use_grouped_mm,
-        # ) if model_args.n_shared_experts else None)
-        self.shared_expert = MLP(
-            model_args,
-            hidden_size=dim,
-            intermediate_size=hidden_dim * model_args.n_shared_experts,
-        ) if model_args.n_shared_experts else None
+        self.shared_expert = (GroupedExperts(
+            dim=dim,
+            hidden_dim=hidden_dim * model_args.n_shared_experts,
+            num_experts=1,
+            use_grouped_mm=self.use_grouped_mm,
+        ) if model_args.n_shared_experts else None)
+        # self.shared_expert = MLP(
+        #     model_args,
+        #     hidden_size=dim,
+        #     intermediate_size=hidden_dim * model_args.n_shared_experts,
+        # ) if model_args.n_shared_experts else None
 
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
