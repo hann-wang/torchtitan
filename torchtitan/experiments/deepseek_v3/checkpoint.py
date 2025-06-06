@@ -7,8 +7,7 @@
 import json
 import logging
 import os
-from typing import Dict, Optional, Set, Tuple, Iterable
-import re
+from typing import Dict, Optional, Set, Tuple
 
 import torch
 from safetensors import safe_open
@@ -20,24 +19,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SAFETENSOR_FILE_NAME = "model.safetensors.index.json"
 
-PARAM_MAPPING = {
-    r"\.moe\.router\.gate\.weight$": ".mlp.gate.weight",
-    r"\.moe\.expert_bias": ".mlp.gate.e_score_correction_bias",
-    "moe.shared_expert.w1": "mlp.shared_experts.gate_proj.weight",
-    "moe.shared_expert.w2": "mlp.shared_experts.down_proj.weight",
-    "moe.shared_expert.w3": "mlp.shared_experts.up_proj.weight",
-    "moe.shared_expert": "mlp.shared_experts",
-    ".moe.": ".mlp.",
-    ".feed_forward.": ".mlp.",
-    r"^model.tok_embeddings": "model.embed_tokens",
-    r"^output": "lm_head",
-}
-
-EXPERT_WEIGHT_MAPPING = {
-    "gate_proj": "w1",
-    "up_proj": "w3",
-    "down_proj": "w2",
-}
 
 def read_weights_from_json(file_path: str) -> Optional[Dict[str, str]]:
     try:
@@ -74,10 +55,10 @@ def get_hf_weight_map_and_path(
 
 
 def get_needed_files(
-    state_dict_keys: Iterable[str], weight_map: Dict[str, str]
+    state_dict: Dict[str, torch.Tensor], weight_map: Dict[str, str]
 ) -> Set[str]:
     needed_files = set()
-    for param in state_dict_keys:
+    for param in state_dict.keys():
         file = weight_map.get(param)
         if file:
             needed_files.add(file)
@@ -100,31 +81,6 @@ def load_safetensor_file(
     return tensors
 
 
-def combine_expert_weights(
-    state_dict: Dict[str, torch.Tensor],
-    expert_weights: Dict[str, torch.Tensor],
-    updated_states: Set[str],
-) -> None:
-    for key in state_dict.keys():
-        try:
-            sd_key_prefix = re.search(r"^(.+?)\.experts\.", key).group(1)
-            hf_key_prefix = sd_key_prefix.replace(".moe", ".mlp")
-        except AttributeError:
-            continue
-        for k in expert_weights.keys():
-            if k.startswith(hf_key_prefix):
-                k_splitted = k.split(".")
-                expert_id = int(k_splitted[5])
-                weight_name = k_splitted[-2]
-                sd_weight_name = EXPERT_WEIGHT_MAPPING[weight_name]
-                sd_key = f"{sd_key_prefix}.experts.{sd_weight_name}"
-                w = state_dict[sd_key]
-                w.data[expert_id, :, :] = expert_weights[k].T
-        updated_states.add(key)
-        updated_states.add(f"{sd_key_prefix}.tokens_per_expert")
-        updated_states.add(f"{sd_key_prefix}.expert_bias")
-
-
 def load_safetensor_weights(
     model: torch.nn.Module,
     weight_map: Dict[str, str],
@@ -142,30 +98,7 @@ def load_safetensor_weights(
         device (torch.device): The device to load tensors onto.
     """
     model_state_dict = model.state_dict()
-    param_key_reverse_mapping = {}
-    hf_keys = []
-    expert_weights = {}
-    for param in model_state_dict.keys():
-        replaced = False
-        for pattern, value in PARAM_MAPPING.items():
-            if re.search(pattern, param):
-                new_key = re.sub(pattern, value, param)
-                param_key_reverse_mapping[new_key] = param
-                hf_keys.append(new_key)
-                replaced = True
-                break
-        if re.search(".experts.", param):
-            hf_param_name = param.replace(".moe.", ".mlp.")
-            key_prefix = re.search(r"^(.+?)\.experts\.",
-                                   hf_param_name).group(0)
-            for k in weight_map.keys():
-                if k.startswith(key_prefix):
-                    hf_keys.append(k)
-                    expert_weights[k] = None
-            replaced = True
-        if not replaced:
-            hf_keys.append(param)
-    needed_files = get_needed_files(hf_keys, weight_map)
+    needed_files = get_needed_files(model_state_dict, weight_map)
     updated_states: Set[str] = set()
 
     for file in needed_files:
@@ -177,30 +110,18 @@ def load_safetensor_weights(
         except Exception as e:
             logger.error(f"Error during checkpoint processing of {full_path}: {str(e)}")
 
-        matched_keys = set(checkpoint.keys()) & set(hf_keys)
+        matched_keys = set(checkpoint.keys()) & set(model_state_dict.keys())
         for key in matched_keys:
-            if key in expert_weights:
-                # Handle expert weights separately
-                expert_weights[key] = checkpoint[key]
-                continue
-            sd_key = param_key_reverse_mapping.get(key, key)
             # Check shape
-            hf_tensor = checkpoint[key]
-            if ".shared_expert.w" in sd_key:
-                hf_tensor = hf_tensor.T.unsqueeze(0).contiguous()
-            if model_state_dict[sd_key].shape != hf_tensor.shape:
+            if model_state_dict[key].shape != checkpoint[key].shape:
                 raise ValueError(
                     f"Shape mismatch for {key}: "
-                    f"model needs {model_state_dict[sd_key].shape}, but "
-                    f"checkpoint has {hf_tensor.shape}")
-            model_state_dict[sd_key] = hf_tensor.to(device)
-            updated_states.add(sd_key)
+                    f"model needs {model_state_dict[key].shape}, but "
+                    f"checkpoint has {checkpoint[key].shape}"
+                )
+            model_state_dict[key] = checkpoint[key].to(device)
 
-    combine_expert_weights(
-        model_state_dict,
-        expert_weights,
-        updated_states,
-    )
+        updated_states.update(matched_keys)
 
     missing_keys = set(model_state_dict.keys()) - updated_states
     if missing_keys:

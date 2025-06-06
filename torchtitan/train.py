@@ -13,8 +13,6 @@ from typing import Any, Generator, Iterable, Optional
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
-from transformers import AutoConfig
-
 import torchtitan.components.ft as ft
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
@@ -150,26 +148,14 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         # build model (using meta init)
         model_cls = self.train_spec.cls
         model_args = self.train_spec.config[job_config.model.flavor]
-        if not job_config.model.path:
-            # set the model args from training job configs
-            model_args.update_from_config(job_config, tokenizer)
-            logger.info(
-                f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
-            )
-            with torch.device("meta"):
-                model = model_cls.from_model_args(model_args)
+        # set the model args from training job configs
+        model_args.update_from_config(job_config, tokenizer)
 
-        else:
-            logger.info(
-                f"Building HF Transformers model with {job_config.model.path}"
-            )
-            hf_config = AutoConfig.from_pretrained(job_config.model.path)
-            hf_config._attn_implementation = "flash_attention_2"
-            hf_config.pad_token_id = None
-            hf_config.torch_dtype = torch.bfloat16
-            model_args.update_from_config(hf_config)
-            with torch.device("meta"):
-                model = model_cls(hf_config)
+        logger.info(
+            f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
+        )
+        with torch.device("meta"):
+            model = model_cls.from_model_args(model_args)
 
         # Build the collection of model converters. No-op if `model.converters` empty
         model_converters = build_model_converters(job_config, parallel_dims)
@@ -266,7 +252,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 m.to_empty(device=init_device)
                 with torch.no_grad():
                     m.init_weights(buffer_device=buffer_device)
-                    utils.convert_model_to_bfloat16(m)
                 m.train()
 
             # confirm that user will be able to view loss metrics on the console
@@ -279,12 +264,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             model.to_empty(device=init_device)
             with torch.no_grad():
-                if not job_config.model.path:
-                    model.init_weights(buffer_device=buffer_device)
-                else:
-                    utils.reset_params(model)
-                    model.init_weights()
-                utils.convert_model_to_bfloat16(model)
+                model.init_weights(buffer_device=buffer_device)
             model.train()
 
             self.model_parts = [model]
@@ -429,8 +409,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
                 pred = model_parts[0](inputs)
-                if hasattr(pred, "logits"):
-                    pred = pred.logits
                 loss = self.loss_fn(pred, labels)
                 # need to free to before bwd to avoid peaking memory
                 del pred

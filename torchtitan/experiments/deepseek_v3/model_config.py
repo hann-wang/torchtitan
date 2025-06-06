@@ -5,14 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
-from torch import nn
-from torchtitan.components.tokenizer import Tokenizer
-from torchtitan.config_manager import JobConfig
-from torchtitan.protocols.train_spec import BaseModelArgs
-from torchtitan.tools.logging import logger
+
 
 @dataclass
-class ModelArgs(BaseModelArgs):
+class ModelArgs:
     r"""
     This is the configuration class to store the configuration of a [`DeepseekV3Model`]. It is used to instantiate an DeepSeek
     model according to the specified arguments, defining the model architecture. Instantiating a configuration with the
@@ -160,69 +156,6 @@ class ModelArgs(BaseModelArgs):
     # Added for pipeline parallel
     num_stages: int = 1
     stage_idx: int = 0
-    use_grouped_mm: bool = True
-    load_balance_coeff: float | None = None
-
-    @property
-    def n_layers(self) -> int:
-        return self.num_hidden_layers
-
-    def update_from_config(self, job_config: JobConfig,
-                           tokenizer: Tokenizer) -> None:
-        self.vocab_size = tokenizer.n_words
-        self.max_seq_len = job_config.training.seq_len
-        self.eos_id = tokenizer.eos_id
-
-    def get_nparams_and_flops(self, model: nn.Module,
-                              seq_len: int) -> tuple[int, float]:
-        nparams_embedding = 0
-        nparams_moe_router = 0
-        nparams_shared_expert = 0
-        nparams_experts = 0
-        nparams_dense = 0
-
-        for name, p in model.named_parameters():
-            if "embedding" in name:
-                nparams_embedding += p.numel()
-                nparams_dense += p.numel()
-            elif "mlp.shared_expert" in name:
-                nparams_shared_expert += p.numel()
-            elif "mlp.router" in name:
-                nparams_moe_router += p.numel()
-            elif "mlp.experts" in name:
-                nparams_experts += p.numel()
-            else:
-                nparams_dense += p.numel()
-
-        nparams_sparse = nparams_moe_router + nparams_shared_expert + nparams_experts
-        nparams = nparams_dense + nparams_sparse
-        nparams_sparse_active = (
-            nparams_moe_router + nparams_shared_expert +
-            nparams_experts * self.num_experts_per_tok // self.n_routed_experts)
-
-        logger.info(
-            f"Total parameter count: dense {nparams_dense:,}, "
-            f"sparse {nparams_sparse:,}, active {nparams_dense + nparams_sparse_active:,}"
-        )
-
-        l, h, q, t = (
-            self.num_hidden_layers,
-            self.num_attention_heads,
-            self.hidden_size // self.num_attention_heads,
-            seq_len,
-        )
-        # Reasoning behind the factor of 12 for the self-attention part of the formula:
-        # 1. each self-attention has 2 matmul in the forward and 4 in the backward (6)
-        # 2. the flash attention does 1 more matmul recomputation in the backward
-        #    but recomputation should not be counted in calculating MFU           (+0)
-        # 3. each matmul performs 1 multiplication and 1 addition                 (*2)
-        # 4. we follow the convention and do not account for sparsity in causal attention
-        num_flops_per_token = (
-            6 * (nparams_dense - nparams_embedding + nparams_sparse_active) +
-            12 * l * h * q * t)
-
-        return nparams, num_flops_per_token
-
 
 
 # This is the configuration for deepseek-ai/DeepSeek-V2-Lite.
@@ -262,62 +195,10 @@ deepseek_v2_lite_config = ModelArgs(
 )
 
 
-# This is the configuration for deepseek-ai/DeepSeek-V2-Lite.
-deepseek_v2_dim10752_config = ModelArgs(
-    vocab_size=102400,
-    hidden_size=2048,
-    intermediate_size=10752,  # the original 10944 is not divisible by 128
-    moe_intermediate_size=1280,
-    num_hidden_layers=27,
-    num_attention_heads=16,
-    num_key_value_heads=16,
-    n_shared_experts=2,
-    n_routed_experts=64,
-    routed_scaling_factor=1.0,
-    kv_lora_rank=512,
-    q_lora_rank=None,
-    qk_rope_head_dim=64,
-    v_head_dim=128,
-    qk_nope_head_dim=128,
-    topk_method="greedy",
-    n_group=1,
-    topk_group=1,
-    num_experts_per_tok=6,
-    first_k_dense_replace=1,
-    norm_topk_prob=False,
-    scoring_func="softmax",
-    max_position_embeddings=4096,
-    rope_scaling={
-        "beta_fast": 32,
-        "beta_slow": 1,
-        "factor": 40,
-        "mscale": 0.707,
-        "mscale_all_dim": 0.707,
-        "original_max_position_embeddings": 4096,
-        "type": "yarn",
-    },
-)
-
-deepseek_v3_lite_config = ModelArgs(
-    vocab_size=102400,
-    hidden_size=2048,
-    intermediate_size=10752,  # the original 10944 is not divisible by 128
-    moe_intermediate_size=1280,
-    num_hidden_layers=27,
-    num_attention_heads=16,
-    num_key_value_heads=16,
-    n_shared_experts=1,
-    n_routed_experts=64,
-    first_k_dense_replace=1,
-)
-
-deepseek_v3_config = ModelArgs()
-
 # Model configuration registry
 # Key is the model distribution ID on HuggingFace Hub
 deepseek_config_registry = {
     "deepseek-ai/DeepSeek-V2-Lite": deepseek_v2_lite_config,
     "deepseek-ai/DeepSeek-V2-Lite-Chat": deepseek_v2_lite_config,
-    "deepseek-ai/deepseek-v3": deepseek_v3_config,
-    "deepseek-ai/DeepSeek-V3-0324": deepseek_v3_config,
+    "deepseek-ai/deepseek-v3": ModelArgs(),
 }

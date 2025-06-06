@@ -96,9 +96,6 @@ class Metrics:
 class Model:
     name: str = "llama3"
     """Which model to train"""
-    
-    path: str = ""
-    """HF model path"""
 
     flavor: str = "debugmodel"
     """Which model config to train"""
@@ -459,7 +456,7 @@ class Float8:
     for backward computation.
     """
 
-    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp", "blockwise"] | None = None
+    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None
     """If specified, creates float8 config from recipe name"""
 
     filter_fqns: list[str] = field(default_factory=list)
@@ -468,18 +465,6 @@ class Float8:
     nn.Linear modules with any dim size not divisible by 16 are always skipped due to hardware requirements.
     Example: --float8.filter_fqns "attention.wq,attention.wk,attention.wv,output"
     """
-    
-    enable_fp8_fa: bool = False
-    """Whether to use FP8 FlashAttention Triton kernel"""
-
-    fp8_fa_granularity: Literal["tensorwise", "blockwise"] = "blockwise"
-    """Scale granularity for Q, K. (V is always tensorwise scaled)"""
-    
-    enable_fp8_gmm: bool = False
-    """Whether to use FP8 grouped_gemm Triton kernel"""
-    
-    enable_fp8_linear: bool = True
-    """Whether to use FP8 Linear module"""
 
     emulate: bool = False
     """

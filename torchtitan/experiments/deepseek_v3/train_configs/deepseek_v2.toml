@@ -1,80 +1,77 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-# DeepSeek V2 Lite
-
 [job]
-dump_folder = "./deepseek-v2-lite-dim10752-fp8-linearblk-fa-nonshared-shared-f8bwd-ep2-outputs"
-description = "DeepSeek v2 training"
+dump_folder = "./outputs"
+description = "DeepSeek v2 debug training"
+print_args = false
+use_for_integration_test = true
 
 [profiling]
 enable_profiling = false
 save_traces_folder = "profile_trace"
-profile_freq = 100
+profile_freq = 10
+enable_memory_snapshot = false
+save_memory_snapshot_folder = "memory_snapshot"
 
 [metrics]
 log_freq = 1
-enable_tensorboard = true
+disable_color_printing = false
+enable_tensorboard = false
 save_tb_folder = "tb"
 enable_wandb = false
 
 [model]
-name = "DeepSeek"
-flavor = "V2-Dim10752"
-tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
-converters = ["float8"]
+name = "deepseek_v2"
+flavor = "deepseek-ai/DeepSeek-V2-Lite"
+# test tokenizer.model, for debug purpose only
+tokenizer_path = "./tests/assets/test_tiktoken.model"
+# converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
-lr = 4.2e-4
+lr = 4e-3
 eps = 1e-15
-# B1 = 0.9 / B2 = 0.95
+implementation = "foreach"
 
 [lr_scheduler]
-warmup_steps = 600  # lr scheduler warm up, normally 20% of the train steps
+warmup_steps = 100  # lr scheduler warm up, normally 20% of the train steps
 decay_ratio = 0.8  # lr scheduler decay ratio, 80% of the train steps
 decay_type = "linear"
 lr_min = 0.1
 
 [training]
-local_batch_size = 2
-seq_len = 4096
+local_batch_size = 2 # 8
+seq_len = 1024 # 2048
 max_norm = 1.0  # grad norm clipping
-steps = 3000
-compile = true
-dataset = "c4"
-seed = 1
+steps = 200
+compile = false
+dataset = "c4"  # supported datasets: c4_test (2K), c4 (177M)
 
 [parallelism]
 data_parallel_replicate_degree = 1
-data_parallel_shard_degree = -1
-tensor_parallel_degree = 2
+data_parallel_shard_degree = 2   # we use Zero2 so it's not really sharding per se...
+fsdp_reshard_after_forward = "default" # default / never / always
+tensor_parallel_degree = 1
 enable_async_tensor_parallel = false
 pipeline_parallel_degree = 1
 context_parallel_degree = 1
-enable_compiled_autograd = false
-enable_tp2ep = false
+# expert_parallel_degree = 2  set in custom_args
 
 [checkpoint]
 enable_checkpoint = false
 folder = "checkpoint"
-interval = 1000
+interval = 10
 model_weights_only = false
-export_dtype = "bfloat16"
+export_dtype = "float32"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = "none"  # ['none', 'selective', 'full']
+mode = "none"  # ["none", "selective", "full"]
+selective_ac_option = '2'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [float8]
 enable_fsdp_float8_all_gather = false
 precompute_float8_dynamic_scale_for_fsdp = false
-filter_fqns = ["output", "router.gate", "self_attn.q_a_proj", "self_attn.q_b_proj", "self_attn.kv_a_proj_with_mqa", "self_attn.kv_b_proj", "self_attn.q_proj", "self_attn.o_proj"]
-enable_fp8_fa = true
-fp8_fa_granularity = "blockwise"
-enable_fp8_gmm = true
-enable_fp8_linear = true
-recipe_name = "blockwise"
+filter_fqns = ["output", "router.gate"]
+
+[experimental]
+# expert parallelism is set here (default is 2)
+custom_args_module = "torchtitan.experiments.deepseek_v3.train_configs.custom_args"

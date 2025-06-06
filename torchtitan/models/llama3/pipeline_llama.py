@@ -108,28 +108,20 @@ def pipeline_llama_manual_split(
     ) -> tuple[PipelineStage, nn.Module]:
         model = copy.deepcopy(whole_model)
         if not is_first:
-            if hasattr(model, "tok_embeddings"):
-                model.tok_embeddings = None
-            else:
-                model.model.tok_embeddings = None
+            model.tok_embeddings = None
 
         drop_layers = start_layer is not None
-        layers = model.layers if hasattr(model,
-                                         "layers") else model.model.layers
-        for name in list(layers.keys()):
+        for name in list(model.layers.keys()):
             # we keep layers in a contiguous region between start (inclusive) and stop (exclusive)
             if f"layers.{name}" == start_layer:
                 drop_layers = False
             if f"layers.{name}" == stop_layer:
                 drop_layers = True
             if drop_layers:
-                del layers[name]
+                del model.layers[name]
 
         if not is_last:
-            if hasattr(model, "norm"):
-                model.norm = None
-            else:
-                model.model.norm = None
+            model.norm = None
             model.output = None
 
         stage = PipelineStage(

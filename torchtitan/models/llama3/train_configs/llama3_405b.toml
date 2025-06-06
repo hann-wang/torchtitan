@@ -19,7 +19,7 @@ save_tb_folder = "tb"
 name = "llama3"
 flavor = "405B"
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
-# converters = ["float8"]
+converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
@@ -50,7 +50,7 @@ enable_checkpoint = false
 folder = "checkpoint"
 interval = 500
 model_weights_only = false
-export_dtype = "bfloat16"
+export_dtype = "float32"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
@@ -60,5 +60,3 @@ mode = "full" # ["none", "selective", "full"]
 enable_fsdp_float8_all_gather = true
 precompute_float8_dynamic_scale_for_fsdp = true
 filter_fqns = ["output"]
-enable_fp8_fa = true
-fp8_fa_granularity = "blockwise"

@@ -72,9 +72,9 @@ def get_peak_flops(device_name: str) -> int:
         result = subprocess.run(["lspci"], stdout=subprocess.PIPE, text=True)
         # Filter the output for lines containing both "NVIDIA" and "H100"
         filtered_lines = [
-            line for line in result.stdout.splitlines()
-            if "NVIDIA" in line and "H100" in line or (
-                "AMD" in line and "Instinct" in line)
+            line
+            for line in result.stdout.splitlines()
+            if "NVIDIA" in line and "H100" in line
         ]
         # Join all filtered lines into a single string
         device_name = " ".join(filtered_lines) or device_name
@@ -102,8 +102,6 @@ def get_peak_flops(device_name: str) -> int:
         # MI300X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
         # MI325X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html
         return 1300e12
-    elif "MI308X" in device_name:
-        return 203e12
     elif "MI250X" in device_name:
         # data from https://www.amd.com/en/products/accelerators/instinct/mi200/mi250x.html (per GCD)
         return 191.5e12
@@ -169,19 +167,3 @@ def check_if_feature_in_pytorch(
             f"{min_nightly_version}. Please upgrade a newer version to include the "
             f"change in ({pull_request_link}) for correct {feature_name}."
         )
-
-
-def reset_params(mod: torch.nn.Module):
-    if hasattr(mod, "reset_parameters"):
-        mod.reset_parameters()
-    for cmod in mod.children():
-        reset_params(cmod)
-
-
-@torch.no_grad
-def convert_model_to_bfloat16(model: torch.nn.Module) -> None:
-    if hasattr(model, "freqs_cis"):
-        ori_device = model.freqs_cis.device
-    model.to(torch.bfloat16)
-    if hasattr(model, "freqs_cis"):
-        model.freqs_cis = model._precompute_freqs_cis().to(ori_device)

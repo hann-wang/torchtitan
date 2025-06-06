@@ -21,8 +21,6 @@ if [ $# -ne 0 ]; then
 fi
 
 PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
-FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="0" \
-FLASH_ATTENTION_TRITON_AMD_DEBUG="0" \
 torchrun --nproc_per_node=${NGPU} --rdzv_backend c10d --rdzv_endpoint="localhost:0" \
 --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
 convert_hf_to_dcp_with_gpus.py --job.config_file ${CONFIG_FILE} $overrides

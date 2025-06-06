@@ -8,9 +8,8 @@
 
 # use inference.sh "Your Question Here?" to run inference with a single prompt.
 
-import sys, os
+import sys
 from dataclasses import dataclass
-from typing import List
 
 import torch
 import torch.distributed as dist
@@ -18,22 +17,16 @@ import torch.distributed as dist
 from checkpoint import load_weights_from_hf
 from model import DeepseekForCausalLM
 from model_config import deepseek_config_registry
-from torch.distributed import get_process_group_ranks
-from torch.distributed.tensor import DTensor
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.pipelining import PipelineStage, ScheduleGPipe
 from transformers import AutoTokenizer
 
-import torchtitan.protocols.train_spec as train_spec_module
-from torchtitan.tools import utils
 from torchtitan.tools.utils import Color
-from torchtitan.config_manager import JobConfig, ConfigManager
-from torchtitan.distributed import ParallelDims, utils as dist_utils
 
 # Uncomment the model you want to run.
-model_id, model_path, config_file = "deepseek-ai/DeepSeek-V2-Lite-Chat", None, "train_configs/debug_model.toml"
-# model_id, model_path, config_file = "deepseek-ai/DeepSeek-V3-0324", None, "train_configs/deepseek_v3.toml"
+model_id, mesh_shape = "deepseek-ai/DeepSeek-V2-Lite-Chat", (1, 4)
+# model_id, mesh_shape = "deepseek-ai/deepseek-v3", (8, 4)
 
-if not model_path:
-    model_path = model_id
 
 def colorize_chat(text, user_color=None, assistant_color=None, output_color=None):
     """Parse and colorize chat output with optional colors for each role."""
@@ -117,17 +110,58 @@ def colorize_chat(text, user_color=None, assistant_color=None, output_color=None
 color = Color()
 
 
-def create_model(device: torch.device):
+@dataclass
+class DistConfig:
+    mesh: DeviceMesh
+    pp_mesh: DeviceMesh
+    ep_mesh: DeviceMesh
+    pp_size: int
+    ep_size: int
+    ep_rank: int
+    pp_rank: int
+    device: torch.device
+
+
+def create_model(dist_config: DistConfig):
     model_args = deepseek_config_registry[model_id]
+    model_args.ep_size = dist_config.ep_size
+    model_args.num_stages = dist_config.pp_size
+    model_args.stage_idx = dist_config.pp_rank
     model_args.max_seq_len = 4096  # 16384
 
-    with device:
+    with dist_config.device, dist_config.mesh:
         model = DeepseekForCausalLM(model_args)
-        model.to(torch.bfloat16)
-    load_weights_from_hf(model, model_path, device)
+    load_weights_from_hf(model, model_id, dist_config.device)
     model.eval()
+    model.setup_symm_mem(torch.bfloat16, dist_config.device)
 
-    return model
+    stage = PipelineStage(
+        model,
+        dist_config.pp_rank,
+        dist_config.pp_size,
+        dist_config.device,
+        group=dist_config.pp_mesh.get_group(),
+    )
+    pp_schedule = ScheduleGPipe(stage, dist_config.pp_size)
+    return model, pp_schedule
+
+
+def create_dist_config(mesh: DeviceMesh):
+    rank = dist.get_rank()
+    device_count = torch.cuda.device_count()
+    device = torch.device("cuda", rank % device_count)
+
+    dist_config = DistConfig(
+        mesh=mesh,
+        pp_mesh=mesh["pp"],
+        ep_mesh=mesh["ep"],
+        pp_rank=mesh["pp"].get_local_rank(),
+        pp_size=mesh["pp"].size(),
+        ep_size=mesh["ep"].size(),
+        ep_rank=mesh["ep"].get_local_rank(),
+        device=device,
+    )
+    return dist_config
 
 
 def decode(tokenizer, x):
@@ -185,20 +219,17 @@ def time_generation(func):
 @time_generation
 @torch.inference_mode()
 def generate(
-    model_parts: List[torch.nn.Module],
+    model,
     pp_schedule,
     tokenizer,
-    parallel_dims: ParallelDims,
+    dist_config,
     messages: list[dict],
     n_tokens: int = 200,
-    world_mesh: torch.distributed.device_mesh.DeviceMesh = None,
-    device: torch.device = torch.device("cpu"),
-    pp_has_first_stage: bool = False,
-    pp_has_last_stage: bool = False,
 ):
     rank = dist.get_rank()
+    device = dist_config.device
     x = tokenizer.apply_chat_template(
-        [messages] * parallel_dims.pp,
+        [messages] * dist_config.pp_size,
         add_generation_prompt=True,
         return_tensors="pt",
     )
@@ -209,41 +240,45 @@ def generate(
     tokens_generated = 0
     eos_token_id = tokenizer.eos_token_id
     # Create tensor on device for comparison
-    eos_tensor = torch.tensor([eos_token_id] * parallel_dims.pp, device=device)
+    eos_tensor = torch.tensor([eos_token_id], device=device)
 
     # Print initial progress indicator
     if rank == 0:
         print("Generating: ", end="", flush=True)
 
     for _ in range(n_tokens):
-        if parallel_dims.pp_enabled:
-            pp_group = world_mesh["pp"].get_group()
-            pp_ranks = get_process_group_ranks(pp_group)
-            if pp_has_first_stage:
+        if dist_config.pp_size > 1:
+            if dist_config.pp_rank == 0:
                 pp_schedule.step(x)
-            elif pp_has_last_stage:
+                torch.distributed.broadcast(
+                    x,
+                    group=dist_config.pp_mesh.get_group(),
+                    group_src=dist_config.pp_size - 1,
+                )
+            elif dist_config.pp_rank == dist_config.pp_size - 1:
                 preds = pp_schedule.step()
-                if isinstance(preds, DTensor):
-                    preds = preds.full_tensor()
                 next_token = torch.argmax(preds[:, next_idx - 1], dim=-1)
                 x[:, next_idx] = next_token
+                torch.distributed.broadcast(
+                    x,
+                    group=dist_config.pp_mesh.get_group(),
+                    group_src=dist_config.pp_size - 1,
+                )
+                # Break if EOS token is generated (without .item())
+                if torch.equal(next_token, eos_tensor):
+                    tokens_generated += 1
+                    break
             else:
                 pp_schedule.step()
-            torch.distributed.broadcast(
-                x,
-                group=world_mesh["pp"].get_group(),
-                group_src=pp_ranks[-1],
-            )
-            # Break if EOS token is generated (without .item())
-            if torch.equal(x[:, next_idx], eos_tensor):
-                tokens_generated += 1
-                break
+                torch.distributed.broadcast(
+                    x,
+                    group=dist_config.pp_mesh.get_group(),
+                    group_src=dist_config.pp_size - 1,
+                )
+
             next_idx += 1
         else:
-            assert len(model_parts) == 1
-            preds = model_parts[0](x)
-            if isinstance(preds, DTensor):
-                preds = preds.full_tensor()
+            preds = model(x)
             next_token = torch.argmax(preds[:, next_idx - 1], dim=-1)
             x[:, next_idx] = next_token
             next_idx += 1
@@ -267,51 +302,55 @@ def generate(
     return x, tokens_generated
 
 
-def apply_parallel(job_config: JobConfig, parallel_dims: ParallelDims,
-                   init_device: torch.device):
+@time_generation
+@torch.inference_mode()
+def generate_with_cuda_graph(
+    model,
+    tokenizer,
+    dist_config,
+    messages: list[dict],
+    n_tokens: int = 100,
+):
+    rank = dist.get_rank()
+    device = dist_config.device
+    x = tokenizer.apply_chat_template(
+        [messages] * dist_config.pp_size,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
+    next_idx = x.shape[-1]
+    x = torch.cat([x, torch.zeros(x.shape[0], n_tokens, dtype=torch.int64)], dim=-1)
+    x = x.to(device)
 
-    model = create_model(torch.device("cpu"))
-    train_spec = train_spec_module.get_train_spec(job_config.model.name)
-    model_args = train_spec.config[job_config.model.flavor]
-    pp_schedule = None
-    pp_has_first_stage = pp_has_last_stage = False
+    torch.cuda.synchronize()
+    eos_token_id = tokenizer.eos_token_id
+    # Create tensor on device for comparison
+    eos_tensor = torch.tensor([eos_token_id], device=device)
 
-    # apply parallelisms and initialization
-    if parallel_dims.pp_enabled:
-        if not train_spec.pipelining_fn:
-            raise RuntimeError(
-                f"Pipeline Parallel is enabled but {train_spec.name} "
-                f"does not support pipelining")
+    # Create CUDA graph
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        preds = model(x)
 
-        # apply both PT-D Pipeline Parallel and SPMD-style PT-D techniques
-        pp_schedule, model_parts, pp_has_first_stage, pp_has_last_stage = train_spec.pipelining_fn(
-            model,
-            world_mesh,
-            parallel_dims,
-            job_config,
-            device,
-            model_args,
-            train_spec.parallelize_fn,
-            None,
-        )
-        # when PP is enabled, `model` obj is no longer used after this point,
-        # model_parts is used instead
-        del model
+    # Run CUDA graph
+    tokens_generated = 0
+    for _ in range(n_tokens):
+        g.replay()
+        next_token = torch.argmax(preds[:, next_idx - 1], dim=-1)
+        x[:, next_idx] = next_token
+        next_idx += 1
+        tokens_generated += 1
 
-        for m in model_parts:
-            m.to(device=init_device)
-            m.eval()
-    else:
-        # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
-        model = train_spec.parallelize_fn(model, world_mesh,
-                                               parallel_dims, job_config)
+        # Break if EOS token is generated (without .item())
+        if torch.equal(next_token, eos_tensor):
+            break
 
-        model.to(device=init_device)
-        model.eval()
+    if rank == 0:
+        colored_output = decode(tokenizer, x)
+        print(f"With CUDA Graph:\n{colored_output}")
 
-        model_parts = [model]
+    return x, tokens_generated
 
-    return model_parts, pp_schedule, pp_has_first_stage, pp_has_last_stage
 
 if __name__ == "__main__":
     # Get user prompt from command line arguments
@@ -319,70 +358,26 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         user_prompt = sys.argv[1]
 
-    config_manager = ConfigManager()
-    job_config = config_manager.parse_args(["--job.config_file", config_file])
+    mesh = dist.init_device_mesh("cuda", mesh_shape, mesh_dim_names=("pp", "ep"))
+    rank = dist.get_rank()
+    if rank == 0:
+        print(
+            f"{color.yellow}Running inference with {model_id} on {mesh_shape} mesh{color.reset}"
+        )
 
-    device_module, device_type = utils.device_module, utils.device_type
-    is_distributed = 'LOCAL_RANK' in os.environ and 'WORLD_SIZE' in os.environ
-
-    if is_distributed:
-        device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
-        world_size = int(os.environ["WORLD_SIZE"])
-    else:
-        device = torch.device(f"{device_type}:0")
-        world_size = 1
-    device_module.set_device(device)
-
-    parallelism_config = job_config.parallelism
-    parallelism_config.pipeline_parallel_schedule = "GPipe"
-    parallel_dims = ParallelDims(
-        dp_shard=parallelism_config.data_parallel_shard_degree,
-        dp_replicate=parallelism_config.data_parallel_replicate_degree,
-        cp=parallelism_config.context_parallel_degree,
-        tp=parallelism_config.tensor_parallel_degree,
-        pp=parallelism_config.pipeline_parallel_degree,
-        world_size=world_size,
-        enable_loss_parallel=not parallelism_config.disable_loss_parallel,
-    )
-    if is_distributed:
-        dist_utils.init_distributed(job_config)
-        world_mesh = parallel_dims.build_mesh(device_type=device_type)
-    else:
-        world_mesh = None
-
-    dist_utils.set_determinism(
-        world_mesh,
-        device,
-        job_config.training.seed,
-        job_config.training.deterministic,
-    )
-
+    dist_config = create_dist_config(mesh)
+    model, pp_schedule = create_model(dist_config)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-
-    model_parts, pp_schedule, pp_has_first_stage, pp_has_last_stage = apply_parallel(
-        job_config,
-        parallel_dims,
-        device_type,
-    )
 
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": user_prompt},
     ]
 
-    generate(
-        model_parts,
-        pp_schedule,
-        tokenizer,
-        parallel_dims,
-        messages,
-        world_mesh=world_mesh,
-        device=device_type,
-        pp_has_first_stage=pp_has_first_stage,
-        pp_has_last_stage=pp_has_last_stage,
-    )
+    generate(model, pp_schedule, tokenizer, dist_config, messages)
+    generate_with_cuda_graph(model, tokenizer, dist_config, messages)
 
-    if dist.get_rank() == 0:
+    if rank == 0:
         print(f"\n{color.yellow}Closing inference mesh...{color.reset}")
 
     dist.destroy_process_group()

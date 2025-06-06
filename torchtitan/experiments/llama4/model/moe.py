@@ -15,7 +15,6 @@ from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward imp
 
 from .args import TransformerModelArgs
 
-USE_CG_GROUPED_GEMM = True
 ALIGN_SIZE_M = 128
 
 class GroupedExperts(nn.Module):
@@ -32,7 +31,6 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.use_grouped_mm = use_grouped_mm
-        self.use_fp8 = False
 
     def forward(
         self,
@@ -55,7 +53,6 @@ class GroupedExperts(nn.Module):
             experts_per_rank = self.num_experts
 
         if not self.use_grouped_mm:
-            assert not self.use_fp8
             if num_local_tokens_per_expert is not None:
                 # a tuple of tensors indexed by experts
                 # each with shape (tokens_per_expert(varying), dim)
@@ -105,49 +102,32 @@ class GroupedExperts(nn.Module):
                 num_local_tokens_per_expert, dim=0, dtype=torch.int32
             )
 
-            if USE_CG_GROUPED_GEMM:
-                from torchtitan.experiments.deepseek_v3 import dsgemm_utils
+            from torchtitan.experiments.deepseek_v3 import dsgemm_utils
 
-                # Create indices from offsets without CPU-GPU sync
-                m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
-                    offsets)
-                gate_proj = cg_grouped_gemm(
-                    x,
-                    w1,
-                    m_indices,
-                    use_fp8=self.use_fp8,
-                )
-                up_proj = cg_grouped_gemm(
-                    x,
-                    w3,
-                    m_indices,
-                    use_fp8=self.use_fp8,
-                )
-                # Apply activation
-                hidden_outputs = F.silu(gate_proj) * up_proj
-                # Run the third GEMM (down projection)
-                out = cg_grouped_gemm(
-                    hidden_outputs,
-                    w2,
-                    m_indices,
-                    use_fp8=self.use_fp8,
-                )
-            else:
-                assert not self.use_fp8
-                # FIXME: grouped_mm does not require padded m_sizes
-                from .grouped_mm_utils import gmm
-                num_local_tokens_per_expert_cpu = num_local_tokens_per_expert.to(
-                    dtype=torch.int64, device="cpu")
-                g = gmm(x.contiguous(), w1.contiguous(),
-                        num_local_tokens_per_expert_cpu.contiguous())
-                assert not torch.isnan(g).any(), "NaN detected in grouped mm gate projection"
-                h = F.silu(g)
-                h = h * gmm(x, w3, num_local_tokens_per_expert_cpu)
-                out = gmm(h, w2, num_local_tokens_per_expert_cpu)
+            # Create indices from offsets without CPU-GPU sync
+            m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
+                offsets)
+            gate_proj = cg_grouped_gemm(
+                x,
+                w1,
+                m_indices,
+            )
+            up_proj = cg_grouped_gemm(
+                x,
+                w3,
+                m_indices,
+            )
+            # Apply activation
+            hidden_outputs = F.silu(gate_proj) * up_proj
+            # Run the third GEMM (down projection)
+            out = cg_grouped_gemm(
+                hidden_outputs,
+                w2,
+                m_indices,
+            )
         else:
             bs, slen, dim = x.shape
             x = x.reshape(1, bs * slen, dim)
-            assert not self.use_fp8
             # fall back to regular bmm between 3D tensors
             # x shape (num_experts, tokens_per_expert, dim)
             h = F.silu(torch.bmm(x, w1))
@@ -181,22 +161,12 @@ class TokenChoiceTopKRouter(nn.Module):
         num_experts: int,
         top_k: int,
         use_sigmoid: bool = False,
-        norm_topk_prob: bool = False,
-        routed_scaling_factor: float | None = None,
-        topk_method: str = "noaux",
-        n_group: int = 1,
-        topk_group: int = 1,
     ):
         super().__init__()
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.num_experts = num_experts
         self.top_k = top_k
         self.use_sigmoid = use_sigmoid
-        self.norm_topk_prob = norm_topk_prob
-        self.routed_scaling_factor = routed_scaling_factor
-        self.topk_method = topk_method
-        self.n_group = n_group
-        self.topk_group = topk_group
 
     def forward(
         self, x: torch.Tensor, expert_bias: torch.Tensor = None
@@ -214,7 +184,6 @@ class TokenChoiceTopKRouter(nn.Module):
                 Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
         # scores shape (bs*slen, num_experts)
-        num_tokens = x.shape[0]
         scores = self.gate(x)
 
         # By default, sigmoid or softmax is performed in float32 to avoid loss explosion
@@ -223,64 +192,13 @@ class TokenChoiceTopKRouter(nn.Module):
         else:
             scores = F.softmax(scores.to(torch.float32), dim=1)
 
-        match self.topk_method:
-            case "greedy":
-                top_scores, selected_experts_indices = torch.topk(
-                    scores,
-                    k=self.top_k,
-                    dim=1,
-                    sorted=False,
-                )
-            case "noaux":
-                _, selected_experts_indices = torch.topk(
-                    scores + expert_bias,
-                    k=self.top_k,
-                    dim=1,
-                    sorted=False,
-                )
-                # top scores shape (bs*slen, top_k)
-                # NOTE: The expert_bias is only used for routing. The gating value
-                #       top_scores is still derived from the original scores.
-                top_scores = scores.gather(dim=1, index=selected_experts_indices)
-            case "noaux_tc":
-                assert self.num_experts % self.n_group == 0, (
-                    "num_experts must be divisible by n_group for noaux_tc routing"
-                )
-                scores_for_choice = scores + expert_bias.unsqueeze(0)
-                group_scores = (scores_for_choice.view(
-                    num_tokens, self.n_group,
-                    -1).topk(2, dim=-1)[0].sum(dim=-1))  # [n, n_group]
-                group_idx = torch.topk(
-                    group_scores, k=self.topk_group, dim=-1, sorted=False
-                )[
-                    1
-                ]  # [n, top_k_group]
-                group_mask = torch.zeros_like(group_scores)  # [n, n_group]
-                group_mask.scatter_(1, group_idx, 1)  # [n, n_group]
-                score_mask = (group_mask.unsqueeze(-1).expand(
-                    num_tokens, self.n_group,
-                    self.num_experts // self.n_group).reshape(num_tokens,
-                                                              -1))  # [n, e]
-                tmp_scores = scores_for_choice.masked_fill(
-                    ~score_mask.bool(), 0.0
-                )  # [n, e]
-                _, selected_experts_indices = torch.topk(
-                    tmp_scores,
-                    k=self.top_k,
-                    dim=-1,
-                    sorted=False,
-                )
-                top_scores = scores.gather(1, selected_experts_indices)
-            case _:
-                raise ValueError(f"Unknown topk method: {self.topk_method}")
-
-
-        # norm gate to sum 1
-        if self.top_k > 1 and self.norm_topk_prob:
-            denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
-            top_scores = top_scores / denominator
-        if self.routed_scaling_factor is not None:
-            top_scores = top_scores * self.routed_scaling_factor
+        # top scores shape (bs*slen, top_k)
+        # NOTE: The expert_bias is only used for routing. The gating value
+        #       top_scores is still derived from the original scores.
+        _, selected_experts_indices = torch.topk(
+            scores + expert_bias, k=self.top_k, dim=1
+        )
+        top_scores = scores.gather(dim=1, index=selected_experts_indices)
 
         # group tokens together by expert indices from 0 to num_experts and pass that to experts forward
         num_local_tokens_per_expert = torch.histc(
@@ -319,7 +237,6 @@ class MoE(nn.Module):
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
 
         num_experts = model_args.num_experts
-        self.topk_method = model_args.topk_method
 
         hidden_dim_denom = 1
         if model_args.auto_scale_hidden_dim:
@@ -337,10 +254,7 @@ class MoE(nn.Module):
             use_grouped_mm=self.use_grouped_mm,
         )
         self.router = TokenChoiceTopKRouter(
-            dim=dim,
-            num_experts=num_experts,
-            top_k=model_args.top_k,
-            topk_method=self.topk_method,
+            dim=dim, num_experts=num_experts, top_k=model_args.top_k
         )
         self.shared_expert = (
             GroupedExperts(
@@ -357,21 +271,11 @@ class MoE(nn.Module):
         self.load_balance_coeff = model_args.load_balance_coeff
         # the fields below are defined even when load_balance_coeff is None
         # to make initialization and checkpointing code simpler
-        if self.topk_method == "noaux_tc":
-            # Changed from torch.empty to torch.rand to avoid non-even
-            # distribution for runs without actual weigths
-            self.register_parameter(
-                "expert_bias",
-                torch.nn.Parameter(
-                    torch.randn(num_experts, dtype=torch.get_default_dtype())),
-            )
-        else:
-            self.register_buffer(
-                "expert_bias",
-                torch.randn(num_experts, dtype=torch.get_default_dtype()),
-                persistent=True,
-            )
-
+        self.register_buffer(
+            "expert_bias",
+            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            persistent=True,
+        )
         self.register_buffer(
             "tokens_per_expert",
             torch.zeros(num_experts, dtype=torch.get_default_dtype()),
@@ -416,9 +320,8 @@ class MoE(nn.Module):
             num_local_tokens_per_expert,
         ) = self.router(x.reshape(bs * slen, dim), expert_bias)
 
-        if self.topk_method == "noaux":
-            # will be used to update the expert bias for load balancing
-            self.tokens_per_expert += num_local_tokens_per_expert
+        # will be used to update the expert bias for load balancing
+        self.tokens_per_expert += num_local_tokens_per_expert
 
         # shape (bs*slen*top_k, dim)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
@@ -436,6 +339,7 @@ class MoE(nn.Module):
         if isinstance(
                 self.experts.w1, DTensor) and self.experts.w1.placements == (
                     Shard(0), ) and self.experts.w1.device_mesh.size() > 1:
+            print("EP enabled!!!!!")
             # expert parallel enabled
             ep_size = self.experts.w1.device_mesh.size()
             ep_group = self.experts.w1.device_mesh.get_group()
@@ -579,12 +483,17 @@ class MoE(nn.Module):
     def init_weights(
         self,
         init_std: float,
-        buffer_device: torch.device | None = None,
+        buffer_device: torch.device,
     ):
         self.experts.init_weights(init_std)
         self.router.init_weights(init_std)
         if self.shared_expert is not None:
             self.shared_expert.init_weights(init_std)
 
-        nn.init.normal_(self.expert_bias)
-        nn.init.zeros_(self.tokens_per_expert)
+        with torch.device(buffer_device):
+            self.expert_bias = torch.zeros(
+                self.experts.num_experts, dtype=torch.float32
+            )
+            self.tokens_per_expert = torch.zeros(
+                self.experts.num_experts, dtype=torch.float32
+            )

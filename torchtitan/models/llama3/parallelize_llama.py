@@ -53,7 +53,7 @@ def parallelize_llama(
         ):
             raise RuntimeError("Async TP requires --training.compile")
 
-        enable_float8_linear = "float8" in job_config.model.converters and job_config.float8.enable_fp8_linear
+        enable_float8_linear = "float8" in job_config.model.converters
         float8_is_rowwise = job_config.float8.recipe_name in (
             "rowwise",
             "rowwise_with_gw_hp",
@@ -175,8 +175,7 @@ def apply_tp(
     # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
     #       by folding (and unfolding) the batch dimension and the sequence dimension.
     #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
-    layers = model.layers if hasattr(model, "layers") else model.model.layers
-    for transformer_block in layers.values():
+    for transformer_block in model.layers.values():
         layer_plan = {
             "attention_norm": SequenceParallel(),
             "attention": prepare_module_input(
@@ -292,23 +291,21 @@ def _apply_ac_to_transformer_block(module: nn.Module, ac_config):
 
 def apply_ac(model: nn.Module, ac_config):
     """Apply activation checkpointing to the model."""
-    layers = model.layers if hasattr(model, "layers") else model.model.layers
-    for layer_id, transformer_block in layers.named_children():
+    for layer_id, transformer_block in model.layers.named_children():
         transformer_block = _apply_ac_to_transformer_block(transformer_block, ac_config)
-        layers.register_module(layer_id, transformer_block)
+        model.layers.register_module(layer_id, transformer_block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
 
 
-def apply_compile(model: nn.Module, fullgraph: bool = True):
+def apply_compile(model: nn.Module):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
     """
-    layers = model.layers if hasattr(model, "layers") else model.model.layers
-    for layer_id, transformer_block in layers.named_children():
-        transformer_block = torch.compile(transformer_block, fullgraph=fullgraph)
-        layers.register_module(layer_id, transformer_block)
+    for layer_id, transformer_block in model.layers.named_children():
+        transformer_block = torch.compile(transformer_block, fullgraph=True)
+        model.layers.register_module(layer_id, transformer_block)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
 
@@ -344,8 +341,7 @@ def apply_fsdp(
     if cpu_offload:
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
-    layers = model.layers if hasattr(model, "layers") else model.model.layers
-    for layer_id, transformer_block in layers.items():
+    for layer_id, transformer_block in model.layers.items():
         if reshard_after_forward_policy == "always":
             reshard_after_forward = True
         elif reshard_after_forward_policy == "never":
@@ -358,7 +354,7 @@ def apply_fsdp(
             else:
                 # As an optimization, do not reshard after forward for the last
                 # transformer block since FSDP would prefetch it immediately
-                reshard_after_forward = int(layer_id) < len(layers) - 1
+                reshard_after_forward = int(layer_id) < len(model.layers) - 1
         else:
             raise ValueError(
                 f"Invalid reshard_after_forward_policy: {reshard_after_forward_policy}."

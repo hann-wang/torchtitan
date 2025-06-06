@@ -315,7 +315,6 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
-
     total_norm = torch.nn.utils.get_total_norm(
         grads, norm_type, error_if_nonfinite, foreach
     )
@@ -342,10 +341,3 @@ def clip_grad_norm_(
 
     torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
     return total_norm
-
-
-def reset_params(mod: torch.nn.Module):
-    if hasattr(mod, "reset_parameters"):
-        mod.reset_parameters()
-    for cmod in mod.children():
-        reset_params(cmod)

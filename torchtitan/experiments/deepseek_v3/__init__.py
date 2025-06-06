@@ -9,75 +9,39 @@ from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
 from torchtitan.components.optimizer import build_optimizers
 from torchtitan.datasets.hf_datasets import build_hf_dataloader
-from torchtitan.datasets.tokenizer.tiktoken import build_tiktoken_tokenizer
+from torchtitan.experiments.deepseek_v3.tokenizers.hf_tokenizer import get_hf_tokenizer
+
+# ToDO - this is not suitable for deepseek but using for now...
+from torchtitan.models.llama3 import pipeline_llama
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
-from torchtitan.models.llama3 import pipeline_llama
 from .infra.parallelize_deepseek import parallelize_deepseek
-from .model_config import (
-    ModelArgs,
-    deepseek_config_registry,
-    deepseek_v2_dim10752_config,
-    deepseek_v3_lite_config,
-)
+
 from .model import DeepseekForCausalLM
 
+from .model_args import TransformerModelArgs
+
+
 __all__ = [
-    "ModelArgs",
+    "TransformerModelArgs",
     "DeepseekForCausalLM",
-    "llama4_configs",
+    "deepseek_configs",
 ]
 
+
 deepseek_configs = {
-    "debugmodel":
-    ModelArgs(
-        vocab_size=102400,
-        hidden_size=2048,
-        intermediate_size=1024,
-        moe_intermediate_size=512,
-        num_hidden_layers=2,
-        num_attention_heads=8,
-        num_key_value_heads=8,
-        n_shared_experts=1,
-        n_routed_experts=8,
-        routed_scaling_factor=1.0,
-        kv_lora_rank=512,
-        q_lora_rank=None,
-        qk_rope_head_dim=64,
-        v_head_dim=64,
-        qk_nope_head_dim=64,
-        topk_method="noaux_tc",
-        n_group=4,
-        topk_group=2,
-        num_experts_per_tok=2,
-        first_k_dense_replace=1,
-        norm_topk_prob=False,
-        scoring_func="softmax",
-        max_position_embeddings=4096,
-        rope_scaling={
-            "beta_fast": 32,
-            "beta_slow": 1,
-            "factor": 40,
-            "mscale": 0.707,
-            "mscale_all_dim": 0.707,
-            "original_max_position_embeddings": 4096,
-            "type": "yarn",
-        },
-        load_balance_coeff=None,
+    "debugmodel": TransformerModelArgs(
+        dim=256,
+        n_layers=6,
+        n_heads=16,
+        rope_theta=500000,
     ),
-    "V2-Lite":
-    deepseek_config_registry["deepseek-ai/DeepSeek-V2-Lite"],
-    "V3":
-    deepseek_config_registry["deepseek-ai/deepseek-v3"],
-    "V2-Dim10752":
-    deepseek_v2_dim10752_config,
-    "V3-Lite":
-    deepseek_v3_lite_config,
 }
+
 
 register_train_spec(
     TrainSpec(
-        name="DeepSeek",
+        name="deepseek3",
         cls=DeepseekForCausalLM,
         config=deepseek_configs,
         parallelize_fn=parallelize_deepseek,
@@ -85,6 +49,7 @@ register_train_spec(
         build_optimizers_fn=build_optimizers,
         build_lr_schedulers_fn=build_lr_schedulers,
         build_dataloader_fn=build_hf_dataloader,
-        build_tokenizer_fn=build_tiktoken_tokenizer,
+        build_tokenizer_fn=get_hf_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
-    ))
+    )
+)

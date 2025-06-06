@@ -15,6 +15,7 @@ from torchtitan.protocols.train_spec import BaseModelArgs
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
+
 @dataclass
 class TransformerModelArgs(BaseModelArgs):
     dim: int = 4096
@@ -56,7 +57,6 @@ class TransformerModelArgs(BaseModelArgs):
     top_k: int = 1
     use_grouped_mm: bool = True  # grouped mm or for-loop for the experts computation
     load_balance_coeff: float | None = 1e-3
-    topk_method: str = "noaux"
 
     def update_from_config(self, job_config: JobConfig, tokenizer: Tokenizer) -> None:
         self.vocab_size = tokenizer.n_words
