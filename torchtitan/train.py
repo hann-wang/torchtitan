@@ -33,8 +33,6 @@ from torchtitan.tools.profiling import (
 )
 
 
-torch.set_default_dtype(torch.bfloat16)
-
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     job_config: JobConfig
     gc_handler: utils.GarbageCollection
@@ -76,18 +74,12 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             logger.info(f"Running with args: {job_config.to_dict()}")
 
         device_module, device_type = utils.device_module, utils.device_type
-        self.is_distributed = 'LOCAL_RANK' in os.environ and 'WORLD_SIZE' in os.environ
-
-        if self.is_distributed:
-            self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
-            world_size = int(os.environ["WORLD_SIZE"])
-        else:
-            self.device = torch.device(f"{device_type}:0")
-            world_size = 1
+        self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
 
         # init distributed
+        world_size = int(os.environ["WORLD_SIZE"])
         parallelism_config = job_config.parallelism
         self.parallel_dims = parallel_dims = ParallelDims(
             dp_shard=parallelism_config.data_parallel_shard_degree,
@@ -98,12 +90,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             world_size=world_size,
             enable_loss_parallel=not parallelism_config.disable_loss_parallel,
         )
-        if self.is_distributed:
-            dist_utils.init_distributed(job_config)
-            self.world_mesh = world_mesh = parallel_dims.build_mesh(device_type=device_type)
-        else:
-            self.world_mesh = world_mesh = None
+        dist_utils.init_distributed(job_config)
 
+        # build meshes
+        self.world_mesh = world_mesh = parallel_dims.build_mesh(device_type=device_type)
         if parallel_dims.dp_enabled:
             dp_mesh = world_mesh["dp"]
             dp_degree, dp_rank = dp_mesh.size(), dp_mesh.get_local_rank()
@@ -513,7 +503,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
                 # reduce timeout after first train step for faster signal
                 # (assuming lazy init and compilation are finished)
-                if self.is_distributed and self.step == 1:
+                if self.step == 1:
                     dist_utils.set_pg_timeouts(
                         timeout=timedelta(
                             seconds=job_config.comm.train_timeout_seconds
@@ -521,7 +511,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                         world_mesh=self.world_mesh,
                     )
 
-        if not self.is_distributed or torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
             time.sleep(2)
 

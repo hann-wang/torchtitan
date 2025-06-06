@@ -7,29 +7,18 @@
 
 import torch
 import triton
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._op_schema import PlacementList
-from torch.distributed.tensor.placement_types import (
-    Partial,
-    Replicate,
-    Shard,
-)
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
 
-from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_forward import cg_grouped_gemm_forward
-from torchtitan.experiments.kernels.triton_contiguous_group_gemm.tma_cuda_autotune import (
-    STANDARD_CONFIGS,
-    early_config_prune,
-)
+from tma_cuda_autotune import early_config_prune, STANDARD_CONFIGS
 
 # ============ Triton kernel for contiguous grouped GEMM backward inputs ============
 
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["N", "K"],
+    key=["M_TOTAL", "N", "K"],
     prune_configs_by={"early_config_prune": early_config_prune},
 )
 @triton.jit
@@ -41,7 +30,7 @@ def _kernel_cg_backward_dx(
     # Pointer to indices array
     indices_ptr,  # [M_TOTAL]
     # Matrix dimensions
-    M_TOTAL,  # Total M dimension (sum of all groups)
+    M_TOTAL: tl.constexpr,  # Total M dimension (sum of all groups)
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
     # Number of experts
@@ -131,7 +120,7 @@ def _kernel_cg_backward_dw(
     grad_weights_ptr,  # [num_experts, N, K]
     indices_ptr,  # [M_total]
     # Matrix dimensions
-    M_TOTAL,  # Total M dimension
+    M_TOTAL: tl.constexpr,  # Total M dimension
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
     # Number of experts
@@ -247,14 +236,8 @@ def cg_grouped_gemm_backward_weights(
     assert expert_indices.is_contiguous(), "Expert indices tensor must be contiguous"
 
     # Get dimensions
-    _, N = grad_output.shape
-    M_bufferlen, K = inputs.shape
-    M_total = expert_indices.shape[0]
-
-    # Check if dimensions match
-    assert (
-        M_total % group_size_m == 0
-    ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
+    M_total, N = grad_output.shape
+    _, K = inputs.shape
 
     # Ensure expert_indices has the right dtype
     if expert_indices.dtype != torch.int32:
@@ -320,9 +303,8 @@ def cg_grouped_gemm_backward_inputs(
     assert expert_indices.is_contiguous(), "Expert indices tensor must be contiguous"
 
     # Get dimensions
-    M_bufferlen, N = grad_output.shape
+    M_total, N = grad_output.shape
     num_experts, _, K = expert_weights.shape
-    M_total = expert_indices.shape[0]
 
     # Check if dimensions match
     assert (
@@ -330,9 +312,9 @@ def cg_grouped_gemm_backward_inputs(
     ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
 
     # Create output tensor for gradients
-    grad_inputs = torch.zeros((M_bufferlen, K),
-                              device=grad_output.device,
-                              dtype=grad_output.dtype)
+    grad_inputs = torch.zeros(
+        (M_total, K), device=grad_output.device, dtype=grad_output.dtype
+    )
 
     # Calculate grid size for the kernel
     grid = lambda meta: (
@@ -367,6 +349,7 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs, expert_weights, expert_indices, group_size_m=128):
         """Forward pass for contiguous grouped GEMM."""
+        from cg_forward import cg_grouped_gemm_forward
 
         # Save for backward
         ctx.save_for_backward(inputs, expert_weights, expert_indices)
@@ -415,21 +398,6 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
 
         return grad_inputs, grad_weights, grad_indices, grad_group_size_m
 
-single_mesh_dim_strategies = []
-replicate_colwise_2x3: PlacementList = [
-    Shard(1),
-    Replicate(),  # mat1
-    Shard(2),  # mat2
-    Replicate(),  # offs
-]
-colwise_rowwise_2x3: PlacementList = [
-    Partial(),
-    Shard(1),  # mat1
-    Shard(1),  # mat2
-    Replicate(),  # offs
-]
-single_mesh_dim_strategies.extend(
-    [replicate_colwise_2x3, colwise_rowwise_2x3])
 
 def cg_grouped_gemm(
     inputs: torch.Tensor,
@@ -452,35 +420,9 @@ def cg_grouped_gemm(
     if expert_indices.dtype != torch.int32:
         expert_indices = expert_indices.to(torch.int32)
 
-    tp_mesh = None
-    if isinstance(inputs, DTensor):
-        tp_mesh = inputs.device_mesh
-        output_placement = None
-        for available_placement in single_mesh_dim_strategies:
-            if available_placement[1:] == [
-                    inputs.placements[-1], expert_weights.placements[-1],
-                    expert_indices.placements[-1]
-            ]:
-                output_placement = available_placement[0]
-                break
-        assert output_placement is not None, "No suitable placement found for CG-Grouped-Gemm"
-        inputs = inputs.to_local()
-        expert_weights = expert_weights.to_local()
-        expert_indices = expert_indices.to_local()
-    expert_weights = expert_weights.transpose(-1, -2).contiguous()
-    res = ContiguousGroupedGEMM.apply(
+    return ContiguousGroupedGEMM.apply(
         inputs, expert_weights, expert_indices, group_size_m
     )
-
-    if tp_mesh is not None:
-        # Convert result to DTensor with appropriate placements
-        res = DTensor.from_local(
-            res,
-            device_mesh=tp_mesh,
-            placements=(output_placement, ),
-            run_check=False,
-        )
-    return res
 
 
 # =============== Test functions for verifying correctness =================

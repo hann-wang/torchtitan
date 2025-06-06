@@ -16,8 +16,6 @@
 from typing import Tuple
 
 import torch
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Replicate
 
 _num_sms = None
 
@@ -92,53 +90,7 @@ def prepare_fp8_weight(w):
     return (w_fp8, w_scales)
 
 
-# def create_indices_from_offsets_nosync_internal(
-#         m_offsets: torch.Tensor) -> torch.Tensor:
-#     # Get total size from the last offset
-#     total_size = m_offsets[-1]
-
-#     # Pre-allocate output tensor
-#     indices = torch.empty(total_size, device=m_offsets.device, dtype=torch.int32)
-
-#     # Create a range tensor for each section
-#     prev_offset = torch.zeros(1, device=m_offsets.device, dtype=m_offsets.dtype)
-
-#     for i in range(len(m_offsets)):
-#         # Calculate current section size
-#         section_size = m_offsets[i] - prev_offset
-
-#         # Only fill if section has elements
-#         if section_size > 0:
-#             indices[prev_offset : m_offsets[i]] = i
-
-#         # Update prev_offset for next iteration
-#         prev_offset = m_offsets[i]
-
-#     return indices
-
-
-def create_indices_from_offsets_nosync_internal(
-        m_offsets: torch.Tensor) -> torch.Tensor:
-    """
-    Create indices tensor from offsets tensor, compatible with torch.compile.
-    Args:
-        m_offsets: 1D tensor of offsets, shape [num_groups], monotonically increasing.
-    Returns:
-        indices: 1D tensor of shape [m_offsets[-1]], where each position contains its group index.
-    """
-    total_size = m_offsets[-1]
-    all_indices = torch.arange(total_size,
-                               device=m_offsets.device,
-                               dtype=torch.int32)
-    indices = torch.bucketize(all_indices,
-                              m_offsets,
-                              right=True,
-                              out_int32=True)
-    return indices
-
-
-def create_indices_from_offsets_nosync(
-        m_offsets: torch.Tensor) -> torch.Tensor:
+def create_indices_from_offsets_nosync(m_offsets: torch.Tensor) -> torch.Tensor:
     """
     Create m_indices tensor from m_offsets tensor without CPU-GPU sync points.
 
@@ -149,22 +101,28 @@ def create_indices_from_offsets_nosync(
     Returns:
         m_indices: Tensor mapping each row to its group index
     """
+    # Get total size from the last offset
+    total_size = m_offsets[-1]
 
-    device_mesh = None
-    if isinstance(m_offsets, DTensor):
-        assert m_offsets.placements == (Replicate(), )
-        device_mesh = m_offsets.device_mesh
-        m_offsets = m_offsets.to_local()
+    # Pre-allocate output tensor
+    indices = torch.empty(total_size, device=m_offsets.device, dtype=torch.int32)
 
-    res = create_indices_from_offsets_nosync_internal(m_offsets)
-    if device_mesh is not None:
-        res = DTensor.from_local(
-            res,
-            device_mesh,
-            (Replicate(), ),
-            run_check=False,
-        )
-    return res
+    # Create a range tensor for each section
+    prev_offset = torch.zeros(1, device=m_offsets.device, dtype=m_offsets.dtype)
+
+    for i in range(len(m_offsets)):
+        # Calculate current section size
+        section_size = m_offsets[i] - prev_offset
+
+        # Only fill if section has elements
+        if section_size > 0:
+            indices[prev_offset : m_offsets[i]] = i
+
+        # Update prev_offset for next iteration
+        prev_offset = m_offsets[i]
+
+    return indices
+
 
 def create_m_indices_from_offsets(m_offsets: torch.Tensor) -> torch.Tensor:
     """

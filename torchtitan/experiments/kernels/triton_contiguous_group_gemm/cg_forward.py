@@ -44,7 +44,7 @@ def _compute_pid(tile_id, num_pid_in_group, num_pid_m, super_group_m):
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["N", "K"],
+    key=["M_TOTAL", "N", "K"],
     prune_configs_by={"early_config_prune": early_config_prune},
 )
 @triton.jit
@@ -56,7 +56,7 @@ def _kernel_cg_persistent_forward(
     # Pointer to indices array
     indices_ptr,
     # Matrix dimensions
-    M_TOTAL,  # Total M dimension (sum of all groups)
+    M_TOTAL: tl.constexpr,  # Total M dimension (sum of all groups)
     N: tl.constexpr,  # N dimension
     K: tl.constexpr,  # K dimension
     # Number of experts
@@ -159,7 +159,7 @@ def _kernel_cg_persistent_forward(
 
 @triton.autotune(
     configs=STANDARD_CONFIGS,
-    key=["N", "K"],
+    key=["M_TOTAL", "N", "K"],
     prune_configs_by={"early_config_prune": early_config_prune},
 )
 @triton.jit
@@ -283,8 +283,7 @@ def cg_grouped_gemm_forward(
     assert expert_indices.is_contiguous(), "Expert indices tensor must be contiguous"
 
     # Check if inputs are properly aligned
-    M_bufferlen, K = inputs.shape
-    M_total = expert_indices.shape[0]
+    M_total, K = inputs.shape
     assert (
         M_total % group_size_m == 0
     ), f"M_total ({M_total}) must be a multiple of group_size_m ({group_size_m})"
@@ -303,9 +302,7 @@ def cg_grouped_gemm_forward(
     ), "Expert indices length must match M_total"
 
     # Create output tensor
-    output = torch.zeros((M_bufferlen, N),
-                         device=inputs.device,
-                         dtype=torch.bfloat16)
+    output = torch.empty((M_total, N), device=inputs.device, dtype=torch.bfloat16)
 
     # Calculate grid size for the kernel
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count

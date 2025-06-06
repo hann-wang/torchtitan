@@ -10,8 +10,6 @@ from torch import nn
 import torch.distributed as dist
 from torch.distributed._functional_collectives import all_to_all_single_autograd
 from torch.distributed.tensor import DTensor, Shard
-from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
-    cg_grouped_gemm, )
 
 from .args import TransformerModelArgs
 
@@ -36,9 +34,8 @@ class GroupedExperts(nn.Module):
         x: torch.Tensor,
         num_local_tokens_per_expert: torch.Tensor | list[int] | None = None,
     ) -> torch.Tensor:
-        # TODO: keeping this for loop implementation for comparison
-        #       and readability, will remove later
-        if isinstance(self.w1, DTensor) and self.w1.placements == (Shard(0),) and self.w1.device_mesh.size() > 1:
+        if isinstance(self.w1, DTensor) and self.w1.placements == (
+                Shard(0), ) and self.w1.device_mesh.size() > 1:
             # expert parallel enabled
             w1 = self.w1.to_local()
             w2 = self.w2.to_local()
@@ -51,6 +48,8 @@ class GroupedExperts(nn.Module):
             w3 = self.w3
             experts_per_rank = self.num_experts
 
+        # TODO: keeping this for loop implementation for comparison
+        #       and readability, will remove later
         if not self.use_grouped_mm:
             if num_local_tokens_per_expert is not None:
                 # a tuple of tensors indexed by experts
@@ -95,42 +94,18 @@ class GroupedExperts(nn.Module):
             )
             # grouped mm between a 2D tensor and a 3D tensor
             assert x.dim() == 2
-
-            from torchtitan.experiments.deepseek_v3 import dsgemm_utils
-
-            # Create indices from offsets without CPU-GPU sync
-            m_indices = dsgemm_utils.create_indices_from_offsets_nosync(
-                offsets)
-            gate_proj = cg_grouped_gemm(
-                x,
-                w1,
-                m_indices,
-            )
-            up_proj = cg_grouped_gemm(
-                x,
-                w3,
-                m_indices,
-            )
-            # Apply activation
-            hidden_outputs = F.silu(gate_proj) * up_proj
-            # Run the third GEMM (down projection)
-            out = cg_grouped_gemm(
-                hidden_outputs,
-                w2,
-                m_indices,
-            )
         else:
             offsets = None
             bs, slen, dim = x.shape
             # fall back to regular bmm between 3D tensors
             x = x.reshape(1, bs * slen, dim)
 
-            # x shape (num_experts, tokens_per_expert, dim)
-            h = F.silu(torch.bmm(x, w1))
-            h = h * torch.bmm(x, w3)
-            # out shape (num_experts, tokens_per_expert, dim)
-            out = torch.bmm(h, w2)
-            out = out.reshape(bs, slen, dim)
+        assert (x.dtype == w1.dtype == w2.dtype == w3.dtype ==
+                torch.bfloat16), "torch._grouped_mm only supports bf16 dtypes"
+        h = F.silu(torch._grouped_mm(x, w1, offs=offsets))
+        h = h * torch._grouped_mm(x, w3, offs=offsets)
+        out = torch._grouped_mm(h, w2, offs=offsets)
+
         return out
 
     def init_weights(self, init_std: float):
@@ -217,13 +192,13 @@ class TokenChoiceTopKRouter(nn.Module):
 
 
 class MoE(nn.Module):
-
     def __init__(
         self,
         model_args: TransformerModelArgs,
         scoring_before_experts: bool = True,
     ):
         super().__init__()
+        # compatibility with DeepSeek MoE
         self.scoring_before_experts = scoring_before_experts
         dim = model_args.dim
         hidden_dim = 4 * model_args.dim
@@ -269,12 +244,12 @@ class MoE(nn.Module):
         # to make initialization and checkpointing code simpler
         self.register_buffer(
             "expert_bias",
-            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            torch.zeros(num_experts, dtype=torch.float32),
             persistent=True,
         )
         self.register_buffer(
             "tokens_per_expert",
-            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            torch.zeros(num_experts, dtype=torch.float32),
             persistent=True,
         )
 
@@ -320,8 +295,7 @@ class MoE(nn.Module):
         routed_input = torch.gather(
             x.view(-1, dim),
             dim=0,
-            index=token_indices.clone(
-            ),  # FIXME: avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
+            index=token_indices,
         )
 
         ep_size = 1
@@ -329,7 +303,6 @@ class MoE(nn.Module):
         if isinstance(
                 self.experts.w1, DTensor) and self.experts.w1.placements == (
                     Shard(0), ) and self.experts.w1.device_mesh.size() > 1:
-            print("EP enabled!!!!!")
             # expert parallel enabled
             ep_size = self.experts.w1.device_mesh.size()
             ep_group = self.experts.w1.device_mesh.get_group()
@@ -397,7 +370,8 @@ class MoE(nn.Module):
             from torchtitan.experiments.kernels.moe.indices import (
                 generate_permute_indices,
             )
-            ALIGN_SIZE_M = 128
+
+            ALIGN_SIZE_M = 16
 
             with torch.no_grad():
                 experts_per_rank = self.experts.num_experts // ep_size
@@ -409,7 +383,6 @@ class MoE(nn.Module):
                     tokens_per_expert_group,
                     experts_per_rank,
                     ep_size,
-                    gathered_tokens.shape[0] + experts_per_rank * ALIGN_SIZE_M,
                     ALIGN_SIZE_M,
                 )
             gathered_tokens_buffer = torch.vstack(
