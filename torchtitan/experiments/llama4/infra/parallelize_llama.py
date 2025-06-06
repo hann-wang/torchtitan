@@ -79,7 +79,6 @@ def parallelize_llama(
 
         # NOTE: needed for torch.compile to work with dynamic shapes in token-choice MoE
         torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
     dp_mesh: DeviceMesh | None = None
     if (
@@ -168,7 +167,6 @@ def apply_moe_tp(
         if enable_tp2ep:
             moe_layer_plan = {
                 # input / output sharding on the seqlen dim
-                # all-gather for input, reduce-scatter for output
                 "moe":
                 PrepareModuleInputOutput(
                     input_layouts=(Shard(1), ),
@@ -177,10 +175,15 @@ def apply_moe_tp(
                     output_layouts=(Shard(1), ),
                     desired_output_layouts=(Shard(1), ),
                 ),
-                # replicate computation for the router
+                # FIXME: The input is reshaped after sharded along 
+                # the seqlen dimension. Should we use local tensors 
+                # instead of Replicate?
                 "moe.router.gate":
                 NoParallel(),
-                # input Replicate, output Partial
+                # Given the tokens are not splitted evenly,
+                # we need to use local tensors for both input / output.
+                # After the manual all-to-all gather, the result is
+                # sharded along the seqlen dim.
                 "moe.experts":
                 ExpertParallel(),
                 "moe.shared_expert":

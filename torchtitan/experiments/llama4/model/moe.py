@@ -9,13 +9,12 @@ import torch.nn.functional as F
 from torch import nn
 import torch.distributed as dist
 from torch.distributed._functional_collectives import all_to_all_single_autograd
-from torch.distributed.tensor import DTensor, Shard, Replicate
+from torch.distributed.tensor import DTensor, Shard
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
     cg_grouped_gemm, )
 
 from .args import TransformerModelArgs
 
-ALIGN_SIZE_M = 128
 
 class GroupedExperts(nn.Module):
     def __init__(
@@ -88,19 +87,14 @@ class GroupedExperts(nn.Module):
 
         # grouped mm implementation
         if num_local_tokens_per_expert is not None:
-            # grouped mm between a 2D tensor and a 3D tensor
-            assert x.dim() == 2
-
-            assert (
-                x.dtype == self.w1.dtype == self.w2.dtype == self.w3.dtype == torch.bfloat16
-            ), "torch._grouped_mm only supports bf16 dtypes"
-
             # https://github.com/pytorch/pytorch/pull/150374
             # NOTE: torch._gouped_mm requires bf16 dtypes
             #       and shapes to be multiple of 8
             offsets = torch.cumsum(
                 num_local_tokens_per_expert, dim=0, dtype=torch.int32
             )
+            # grouped mm between a 2D tensor and a 3D tensor
+            assert x.dim() == 2
 
             from torchtitan.experiments.deepseek_v3 import dsgemm_utils
 
@@ -126,9 +120,11 @@ class GroupedExperts(nn.Module):
                 m_indices,
             )
         else:
+            offsets = None
             bs, slen, dim = x.shape
-            x = x.reshape(1, bs * slen, dim)
             # fall back to regular bmm between 3D tensors
+            x = x.reshape(1, bs * slen, dim)
+
             # x shape (num_experts, tokens_per_expert, dim)
             h = F.silu(torch.bmm(x, w1))
             h = h * torch.bmm(x, w3)
@@ -306,19 +302,13 @@ class MoE(nn.Module):
         """
         bs, slen, dim = x.shape
 
-        if isinstance(self.expert_bias, DTensor):
-            assert self.expert_bias.placements == (Replicate(),)
-            expert_bias = self.expert_bias.to_local()
-        else:
-            expert_bias = self.expert_bias
-
         # top_scores and selected_indices shape (bs*slen*top_k,)
         # num_local_tokens_per_expert shape (num_experts,)
         (
             top_scores,
             token_indices,
             num_local_tokens_per_expert,
-        ) = self.router(x.reshape(bs * slen, dim), expert_bias)
+        ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
 
         # will be used to update the expert bias for load balancing
         self.tokens_per_expert += num_local_tokens_per_expert
@@ -407,6 +397,7 @@ class MoE(nn.Module):
             from torchtitan.experiments.kernels.moe.indices import (
                 generate_permute_indices,
             )
+            ALIGN_SIZE_M = 128
 
             with torch.no_grad():
                 experts_per_rank = self.experts.num_experts // ep_size
@@ -421,10 +412,10 @@ class MoE(nn.Module):
                     gathered_tokens.shape[0] + experts_per_rank * ALIGN_SIZE_M,
                     ALIGN_SIZE_M,
                 )
-            gathered_tokens_appended = torch.vstack(
+            gathered_tokens_buffer = torch.vstack(
                 (gathered_tokens, gathered_tokens.new_zeros((dim))))
-            buffer_shape = gathered_tokens_appended.shape
-            gathered_tokens = gathered_tokens_appended[permuted_indices, :]
+            buffer_shape = gathered_tokens_buffer.shape
+            gathered_tokens = gathered_tokens_buffer[permuted_indices, :]
 
             gathered_top_scores = torch.cat(
                 (gathered_top_scores, gathered_top_scores.new_zeros(1)))
