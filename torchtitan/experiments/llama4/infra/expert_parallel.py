@@ -187,7 +187,7 @@ class ExpertParallel(ParallelStyle):
                     inp, DTensor), "ExpertParallel expects local tensor inputs."
         return inputs
 
-    def _partition_fn(self, name, module, device_mesh):
+    def _partition_fn(self, name, module, device_mesh: DeviceMesh):
         # shard on the expert dimension
         for name, param in module.named_parameters(recurse=False):
             dist_param = nn.Parameter(
@@ -212,7 +212,12 @@ class ExpertParallel(ParallelStyle):
 
 class PrepareModuleInputOutputWithParams(PrepareModuleInputOutput):
 
-    def _partition_fn(self, name, module, device_mesh):
+    def _partition_fn(
+        self,
+        name,
+        module,
+        device_mesh,
+    ):
         for name, param in module.named_parameters(recurse=False):
             dist_param = nn.Parameter(
                 distribute_tensor(param, device_mesh, [Replicate()]))
