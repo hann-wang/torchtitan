@@ -7,11 +7,10 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-import torch.distributed as dist
-from torch.distributed._functional_collectives import all_to_all_single_autograd
 from torch.distributed.tensor import DTensor, Shard, Replicate
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
     cg_grouped_gemm, )
+from torchtitan.experiments.kernels.moe.token_dispatcher import DefaultTokenDispatcher
 
 from .args import TransformerModelArgs
 
@@ -318,7 +317,7 @@ class MoE(nn.Module):
         if ffn_dim_multiplier is not None:
             hidden_dim = int(ffn_dim_multiplier * hidden_dim)
 
-        num_experts = model_args.num_experts
+        self.num_experts = model_args.num_experts
         self.topk_method = model_args.topk_method
 
         hidden_dim_denom = 1
@@ -333,12 +332,12 @@ class MoE(nn.Module):
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
-            num_experts=num_experts,
+            num_experts=self.num_experts,
             use_grouped_mm=self.use_grouped_mm,
         )
         self.router = TokenChoiceTopKRouter(
             dim=dim,
-            num_experts=num_experts,
+            num_experts=self.num_experts,
             top_k=model_args.top_k,
             topk_method=self.topk_method,
         )
@@ -353,6 +352,8 @@ class MoE(nn.Module):
             else None
         )
 
+        self.token_dispatcher = DefaultTokenDispatcher(self.num_experts)
+
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
         # the fields below are defined even when load_balance_coeff is None
@@ -363,18 +364,18 @@ class MoE(nn.Module):
             self.register_parameter(
                 "expert_bias",
                 torch.nn.Parameter(
-                    torch.randn(num_experts, dtype=torch.get_default_dtype())),
+                    torch.randn(self.num_experts, dtype=torch.get_default_dtype())),
             )
         else:
             self.register_buffer(
                 "expert_bias",
-                torch.randn(num_experts, dtype=torch.get_default_dtype()),
+                torch.randn(self.num_experts, dtype=torch.get_default_dtype()),
                 persistent=True,
             )
 
         self.register_buffer(
             "tokens_per_expert",
-            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            torch.zeros(self.num_experts, dtype=torch.get_default_dtype()),
             persistent=True,
         )
 
@@ -431,65 +432,18 @@ class MoE(nn.Module):
             ),  # FIXME: avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
         )
 
-        ep_size = 1
-        ep_group = None
-        if isinstance(
-                self.experts.w1, DTensor) and self.experts.w1.placements == (
-                    Shard(0), ) and self.experts.w1.device_mesh.size() > 1:
-            # expert parallel enabled
-            ep_size = self.experts.w1.device_mesh.size()
-            ep_group = self.experts.w1.device_mesh.get_group()
-            assert num_local_tokens_per_expert is not None
-            with torch.no_grad():
-                tokens_per_expert_group = num_local_tokens_per_expert.new_empty(
-                    num_local_tokens_per_expert.shape[0])
-                dist.all_to_all_single(tokens_per_expert_group,
-                                       num_local_tokens_per_expert,
-                                       group=ep_group)
-                input_splits = num_local_tokens_per_expert.view(ep_size,
-                                                                -1).sum(dim=1)
-                output_splits = tokens_per_expert_group.view(ep_size,
-                                                             -1).sum(dim=1)
-            if self.training:
-                gathered_tokens = all_to_all_single_autograd(
-                    routed_input,
-                    output_splits.tolist(),
-                    input_splits.tolist(),
-                    ep_group,
-                )
-                gathered_top_scores = all_to_all_single_autograd(
-                    top_scores,
-                    output_splits.tolist(),
-                    input_splits.tolist(),
-                    ep_group,
-                )
-            else:
-                # TODO: unify with all_to_all_single_autograd after
-                # https://github.com/pytorch/pytorch/issues/154370 is resolved
-                gathered_num_tokens = output_splits.sum()
-                gathered_tokens = routed_input.new_empty(
-                    (gathered_num_tokens, dim))
-                dist.all_to_all_single(
-                    gathered_tokens,
-                    routed_input,
-                    output_splits.tolist(),
-                    input_splits.tolist(),
-                    group=ep_group,
-                )
-                gathered_top_scores = top_scores.new_empty(
-                    gathered_num_tokens, )
-                dist.all_to_all_single(
-                    gathered_top_scores,
-                    top_scores,
-                    output_splits.tolist(),
-                    input_splits.tolist(),
-                    group=ep_group,
-                )
-        else:
-            # expert parallel disabled
-            gathered_tokens = routed_input
-            gathered_top_scores = top_scores
-            tokens_per_expert_group = num_local_tokens_per_expert
+        (
+            gathered_tokens,
+            gathered_top_scores,
+            tokens_per_expert_group,
+            input_splits,
+            output_splits,
+        ) = self.token_dispatcher.token_permutation(
+            routed_input,
+            top_scores,
+            num_local_tokens_per_expert,
+            self.training,
+        )
 
         if self.scoring_before_experts:
             gathered_tokens = (gathered_tokens.to(torch.float32) *
@@ -505,16 +459,16 @@ class MoE(nn.Module):
             )
 
             with torch.no_grad():
-                experts_per_rank = self.experts.num_experts // ep_size
                 (
                     permuted_indices,
                     tokens_per_expert_group,
                     _,
                 ) = generate_permute_indices(
                     tokens_per_expert_group,
-                    experts_per_rank,
-                    ep_size,
-                    gathered_tokens.shape[0] + experts_per_rank * ALIGN_SIZE_M,
+                    self.token_dispatcher.experts_per_rank,
+                    self.token_dispatcher.ep_size,
+                    gathered_tokens.shape[0] +
+                    self.token_dispatcher.experts_per_rank * ALIGN_SIZE_M,
                     ALIGN_SIZE_M,
                 )
             gathered_tokens_appended = torch.vstack(
@@ -540,31 +494,8 @@ class MoE(nn.Module):
             gathered_tokens_buffer[permuted_indices, :] = routed_output
             routed_output = gathered_tokens_buffer[:(buffer_shape[0] - 1), :]
 
-        if ep_size > 1:
-            # expert parallel enabled, we need to gather the output
-            # from all experts
-            if self.training:
-                returned_tokens = all_to_all_single_autograd(
-                    routed_output,
-                    input_splits.tolist(),
-                    output_splits.tolist(),
-                    ep_group,
-                )
-            else:
-                # TODO: unify with all_to_all_single_autograd after
-                # https://github.com/pytorch/pytorch/issues/154370 is resolved
-                returned_tokens = routed_output.new_empty(
-                    (input_splits.sum(), dim))
-                dist.all_to_all_single(
-                    returned_tokens,
-                    routed_output,
-                    input_splits.tolist(),
-                    output_splits.tolist(),
-                    group=ep_group,
-                )
-        else:
-            # expert parallel disabled, no need to gather
-            returned_tokens = routed_output
+        returned_tokens = self.token_dispatcher.token_unpermutation(
+            routed_output, input_splits, output_splits, self.training)
 
         # shared expert
         if self.shared_expert is not None:

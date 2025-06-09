@@ -42,7 +42,7 @@ import torch.distributed as dist
 from torchtitan.experiments.llama4.model.moe import MoE as Llama4MoE, GroupedExperts, TokenChoiceTopKRouter
 from torchtitan.experiments.deepseek_v3.attn_mask_utils import _prepare_4d_causal_attention_mask
 from torchtitan.experiments.deepseek_v3.model_config import ModelArgs
-
+from torchtitan.experiments.kernels.moe.token_dispatcher import DefaultTokenDispatcher
 from torchtitan.experiments.kernels.blockwise_fp8.blockwise_fa import flash_attention_forward
 
 USE_SDPA = True
@@ -60,20 +60,20 @@ class MoE(Llama4MoE):
         self.scoring_before_experts = False
         dim = model_args.hidden_size
         hidden_dim = model_args.moe_intermediate_size
-        num_experts = model_args.n_routed_experts
+        self.num_experts = model_args.n_routed_experts
         self.topk_method = model_args.topk_method
 
         self.use_grouped_mm = model_args.use_grouped_mm
         self.experts = GroupedExperts(
             dim=dim,
             hidden_dim=hidden_dim,
-            num_experts=num_experts,
+            num_experts=self.num_experts,
             use_grouped_mm=self.use_grouped_mm,
         )
         assert model_args.scoring_func in ["sigmoid", "softmax"]
         self.router = TokenChoiceTopKRouter(
             dim=dim,
-            num_experts=num_experts,
+            num_experts=self.num_experts,
             top_k=model_args.num_experts_per_tok,
             use_sigmoid=model_args.scoring_func == "sigmoid",
             norm_topk_prob=model_args.norm_topk_prob,
@@ -95,6 +95,8 @@ class MoE(Llama4MoE):
             intermediate_size=hidden_dim * model_args.n_shared_experts,
         ) if model_args.n_shared_experts else None
 
+        self.token_dispatcher = DefaultTokenDispatcher(self.num_experts)
+
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
 
@@ -106,18 +108,18 @@ class MoE(Llama4MoE):
             self.register_parameter(
                 "expert_bias",
                 torch.nn.Parameter(
-                    torch.randn(num_experts, dtype=torch.get_default_dtype())),
+                    torch.randn(self.num_experts, dtype=torch.get_default_dtype())),
             )
         else:
             self.register_buffer(
                 "expert_bias",
-                torch.randn(num_experts, dtype=torch.get_default_dtype()),
+                torch.randn(self.num_experts, dtype=torch.get_default_dtype()),
                 persistent=True,
             )
 
         self.register_buffer(
             "tokens_per_expert",
-            torch.zeros(num_experts, dtype=torch.get_default_dtype()),
+            torch.zeros(self.num_experts, dtype=torch.get_default_dtype()),
             persistent=True,
         )
 

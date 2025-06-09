@@ -290,6 +290,7 @@ def apply_tp(
                 use_local_input=True,
                 output_layouts=(Shard(1), ),
                 desired_output_layouts=(Shard(1), ),
+                enable_tp2ep=True,
             )
             layer_plan["moe.experts"] = ExpertParallel()
             layer_plan[
