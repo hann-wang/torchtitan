@@ -480,9 +480,6 @@ class MoE(nn.Module):
                     tokens_per_expert_group,
                     self.token_dispatcher.experts_per_rank,
                     self.token_dispatcher.ep_size,
-                    gathered_tokens.shape[0] +
-                    self.token_dispatcher.experts_per_rank * ALIGN_SIZE_M -
-                    gathered_tokens.shape[0] % ALIGN_SIZE_M,
                     ALIGN_SIZE_M,
                 )
             gathered_tokens_appended = torch.vstack(
