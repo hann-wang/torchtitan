@@ -10,7 +10,10 @@ from torch import nn
 from torch.distributed.tensor import DTensor, Shard, Replicate
 from torchtitan.experiments.kernels.triton_contiguous_group_gemm.cg_backward import (
     cg_grouped_gemm, )
-from torchtitan.experiments.kernels.moe.token_dispatcher import DefaultTokenDispatcher
+from torchtitan.experiments.kernels.moe.token_dispatcher import (
+    DefaultTokenDispatcher,
+    TorchAllToAllTokenDispatcher,
+)
 
 from .args import TransformerModelArgs
 
@@ -431,6 +434,16 @@ class MoE(nn.Module):
             index=token_indices.clone(
             ),  # FIXME: avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
         )
+
+        # TODO: Find a better place to initialize the token dispatcher.
+        #       I tried putting it in PrepareModuleInputOutputWithParams._apply,
+        #       but caused torch compiling isses
+        if (isinstance(self.experts.w1, DTensor) and self.experts.w1.placements == (Shard(0),)):
+            self.token_dispatcher = TorchAllToAllTokenDispatcher(
+                num_experts=self.num_experts,
+                ep_size=self.experts.w1.device_mesh.size(),
+                ep_group=self.experts.w1.device_mesh.get_group(),
+            )
 
         (
             gathered_tokens,

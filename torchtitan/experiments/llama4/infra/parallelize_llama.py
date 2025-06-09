@@ -155,13 +155,13 @@ def apply_moe_tp(
     from torch.distributed.tensor import Partial, Replicate, Shard
     from torch.distributed.tensor.parallel import (
         parallelize_module,
+        PrepareModuleInputOutput,
     )
 
     from .expert_parallel import (
         NoParallel,
         TensorParallel,
         ExpertParallel,
-        PrepareModuleInputOutputWithParams,
     )
 
     for transformer_block in model.layers.values():
@@ -170,13 +170,12 @@ def apply_moe_tp(
                 # input / output sharding on the seqlen dim
                 # all-gather for input, reduce-scatter for output
                 "moe":
-                PrepareModuleInputOutputWithParams(
+                PrepareModuleInputOutput(
                     input_layouts=(Shard(1), ),
                     desired_input_layouts=(Shard(1), ),
                     use_local_input=True,
                     output_layouts=(Shard(1), ),
                     desired_output_layouts=(Shard(1), ),
-                    enable_tp2ep=enable_tp2ep,
                 ),
                 # replicate computation for the router
                 "moe.router.gate":
@@ -195,13 +194,12 @@ def apply_moe_tp(
                 # input / output sharding on the seqlen dim
                 # all-gather for input, reduce-scatter for output
                 "moe":
-                PrepareModuleInputOutputWithParams(
+                PrepareModuleInputOutput(
                     input_layouts=(Shard(1), ),
                     desired_input_layouts=(Replicate(), ),
                     use_local_input=True,
                     output_layouts=(Partial(), ),
                     desired_output_layouts=(Shard(1), ),
-                    enable_tp2ep=enable_tp2ep,
                 ),
                 # replicate computation for the router
                 "moe.router.gate":
