@@ -67,6 +67,7 @@ DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 1003:110 \
     --network host \
     -e HOME=/home/hanwang2 \
     -e HF_HOME=/huggingface \
+    -e HF_HUB_OFFLINE=1 \
     -e TORCH_EXTENSIONS_DIR=/home/hanwang2/.local/share/torch_extensions \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e LOG_RANK=${LOG_RANK} \

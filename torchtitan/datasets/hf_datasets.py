@@ -22,7 +22,7 @@ from torchtitan.tools.logging import logger
 
 def _load_c4_dataset(dataset_path: str):
     """Load C4 dataset with default configuration."""
-    return load_dataset(dataset_path, name="en", split="train", streaming=True)
+    return load_dataset(dataset_path, name="en", split="train", streaming=False).to_iterable_dataset()
 
 
 def _process_c4_text(sample: dict[str, Any]) -> str:
