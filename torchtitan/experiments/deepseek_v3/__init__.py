@@ -19,6 +19,7 @@ from .model_config import (
     deepseek_config_registry,
     deepseek_v2_dim10752_config,
     deepseek_v3_lite_config,
+    instella_200b_config,
 )
 from .model import DeepseekForCausalLM
 
@@ -73,6 +74,8 @@ deepseek_configs = {
     deepseek_v2_dim10752_config,
     "V3-Lite":
     deepseek_v3_lite_config,
+    "200b":
+    instella_200b_config,
 }
 
 register_train_spec(

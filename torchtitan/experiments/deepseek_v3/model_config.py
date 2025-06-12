@@ -182,14 +182,14 @@ class ModelArgs(BaseModelArgs):
         nparams_dense = 0
 
         for name, p in model.named_parameters():
-            if "embedding" in name:
+            if "tok_embeddings" in name:
                 nparams_embedding += p.numel()
                 nparams_dense += p.numel()
-            elif "mlp.shared_expert" in name:
+            elif "moe.shared_expert" in name:
                 nparams_shared_expert += p.numel()
-            elif "mlp.router" in name:
+            elif "moe.router" in name:
                 nparams_moe_router += p.numel()
-            elif "mlp.experts" in name:
+            elif "moe.experts" in name:
                 nparams_experts += p.numel()
             else:
                 nparams_dense += p.numel()
@@ -309,6 +309,28 @@ deepseek_v3_lite_config = ModelArgs(
     n_shared_experts=1,
     n_routed_experts=64,
     first_k_dense_replace=1,
+)
+
+instella_200b_config = ModelArgs(
+    hidden_size=4096,
+    intermediate_size=12288,
+    moe_intermediate_size=1536,
+    num_hidden_layers=64,
+    first_k_dense_replace=2,
+    num_attention_heads=32,
+    num_key_value_heads=32,
+    n_shared_experts=2,
+    n_routed_experts=160,
+    routed_scaling_factor=2.5,
+    kv_lora_rank=512,
+    q_lora_rank=None,
+    qk_rope_head_dim=32,
+    v_head_dim=128,
+    qk_nope_head_dim=96,
+    topk_method="noaux_tc",
+    n_group=8,
+    topk_group=4,
+    num_experts_per_tok=6,
 )
 
 deepseek_v3_config = ModelArgs()
