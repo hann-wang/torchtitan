@@ -12,9 +12,9 @@
 
 #SBATCH --job-name=dsv3_torchtitan_multi_node
 
-#SBATCH --ntasks=2
+#SBATCH --ntasks=4
 
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 
 #SBATCH --gpus-per-task=8
 
@@ -82,7 +82,8 @@ DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 1003:110 \
     ${IMAGE_NAME}"}
 
 # check if docker image exists on each node
-for node in "${nodes_array[@]}"; do
+check_image_on_node() {
+    local node="$1"
     echo "Checking Docker image on node: $node"
     if srun --nodes=1 --ntasks=1 -w "$node" docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -q "^${IMAGE_NAME}$"; then
         echo "Docker image $IMAGE_NAME found on $node."
@@ -91,11 +92,16 @@ for node in "${nodes_array[@]}"; do
         echo "Docker image not found on $node, loading from tar file $IMAGE_FILE"
         srun --nodes=1 --ntasks=1 -w "$node" docker image load -i $IMAGE_FILE
     fi
+}
+
+for node in "${nodes_array[@]}"; do
+    check_image_on_node "$node" &
 done
+wait
 echo "Docker image is available on all nodes."
 
 # dcgmi profile --pause
 # adjust sbatch --ntasks and sbatch --nodes above and --nnodes below
 # to your specific node count, and update target launch file.
-srun $DOCKER_RUN_CMD torchrun --nnodes 2 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./torchtitan/train.py --job.config_file ${CONFIG_FILE}
+srun $DOCKER_RUN_CMD torchrun --nnodes 4 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./torchtitan/train.py --job.config_file ${CONFIG_FILE}
 # dcgmi profile --resume

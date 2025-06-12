@@ -7,7 +7,7 @@
 # Instella-200b (deepseek-v3 like)
 
 [job]
-dump_folder = "./instella-200b-bf16-bs2-fsdp2-tp8-outputs"
+dump_folder = "./instella-200b-bf16-bs1-fsdp4-ep8-outputs"
 description = "Instella-200b training"
 
 [profiling]
@@ -61,10 +61,11 @@ enable_tp2ep = true
 [checkpoint]
 enable_checkpoint = false
 folder = "checkpoint"
-interval = 1000
+interval = 200
 model_weights_only = false
 export_dtype = "bfloat16"
-async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
+async_mode = "async"  # ["disabled", "async", "async_with_pinned_mem"]
+keep_latest_k = 2
 
 [activation_checkpoint]
 mode = 'none'  # ['none', 'selective', 'full']
