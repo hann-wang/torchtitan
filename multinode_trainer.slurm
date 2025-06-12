@@ -25,7 +25,7 @@
 nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
 nodes_array=($nodes)
 head_node=${nodes_array[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
+head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address | awk '{print $NF}')
 
 echo Node IP: $head_node_ip
 export LOGLEVEL=INFO
@@ -79,12 +79,14 @@ DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 1003:110 \
 
 # check if docker image exists on each node
 for node in "${nodes_array[@]}"; do
+    echo "Checking Docker image on node: $node"
     if ! srun --nodes=1 --ntasks=1 -w "$node" docker image inspect han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.4 > /dev/null 2>&1; then
         # load from local tar file
         echo "Docker image not found on $node, loading from tar file..."
         srun --nodes=1 --ntasks=1 -w "$node" docker load -i /home/amd/cache/hanwang2/docker/han-workspace.tar
     fi
 done
+echo "Docker image is available on all nodes."
 
 # dcgmi profile --pause
 # adjust sbatch --ntasks and sbatch --nodes above and --nnodes below
