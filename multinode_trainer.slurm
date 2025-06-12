@@ -12,15 +12,15 @@
 
 #SBATCH --job-name=dsv3_torchtitan_multi_node
 
-#SBATCH --ntasks=4
+#SBATCH --ntasks=2
 
-#SBATCH --nodes=4
+#SBATCH --nodes=2
 
 #SBATCH --gpus-per-task=8
 
 #SBATCH --cpus-per-task=128
 
-#SBATCH --partition=AIG_Models
+#SBATCH --partition=amd-tw
 
 nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
 nodes_array=($nodes)
@@ -53,7 +53,7 @@ export LOG_RANK=${LOG_RANK:-0}
 
 CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/experiments/deepseek_v3/train_configs/deepseek_v3.toml"}
 
-DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 300177:110 \
+DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 1003:110 \
     --ulimit core=-1  --privileged \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     --device=/dev/kfd \
@@ -71,23 +71,23 @@ DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 300177:110 \
     -e NCCL_DEBUG="$NCCL_DEBUG" \
     -e PYTHONFAULTHANDLER="$PYTHONFAULTHANDLER" \
     -e LOGLEVEL="$LOGLEVEL" \
-    -v /home/Han.Wang@amd.com/workspace:/workspace \
-    -v /home/Han.Wang@amd.com/docker-home:/home/hanwang2 \
-    -v /home/Han.Wang@amd.com/huggingface:/huggingface \
-    -v /home/amd-shared-home:/home/amd-shared-home \
-    han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.2.4"}
+    -v /home/amd/cache/hanwang2/workspace:/workspace \
+    -v /home/amd/cache/hanwang2/docker-home-fp8:/home/hanwang2 \
+    -v /home/amd/cache/huggingface:/huggingface \
+    -v /home/amd/cache:/home/amd/cache \
+    han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.4"}
 
 # check if docker image exists on each node
 for node in "${nodes_array[@]}"; do
-    if ! srun --nodes=1 --ntasks=1 -w "$node" docker image inspect han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.2.4 > /dev/null 2>&1; then
+    if ! srun --nodes=1 --ntasks=1 -w "$node" docker image inspect han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.4 > /dev/null 2>&1; then
         # load from local tar file
         echo "Docker image not found on $node, loading from tar file..."
-        srun --nodes=1 --ntasks=1 -w "$node" docker load -i /home/Han.Wang@amd.com/workspace/docker/han-workspace.tar
+        srun --nodes=1 --ntasks=1 -w "$node" docker load -i /home/amd/cache/hanwang2/docker/han-workspace.tar
     fi
 done
 
 # dcgmi profile --pause
 # adjust sbatch --ntasks and sbatch --nodes above and --nnodes below
 # to your specific node count, and update target launch file.
-srun $DOCKER_RUN_CMD torchrun --nnodes 4 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./torchtitan/train.py --job.config_file ${CONFIG_FILE}
+srun $DOCKER_RUN_CMD torchrun --nnodes 2 --nproc_per_node 8 --rdzv_id 101 --rdzv_backend c10d --rdzv_endpoint "$head_node_ip:29500" ./torchtitan/train.py --job.config_file ${CONFIG_FILE}
 # dcgmi profile --resume
