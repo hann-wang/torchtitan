@@ -22,8 +22,7 @@
 
 #SBATCH --partition=amd-tw
 
-nodes=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
-nodes_array=($nodes)
+nodes_array=( $( scontrol show hostnames $SLURM_JOB_NODELIST ) )
 head_node=${nodes_array[0]}
 head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address | awk '{print $NF}')
 
@@ -45,45 +44,52 @@ export PYTHONFAULTHANDLER=1
 # # on your cluster you might need these:
 # # set the network interface
 # export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
-# export NCCL_BUFFSIZE=2097152
+export NCCL_BUFFSIZE=2097152
 # #export TORCH_DIST_INIT_BARRIER=1
 # export FI_EFA_SET_CUDA_SYNC_MEMOPS=0
 
 export LOG_RANK=${LOG_RANK:-0}
 
-CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/experiments/deepseek_v3/train_configs/deepseek_v3.toml"}
+CONFIG_FILE=${CONFIG_FILE:-"./torchtitan/experiments/deepseek_v3/train_configs/deepseek_200b.toml"}
+IMAGE_NAME="han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.4"
+IMAGE_FILE="/home/amd/cache/hanwang2/docker/han-workspace.tar"
 
 DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 1003:110 \
     --ulimit core=-1  --privileged \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     --device=/dev/kfd \
     --device=/dev/dri \
+    --device=/dev/infiniband \
     --group-add video \
     --group-add render \
     --workdir /workspace/fp8/torchtitan-fa-fp8 \
     --ipc=host --shm-size 8G \
     --network host \
-    -e HOME="/home/hanwang2" \
-    -e HF_HOME="/huggingface" \
-    -e TORCH_EXTENSIONS_DIR="/home/hanwang2/.local/share/torch_extensions" \
-    -e PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" \
-    -e LOG_RANK="$LOG_RANK" \
-    -e NCCL_DEBUG="$NCCL_DEBUG" \
-    -e PYTHONFAULTHANDLER="$PYTHONFAULTHANDLER" \
-    -e LOGLEVEL="$LOGLEVEL" \
+    -e HOME=/home/hanwang2 \
+    -e HF_HOME=/huggingface \
+    -e TORCH_EXTENSIONS_DIR=/home/hanwang2/.local/share/torch_extensions \
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    -e LOG_RANK=${LOG_RANK} \
+    -e NCCL_DEBUG=${NCCL_DEBUG} \
+    -e NCCL_BUFFSIZE=${NCCL_BUFFSIZE} \
+    -e PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER} \
+    -e LOGLEVEL=${LOGLEVEL} \
     -v /home/amd/cache/hanwang2/workspace:/workspace \
     -v /home/amd/cache/hanwang2/docker-home-fp8:/home/hanwang2 \
     -v /home/amd/cache/huggingface:/huggingface \
     -v /home/amd/cache:/home/amd/cache \
-    han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.4"}
+    -v /home/amd/cache/hanwang2/tmp:/tmp \
+    ${IMAGE_NAME}"}
 
 # check if docker image exists on each node
 for node in "${nodes_array[@]}"; do
     echo "Checking Docker image on node: $node"
-    if ! srun --nodes=1 --ntasks=1 -w "$node" docker image inspect han-workspace:ubuntu24.04-pytorch2.8.0dev-rocm6.4 > /dev/null 2>&1; then
+    if srun --nodes=1 --ntasks=1 -w "$node" docker image ls --format '{{.Repository}}:{{.Tag}}' | grep -q "^${IMAGE_NAME}$"; then
+        echo "Docker image $IMAGE_NAME found on $node."
+    else
         # load from local tar file
-        echo "Docker image not found on $node, loading from tar file..."
-        srun --nodes=1 --ntasks=1 -w "$node" docker load -i /home/amd/cache/hanwang2/docker/han-workspace.tar
+        echo "Docker image not found on $node, loading from tar file $IMAGE_FILE"
+        srun --nodes=1 --ntasks=1 -w "$node" docker image load -i $IMAGE_FILE
     fi
 done
 echo "Docker image is available on all nodes."
