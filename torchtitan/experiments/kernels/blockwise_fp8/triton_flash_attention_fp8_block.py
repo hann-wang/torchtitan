@@ -19,7 +19,7 @@ Not currently supported:
 1) Non power of two head dims
 
 """
-from typing import List, Optional
+from typing import Tuple, Optional
 import os
 import math
 import torch
@@ -545,6 +545,9 @@ def attn_fwd(
     else:
         off_h_k = off_h_q
 
+    PADDED_HEAD_QK: tl.constexpr = (ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK)
+    PADDED_HEAD_V: tl.constexpr = (ACTUAL_BLOCK_DMODEL_V != BLOCK_DMODEL_V)
+
     # we assume q and k has the same length
     if USE_FP8:
         actual_kscale_block_num = stride_kdescale_h
@@ -610,6 +613,9 @@ def attn_fwd(
             acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_V],
                            dtype=Out.type.element_ty)
             o_ptrs_mask = offs_m[:, None] < seqlen_q
+            if PADDED_HEAD_V:
+                o_ptrs_mask = o_ptrs_mask & (offs_d_v[None, :]
+                                             < ACTUAL_BLOCK_DMODEL_V)
             # We still need to write 0s to the result
             tl.store(o_ptrs, acc, mask=o_ptrs_mask)
             # The tensor allocated for L is based on MAX_SEQLENS_Q as that is
@@ -636,8 +642,6 @@ def attn_fwd(
         n_extra_tokens = BLOCK_N - seqlen_k
     elif seqlen_k % BLOCK_N:
         n_extra_tokens = seqlen_k % BLOCK_N
-    PADDED_HEAD_QK: tl.constexpr = (ACTUAL_BLOCK_DMODEL_QK != BLOCK_DMODEL_QK)
-    PADDED_HEAD_V: tl.constexpr = (ACTUAL_BLOCK_DMODEL_V != BLOCK_DMODEL_V)
 
     # Compute pointers for all the tensors used in this kernel.
     q_offset = Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
@@ -927,10 +931,10 @@ def attention_block_forward_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    p_scale: float,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_scale: torch.Tensor,
+    p_scale: float,
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
@@ -944,7 +948,7 @@ def attention_block_forward_triton_impl(
     return_scores: bool,
     use_exp2: bool,
     use_fp8: bool,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if DEBUG:
         print()
         print("attention_forward_triton_impl")
@@ -1115,7 +1119,7 @@ def attention_block_forward_triton_impl(
         BLOCK_M=FIXED_BLOCK_M,
         BLOCK_N=FIXED_BLOCK_N,
     )
-    return [o, softmax_lse, exp_scores]
+    return o, softmax_lse, exp_scores
 
 
 @triton.jit
@@ -1233,7 +1237,7 @@ def get_autotune_bwd_configs():
         ),
     ], [
         "BLOCK_DMODEL", "ACTUAL_BLOCK_DMODEL_QK", "ACTUAL_BLOCK_DMODEL_V",
-        "SEQUENCE_PARALLEL", "CAUSAL", "USE_FP8"
+        "CAUSAL", "USE_FP8"
     ]
 
 
@@ -1250,7 +1254,7 @@ def _bwd_kernel_dkdv(
     K,
     V,
     sm_scale: tl.constexpr,
-    q_scale_ptr,
+    q_descale_ptr,
     k_descale_ptr,
     v_scale_ptr,
     p_scale: tl.constexpr,
@@ -1261,7 +1265,6 @@ def _bwd_kernel_dkdv(
     DK,
     DV,
     LD,
-    stride_dq_all,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -1307,7 +1310,6 @@ def _bwd_kernel_dkdv(
     BLOCK_DMODEL_V: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    SEQUENCE_PARALLEL: tl.constexpr,
     CAUSAL: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -1373,7 +1375,7 @@ def _bwd_kernel_dkdv(
 
         qscale_mask = tl.arange(
             0, padded_qscale_block_num) < actual_qscale_block_num
-        q_descale_offset = q_scale_ptr + off_z * stride_qscalez + off_h_q * stride_qscaleh + tl.arange(
+        q_descale_offset = q_descale_ptr + off_z * stride_qscalez + off_h_q * stride_qscaleh + tl.arange(
             0, padded_qscale_block_num)  #  + q_start * stride_qm
         q_descale = tl.load(q_descale_offset, mask=qscale_mask, other=1.0)
 
@@ -1603,7 +1605,7 @@ def _bwd_kernel_dq(
     K,
     V,
     sm_scale: tl.constexpr,
-    q_scale_ptr,
+    q_descale_ptr,
     k_descale_ptr,
     v_scale_ptr,
     p_scale: tl.constexpr,
@@ -1614,7 +1616,6 @@ def _bwd_kernel_dq(
     DK,
     DV,
     LD,
-    stride_dq_all,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -1660,7 +1661,6 @@ def _bwd_kernel_dq(
     BLOCK_DMODEL_V: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_QK: tl.constexpr,
     ACTUAL_BLOCK_DMODEL_V: tl.constexpr,
-    SEQUENCE_PARALLEL: tl.constexpr,
     CAUSAL: tl.constexpr,
     USE_EXP2: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -1727,7 +1727,7 @@ def _bwd_kernel_dq(
 
         qscale_mask = tl.arange(
             0, padded_qscale_block_num) < actual_qscale_block_num
-        q_descale_offset = q_scale_ptr + off_z * stride_qscalez + off_h_q * stride_qscaleh + tl.arange(
+        q_descale_offset = q_descale_ptr + off_z * stride_qscalez + off_h_q * stride_qscaleh + tl.arange(
             0, padded_qscale_block_num)  #  + q_start * stride_qm
         q_descale = tl.load(q_descale_offset, mask=qscale_mask, other=1.0)
 
@@ -1916,14 +1916,11 @@ def attention_block_backward_triton_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
+    softmax_lse_delta: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
     v_scale: torch.Tensor,
     p_scale: float,
-    softmax_lse_delta: torch.Tensor,
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
@@ -1934,8 +1931,7 @@ def attention_block_backward_triton_impl(
     max_seqlen_k: Optional[int],
     use_exp2: bool,
     use_fp8: bool,
-    sequence_parallel: bool = True,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if DEBUG:
         print("####################################################")
         print("attention_backward_triton_new_impl")
@@ -1945,9 +1941,6 @@ def attention_block_backward_triton_impl(
         print("v:", v, v.shape)
         print("o:", o, o.shape)
         print("softmax_lse:", softmax_lse_delta, softmax_lse_delta.shape)
-        print("dq:", dq, dq.shape if dq is not None else None)
-        print("dk:", dk, dk.shape if dk is not None else None)
-        print("dv:", dv, dv.shape if dv is not None else None)
         print("sm_scale:", sm_scale)
         print("alibi_slopes:", alibi_slopes)
         print("causal:", causal)
@@ -1957,7 +1950,6 @@ def attention_block_backward_triton_impl(
         print("max_seqlen_q:", max_seqlen_q)
         print("max_seqlen_k:", max_seqlen_k)
         print("use_exp2:", use_exp2)
-        print("sequence_parallel:", sequence_parallel)
 
     # make contigious
     q = q.contiguous()
@@ -1989,38 +1981,13 @@ def attention_block_backward_triton_impl(
     padded_d_model_v = get_padded_head_dim(head_size_v)
 
     do = do.contiguous()
-    # NOTE: we might need to copy the output tensor if they are not continuous or have other issues
-    copy_back = {"dq": False, "dk": False, "dv": False}
 
     # deal with dq
-    if dq is None:
-        dq = torch.zeros(q.shape, device=q.device, dtype=bwd_torch_dtype)
-    else:
-        dq_og = dq
-        if (not dq.is_contiguous()):
-            dq = dq.contiguous()
-            copy_back["dq"] = True
-
-        dq.zero_()
-    stride_dq_all = dq.stride()[0]
+    dq = torch.zeros_like(q, dtype=bwd_torch_dtype)
 
     # deal with dk, dv
-    if (dk is None) or (dv is None):
-        dk = torch.zeros_like(k, dtype=bwd_torch_dtype)
-        dv = torch.zeros_like(v, dtype=bwd_torch_dtype)
-    else:
-        if (not dk.is_contiguous()):
-            dk_og = dk
-            dk = dk.contiguous()
-            copy_back["dk"] = True
-
-        if (not dv.is_contiguous()):
-            dv_og = dv
-            dv = dv.contiguous()
-            copy_back["dv"] = True
-
-    if DEBUG:
-        print("copy_back:", copy_back)
+    dk = torch.zeros_like(k, dtype=bwd_torch_dtype)
+    dv = torch.zeros_like(v, dtype=bwd_torch_dtype)
 
     # assert contigious
     assert do.is_contiguous()
@@ -2045,8 +2012,8 @@ def attention_block_backward_triton_impl(
         _shape = (batch, nheads_q, triton.cdiv(max_seqlen_q, FIXED_BLOCK_M))
         do_scale = torch.empty(_shape, dtype=torch.float32, device=q.device)
         stride_descalez, stride_descaleh, stride_descalem = do_scale.stride()
-        stride_qscalez, stride_qscaleh, stride_qscalem = q_scale.stride()
-        stride_kscalez, stride_kscaleh, stride_kscalem = k_scale.stride()
+        stride_qscalez, stride_qscaleh, stride_qscalem = q_descale.stride()
+        stride_kscalez, stride_kscaleh, stride_kscalem = k_descale.stride()
 
         padded_doscale_block_num = 1 << (stride_descaleh - 1).bit_length()
         padded_qscale_block_num = 1 << (stride_qscaleh - 1).bit_length()
@@ -2122,7 +2089,6 @@ def attention_block_backward_triton_impl(
         print("max_seqlen_k:", max_seqlen_k)
         print("BLOCK_DMODEL_QK:", padded_d_model_qk)
         print("BLOCK_DMODEL_V:", padded_d_model_v)
-        print("SEQUENCE_PARALLEL:", sequence_parallel)
         print("CAUSAL:", causal)
         print("USE_EXP2:", use_exp2)
 
@@ -2130,15 +2096,15 @@ def attention_block_backward_triton_impl(
     num_block_m = triton.cdiv(max_seqlen_q, FIXED_BLOCK_M)
     grid_bwd = (
         batch_headsize_q,
-        triton.cdiv(max_seqlen_q, FIXED_BLOCK_M) if sequence_parallel else 1,
+        triton.cdiv(max_seqlen_q, FIXED_BLOCK_M),
     )
     wrap_triton(_bwd_kernel_dq)[grid_bwd](
         q,
         k,
         v,
         sm_scale,
-        q_scale,
-        k_scale,
+        q_descale,
+        k_descale,
         v_scale,
         p_scale,
         do_scale,
@@ -2148,7 +2114,6 @@ def attention_block_backward_triton_impl(
         dk,
         dv,
         softmax_lse_delta,
-        stride_dq_all,
         stride_qz,
         stride_qh,
         stride_qm,
@@ -2194,7 +2159,6 @@ def attention_block_backward_triton_impl(
         BLOCK_DMODEL_V=padded_d_model_v,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        SEQUENCE_PARALLEL=sequence_parallel,
         CAUSAL=causal,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
@@ -2217,15 +2181,15 @@ def attention_block_backward_triton_impl(
 
     grid_bwd_dkdv = (
         batch_headsize_k,
-        triton.cdiv(max_seqlen_k, FIXED_BLOCK_N) if sequence_parallel else 1,
+        triton.cdiv(max_seqlen_k, FIXED_BLOCK_N),
     )
     wrap_triton(_bwd_kernel_dkdv)[grid_bwd_dkdv](
         q,
         k,
         v,
         sm_scale,
-        q_scale,
-        k_scale,
+        q_descale,
+        k_descale,
         v_scale,
         p_scale,
         do_scale,
@@ -2235,7 +2199,6 @@ def attention_block_backward_triton_impl(
         dk,
         dv,
         softmax_lse_delta,
-        stride_dq_all,
         stride_qz,
         stride_qh,
         stride_qm,
@@ -2281,7 +2244,6 @@ def attention_block_backward_triton_impl(
         BLOCK_DMODEL_V=padded_d_model_v,
         ACTUAL_BLOCK_DMODEL_QK=head_size_qk,
         ACTUAL_BLOCK_DMODEL_V=head_size_v,
-        SEQUENCE_PARALLEL=sequence_parallel,
         CAUSAL=causal,
         USE_EXP2=use_exp2,
         IS_VARLEN=is_varlen,
@@ -2305,23 +2267,9 @@ def attention_block_backward_triton_impl(
         print("dk:", dk, dk.shape)
         print("dv:", dv, dv.shape)
         # print("delta:", delta, delta.shape)
-        print("copy_back:", copy_back)
 
-    if copy_back["dq"]:
-        dq_og.copy_(dq)
-        dq = dq_og
-    if copy_back["dk"]:
-        dk_og.copy_(dk)
-        dk = dk_og
-    if copy_back["dv"]:
-        dv_og.copy_(dv)
-        dv = dv_og
-
-    return [
-        dq.to(fwd_torch_dtype),
-        dk.to(fwd_torch_dtype),
-        dv.to(fwd_torch_dtype)
-    ]
+    return dq.to(fwd_torch_dtype), dk.to(fwd_torch_dtype), dv.to(
+        fwd_torch_dtype)
 
 
 def block_scaling_node(tensor,
@@ -2379,41 +2327,41 @@ class _triton_attention_block(torch.autograd.Function):
             assert q.dtype != float8_fw
             assert k.dtype != float8_fw
             assert v.dtype != float8_fw
-            q, q_scale = block_scaling_node(q, FIXED_BLOCK_M)
-            k, k_scale = block_scaling_node(k, FIXED_BLOCK_N)
+            q, q_descale = block_scaling_node(q, FIXED_BLOCK_M)
+            k, k_descale = block_scaling_node(k, FIXED_BLOCK_N)
             v_scale = F8_FWD_MAX / v.abs().max()
             v = check_and_convert(v, v_scale)
         else:
-            q_scale = torch.tensor([1.], device=q.device)
-            k_scale = torch.tensor([1.], device=q.device)
-            v_scale = torch.tensor([1.], device=q.device)
+            q_descale = torch.scalar_tensor(1., device=q.device)
+            k_descale = torch.scalar_tensor(1., device=q.device)
+            v_scale = torch.scalar_tensor(1., device=q.device)
             p_scale = 1.
 
-        output, softmax_lse, exp_scores = attention_block_forward_triton_impl(
+        output, softmax_lse, exp_scores = torch.ops.torchtitan.attention_block_forward_triton_impl(
             q,
             k,
             v,
-            p_scale,
-            q_scale,
-            k_scale,
-            v_scale,
-            sm_scale,
-            alibi_slopes,
-            causal,
-            bias,
-            dropout_p,
-            layout,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlens_q,
-            max_seqlens_k,
-            return_scores,
-            use_exp2,
-            use_fp8,
+            q_descale,
+            k_descale,
+            v_scale=v_scale,
+            p_scale=p_scale,
+            sm_scale=sm_scale,
+            alibi_slopes=alibi_slopes,
+            causal=causal,
+            bias=bias,
+            dropout_p=dropout_p,
+            layout=layout,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlens_q=max_seqlens_q,
+            max_seqlens_k=max_seqlens_k,
+            return_scores=return_scores,
+            use_exp2=use_exp2,
+            use_fp8=use_fp8,
         )
 
         ctx.save_for_backward(q, k, v, output, softmax_lse, alibi_slopes, bias,
-                              q_scale, k_scale, v_scale)
+                              q_descale, k_descale, v_scale)
         ctx.use_fp8 = use_fp8
         ctx.sm_scale = sm_scale
         ctx.causal = causal
@@ -2430,7 +2378,7 @@ class _triton_attention_block(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         do = grad_outputs[0]
-        q, k, v, o, softmax_lse, alibi_slopes, bias, q_scale, k_scale, v_scale = ctx.saved_tensors
+        q, k, v, o, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_scale = ctx.saved_tensors
         assert bias is None, "Currently bias is not supported by fa backward function."
         assert do.dtype is torch.bfloat16, f"do should be bfloat16 but get {do.dtype}"
 
@@ -2451,31 +2399,27 @@ class _triton_attention_block(torch.autograd.Function):
         # do = do * _rescale
         _rescale = 1.
 
-        dq, dk, dv = attention_block_backward_triton_impl(
+        dq, dk, dv = torch.ops.torchtitan.attention_block_backward_triton_impl(
             do,
             q,
             k,
             v,
             o,
-            q_scale,
-            k_scale,
-            v_scale,
-            p_scale,
             softmax_lse,
-            None,
-            None,
-            None,
-            ctx.sm_scale,
-            alibi_slopes,
-            ctx.causal,
-            ctx.layout,
-            ctx.cu_seqlens_q,
-            ctx.cu_seqlens_k,
-            ctx.max_seqlens_q,
-            ctx.max_seqlens_k,
-            ctx.use_exp2,
-            ctx.use_fp8,
-            sequence_parallel=True,
+            q_descale,
+            k_descale,
+            v_scale,
+            p_scale=p_scale,
+            sm_scale=ctx.sm_scale,
+            alibi_slopes=alibi_slopes,
+            causal=ctx.causal,
+            layout=ctx.layout,
+            cu_seqlens_q=ctx.cu_seqlens_q,
+            cu_seqlens_k=ctx.cu_seqlens_k,
+            max_seqlen_q=ctx.max_seqlens_q,
+            max_seqlen_k=ctx.max_seqlens_k,
+            use_exp2=ctx.use_exp2,
+            use_fp8=ctx.use_fp8,
         )
         return dq / _rescale, dk / _rescale, dv / _rescale, None, None, None, None, None, None, None, None, None, None, None, None, None
 
@@ -2487,14 +2431,11 @@ def _fake_attention_backward_triton_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
-    q_scale: torch.Tensor,
-    k_scale: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    q_descale: torch.Tensor,
+    k_descale: torch.Tensor,
     v_scale: torch.Tensor,
     p_scale: torch.Tensor,
-    softmax_lse: torch.Tensor,
-    dq: torch.Tensor | None,
-    dk: torch.Tensor | None,
-    dv: torch.Tensor | None,
     sm_scale: float,
     alibi_slopes: torch.Tensor | None,
     causal: bool,
@@ -2505,13 +2446,9 @@ def _fake_attention_backward_triton_impl(
     max_seqlen_k: int,
     use_exp2: bool,
     use_fp8: bool,
-    sequence_parallel: bool = True,
-) -> List[torch.Tensor]:
-    return [
-        torch.empty_like(q, dtype=fwd_torch_dtype),
-        torch.empty_like(k, dtype=fwd_torch_dtype),
-        torch.empty_like(v, dtype=fwd_torch_dtype),
-    ]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q, dtype=fwd_torch_dtype), torch.empty_like(
+        k, dtype=fwd_torch_dtype), torch.empty_like(v, dtype=fwd_torch_dtype),
 
 
 @attention_block_forward_triton_impl.register_fake
@@ -2519,10 +2456,10 @@ def fake_attention_block_forward_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    p_scale: float,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_scale: torch.Tensor,
+    p_scale: float,
     sm_scale: float,
     alibi_slopes: Optional[torch.Tensor],
     causal: bool,
@@ -2536,7 +2473,7 @@ def fake_attention_block_forward_triton_impl(
     return_scores: bool,
     use_exp2: bool,
     use_fp8: bool,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     o_shape = list(q.shape)
     o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
     o = torch.empty(
@@ -2574,14 +2511,49 @@ def fake_attention_block_forward_triton_impl(
 
     # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
     if is_varlen:
-        softmax_lse = torch.empty((q.shape[0], nheads_q),
+        softmax_lse = torch.empty((q.shape[0] * 2, nheads_q),
                                   device=q.device,
                                   dtype=torch.float32)
     else:
         softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q * 2),
                                   device=q.device,
                                   dtype=torch.float32)
-    return [o, softmax_lse, exp_scores]
+    return o, softmax_lse, exp_scores
 
 
-triton_attention_block = _triton_attention_block.apply
+def triton_attention_block(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alibi_slopes: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    sm_scale: float,
+    dropout_p: float,
+    cu_seqlens_q: int,
+    cu_seqlens_k: int,
+    max_seqlens_q: int,
+    max_seqlens_k: int,
+    causal: bool,
+    return_scores: bool,
+    use_exp2: bool,
+    layout: str,
+    use_fp8: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return _triton_attention_block.apply(
+        q,
+        k,
+        v,
+        alibi_slopes,
+        bias,
+        sm_scale,
+        dropout_p,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlens_q,
+        max_seqlens_k,
+        causal,
+        return_scores,
+        use_exp2,
+        layout,
+        use_fp8,
+    )
