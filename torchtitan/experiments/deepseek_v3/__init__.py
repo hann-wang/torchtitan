@@ -64,7 +64,6 @@ deepseek_configs = {
             "original_max_position_embeddings": 4096,
             "type": "yarn",
         },
-        load_balance_coeff=None,
     ),
     "V2-Lite":
     deepseek_config_registry["deepseek-ai/DeepSeek-V2-Lite"],

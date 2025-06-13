@@ -359,22 +359,14 @@ class MoE(nn.Module):
 
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
+        self.expert_bias_enabled = self.load_balance_coeff is not None and self.load_balance_coeff > 0
         # the fields below are defined even when load_balance_coeff is None
         # to make initialization and checkpointing code simpler
-        if self.topk_method == "noaux_tc":
-            # Changed from torch.empty to torch.rand to avoid non-even
-            # distribution for runs without actual weigths
-            self.register_parameter(
-                "expert_bias",
-                torch.nn.Parameter(
-                    torch.randn(self.num_experts, dtype=torch.get_default_dtype())),
-            )
-        else:
-            self.register_buffer(
-                "expert_bias",
-                torch.randn(self.num_experts, dtype=torch.get_default_dtype()),
-                persistent=True,
-            )
+        self.register_buffer(
+            "expert_bias",
+            torch.randn(self.num_experts, dtype=torch.get_default_dtype()),
+            persistent=True,
+        )
 
         self.register_buffer(
             "tokens_per_expert",
@@ -384,17 +376,18 @@ class MoE(nn.Module):
 
         # NOTE: forward hook, forward pre hook, or backward pre hook
         #       would conflict with activation checkpointing
-        if self.load_balance_coeff is not None and self.load_balance_coeff > 0:
+        if self.expert_bias_enabled:
             self.register_full_backward_hook(self._update_expert_bias)
 
     def _update_expert_bias(self, *_):
-        expert_bias_delta = self.load_balance_coeff * torch.sign(
-            self.tokens_per_expert.mean() - self.tokens_per_expert
-        )
-        expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
-        self.expert_bias.add_(expert_bias_delta)
+        with torch.no_grad():
+            expert_bias_delta = self.load_balance_coeff * torch.sign(
+                self.tokens_per_expert.mean() - self.tokens_per_expert
+            )
+            expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
+            self.expert_bias.add_(expert_bias_delta)
 
-        self.tokens_per_expert.zero_()
+            self.tokens_per_expert.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -406,23 +399,37 @@ class MoE(nn.Module):
         """
         bs, slen, dim = x.shape
 
-        if isinstance(self.expert_bias, DTensor):
-            assert self.expert_bias.placements == (Replicate(),)
-            expert_bias = self.expert_bias.to_local()
-        else:
-            expert_bias = self.expert_bias
-
         # top_scores and selected_indices shape (bs*slen*top_k,)
         # num_local_tokens_per_expert shape (num_experts,)
         (
             top_scores,
             token_indices,
             num_local_tokens_per_expert,
-        ) = self.router(x.reshape(bs * slen, dim), expert_bias)
+        ) = self.router(x.reshape(bs * slen, dim), self.expert_bias)
 
-        if self.topk_method == "noaux":
-            # will be used to update the expert bias for load balancing
-            self.tokens_per_expert += num_local_tokens_per_expert
+        # TODO: Find a better place to initialize the token dispatcher.
+        #       I tried putting it in PrepareModuleInputOutputWithParams._apply,
+        #       but caused torch compiling issues
+        if (isinstance(self.experts.w1, DTensor)
+                and self.experts.w1.placements == (Shard(0), )):
+            self.token_dispatcher = TorchAllToAllTokenDispatcher(
+                num_experts=self.num_experts,
+                ep_size=self.experts.w1.device_mesh.size(),
+                ep_group=self.experts.w1.device_mesh.get_group(),
+            )
+
+        # Prevent extra local tokens accumulation on evaluation or activation recomputation
+        if self.expert_bias_enabled and torch.is_grad_enabled():
+            with torch.no_grad():
+                num_local_tokens_per_expert_detached = num_local_tokens_per_expert.detach().clone()
+                if self.token_dispatcher.ep_group is not None:
+                    # sum all num_local_tokens_per_expert from ep_mesh
+                    torch.distributed.all_reduce(
+                        num_local_tokens_per_expert_detached,
+                        group=self.token_dispatcher.ep_group,
+                    )
+                # will be used to update the expert bias for load balancing
+                self.tokens_per_expert += num_local_tokens_per_expert_detached
 
         # shape (bs*slen*top_k, dim)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
@@ -434,16 +441,6 @@ class MoE(nn.Module):
             index=token_indices.clone(
             ),  # FIXME: avoid NaN in the backward pass, maybe changed by permute_indices, related to ROCm?
         )
-
-        # TODO: Find a better place to initialize the token dispatcher.
-        #       I tried putting it in PrepareModuleInputOutputWithParams._apply,
-        #       but caused torch compiling isses
-        if (isinstance(self.experts.w1, DTensor) and self.experts.w1.placements == (Shard(0),)):
-            self.token_dispatcher = TorchAllToAllTokenDispatcher(
-                num_experts=self.num_experts,
-                ep_size=self.experts.w1.device_mesh.size(),
-                ep_group=self.experts.w1.device_mesh.get_group(),
-            )
 
         (
             gathered_tokens,

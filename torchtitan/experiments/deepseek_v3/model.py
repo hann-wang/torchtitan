@@ -99,33 +99,25 @@ class MoE(Llama4MoE):
 
         # auxiliary-loss-free load balancing
         self.load_balance_coeff = model_args.load_balance_coeff
+        self.expert_bias_enabled = self.load_balance_coeff is not None and self.load_balance_coeff > 0
 
         # the fields below are defined even when load_balance_coeff is None
         # to make initialization and checkpointing code simpler
-        if self.topk_method == "noaux_tc":
-            # Changed from torch.empty to torch.rand to avoid non-even
-            # distribution for runs without actual weigths
-            self.register_parameter(
-                "expert_bias",
-                torch.nn.Parameter(
-                    torch.randn(self.num_experts, dtype=torch.get_default_dtype())),
-            )
-        else:
-            self.register_buffer(
-                "expert_bias",
-                torch.randn(self.num_experts, dtype=torch.get_default_dtype()),
-                persistent=True,
-            )
+        self.register_buffer(
+            "expert_bias",
+            torch.randn(self.num_experts, dtype=torch.float32),
+            persistent=True,
+        )
 
         self.register_buffer(
             "tokens_per_expert",
-            torch.zeros(self.num_experts, dtype=torch.get_default_dtype()),
+            torch.zeros(self.num_experts, dtype=torch.float32),
             persistent=True,
         )
 
         # NOTE: forward hook, forward pre hook, or backward pre hook
         #       would conflict with activation checkpointing
-        if self.load_balance_coeff is not None and self.load_balance_coeff > 0:
+        if self.expert_bias_enabled:
             self.register_full_backward_hook(self._update_expert_bias)
 
 
