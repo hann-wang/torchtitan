@@ -377,7 +377,10 @@ class MoE(nn.Module):
         # NOTE: forward hook, forward pre hook, or backward pre hook
         #       would conflict with activation checkpointing
         if self.expert_bias_enabled:
-            self.register_full_backward_hook(self._update_expert_bias)
+            # FIXME: Should be register_full_backward_hook.
+            #        Use register_forward_hook for now until wrap_triton is
+            #        supported by compiled autograd.
+            self.register_forward_hook(self._update_expert_bias)
 
     def _update_expert_bias(self, *_):
         with torch.no_grad():

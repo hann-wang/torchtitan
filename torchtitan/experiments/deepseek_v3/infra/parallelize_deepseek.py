@@ -149,7 +149,10 @@ def parallelize_deepseek(
                 if load_balance_coeff is not None and load_balance_coeff > 0:
                     # prepend=True so that the sync runs before
                     # the _update_expert_bias hook in MoE
-                    transformer_block.moe.register_full_backward_hook(
+                    # FIXME: Should be register_full_backward_hook.
+                    #        Use register_forward_hook for now until wrap_triton is
+                    #        supported by compiled autograd.
+                    transformer_block.moe.register_forward_hook(
                         _sync_tokens_per_expert, prepend=True)
                 else:
                     break
