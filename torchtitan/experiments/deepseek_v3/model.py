@@ -625,62 +625,45 @@ class AttentionFlashAttention2(Attention):
             q = self.q_proj(hidden_states)
         else:
             q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-        q = q.view(bsz, q_len, -1, self.q_head_dim).transpose(1, 2)
-        current_num_heads = q.shape[1]
+        q = q.view(bsz, q_len, -1, self.q_head_dim)
+        current_num_heads = q.shape[2]
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         compressed_kv, k_pe = torch.split(
             compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim)
         kv = (self.kv_b_proj(self.kv_a_layernorm(compressed_kv)).view(
             bsz, q_len, -1,
-            self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2))
+            self.qk_nope_head_dim + self.v_head_dim))
 
         k_nope, value_states = torch.split(
             kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        kv_seq_len = value_states.shape[-2]
+        kv_seq_len = value_states.shape[1]
 
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
 
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids, unsqueeze_dim=2)
 
-        query_states = k_pe.new_empty(bsz, current_num_heads, q_len,
+        query_states = k_pe.new_empty(bsz, q_len, current_num_heads,
                                       self.q_head_dim)
         query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
         query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
 
-        key_states = k_pe.new_empty(bsz, current_num_heads, q_len,
+        key_states = k_pe.new_empty(bsz, q_len, current_num_heads,
                                     self.q_head_dim)
         key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
         key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
-
-        if attention_mask is not None:
-            # Attention mask was made 4D because the `attn_weights` above is 4D.
-            # We probably can make this mask smarter if we want to pack sequences
-            # together, instead of using padding. This optimization can be used in
-            # inference. For training, if we want to pack sequences, data loader
-            # will pass in a mask containing such info.
-            attention_mask = _prepare_4d_causal_attention_mask(
-                attention_mask,  # None, or user provided mask in 2D
-                (bsz, q_len),
-                hidden_states,
-                0,  # past_key_values_length, 0 when training
-            )
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
 
         assert attention_mask is None
         assert q_len == kv_seq_len
 
         if not self.use_fp8 and USE_SDPA:
             attn_output = torch.nn.functional.scaled_dot_product_attention(
-                query_states,
-                key_states,
-                value_states,
+                query_states.transpose(1, 2).contiguous(),
+                key_states.transpose(1, 2).contiguous(),
+                value_states.transpose(1, 2).contiguous(),
                 dropout_p=0.0,
                 is_causal=True,
                 scale=self.softmax_scale,
@@ -689,9 +672,9 @@ class AttentionFlashAttention2(Attention):
             if self.use_fp8:
                 assert self.use_fp8_fa_block_scales
             attn_output = flash_attention_forward(
-                query_states.transpose(1, 2),
-                key_states.transpose(1, 2),
-                value_states.transpose(1, 2),
+                query_states,
+                key_states,
+                value_states,
                 softmax_scale=self.softmax_scale,
                 dropout=0.0,
                 is_causal=True,
