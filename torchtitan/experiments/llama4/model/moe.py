@@ -364,13 +364,13 @@ class MoE(nn.Module):
         # to make initialization and checkpointing code simpler
         self.register_buffer(
             "expert_bias",
-            torch.randn(self.num_experts, dtype=torch.get_default_dtype()),
+            torch.zeros(self.num_experts, dtype=torch.float32),
             persistent=True,
         )
 
         self.register_buffer(
             "tokens_per_expert",
-            torch.zeros(self.num_experts, dtype=torch.get_default_dtype()),
+            torch.zeros(self.num_experts, dtype=torch.float32),
             persistent=True,
         )
 
@@ -429,7 +429,7 @@ class MoE(nn.Module):
                         group=self.token_dispatcher.ep_group,
                     )
                 # will be used to update the expert bias for load balancing
-                self.tokens_per_expert += num_local_tokens_per_expert_detached
+                self.tokens_per_expert.add_(num_local_tokens_per_expert_detached)
 
         # shape (bs*slen*top_k, dim)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)
@@ -525,5 +525,5 @@ class MoE(nn.Module):
         if self.shared_expert is not None:
             self.shared_expert.init_weights(init_std)
 
-        nn.init.normal_(self.expert_bias)
+        nn.init.zeros_(self.expert_bias)
         nn.init.zeros_(self.tokens_per_expert)
