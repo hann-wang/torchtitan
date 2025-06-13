@@ -41,9 +41,9 @@ export PYTHONFAULTHANDLER=1
 # export NCCL_DEBUG=INFO
 # NCCL_DEBUG_SUBSYS=INIT,GRAPH,ENV
 
-# # on your cluster you might need these:
-# # set the network interface
-# export NCCL_SOCKET_IFNAME="eth0,en,eth,em,bond"
+# on your cluster you might need these:
+# set the network interface
+export NCCL_SOCKET_IFNAME="eno0,eth0,eth1,eth2,eth3,eth4,eth5,eth6,eth7"
 export NCCL_BUFFSIZE=2097152
 # #export TORCH_DIST_INIT_BARRIER=1
 # export FI_EFA_SET_CUDA_SYNC_MEMOPS=0
@@ -72,6 +72,7 @@ DOCKER_RUN_CMD=${DOCKER_RUN_CMD:-"docker run --rm -t -u 1003:110 \
     -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e LOG_RANK=${LOG_RANK} \
     -e NCCL_DEBUG=${NCCL_DEBUG} \
+    -e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME} \
     -e NCCL_BUFFSIZE=${NCCL_BUFFSIZE} \
     -e PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER} \
     -e LOGLEVEL=${LOGLEVEL} \

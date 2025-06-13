@@ -7,7 +7,7 @@
 # Instella-200b (deepseek-v3 like)
 
 [job]
-dump_folder = "./instella-200b-bf16-bs7-fsdp4-ep8-outputs"
+dump_folder = "./instella-200b-fp8-bs7-fsdp4-ep8-outputs"
 description = "Instella-200b training"
 
 [profiling]
@@ -25,7 +25,7 @@ enable_wandb = false
 name = "DeepSeek"
 flavor = "200b"
 tokenizer_path = "./assets/tokenizer/original/tokenizer.model"
-# converters = ["float8"]
+converters = ["float8"]
 
 [optimizer]
 name = "AdamW"
