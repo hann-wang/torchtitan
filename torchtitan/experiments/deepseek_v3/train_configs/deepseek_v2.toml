@@ -62,7 +62,7 @@ enable_tp2ep = false
 enable_checkpoint = false
 folder = "checkpoint"
 interval = 1000
-model_weights_only = false
+last_save_model_weights_only = false
 export_dtype = "bfloat16"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
 
