@@ -13,8 +13,8 @@ from torchtitan.datasets.tokenizer.tiktoken import build_tiktoken_tokenizer
 from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 from torchtitan.models.llama3 import pipeline_llama
-from torchtitan.experiments.llama4.infra.parallelize_llama import update_router_expert_bias
-from .infra.parallelize_deepseek import parallelize_deepseek
+from torchtitan.experiments.llama4.infra.parallelize import update_router_expert_bias
+from .infra.parallelize import parallelize_deepseek
 from .model_config import (
     ModelArgs,
     deepseek_config_registry,

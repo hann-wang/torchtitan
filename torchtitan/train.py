@@ -160,7 +160,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
             )
             with torch.device("meta"):
-                model = model_cls.from_model_args(model_args)
+                model = model_cls(model_args)
 
         else:
             logger.info(
@@ -481,12 +481,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if not self.metrics_processor.should_log(self.step):
             return
 
-        if (
-            parallel_dims.dp_replicate_enabled
-            or parallel_dims.dp_shard_enabled
-            or parallel_dims.cp_enabled
-            or self.ft_manager.enabled
-        ):
+        if parallel_dims.dp_cp_enabled or self.ft_manager.enabled:
             loss = loss.detach()
             # Skip ft manager communication when using semi sync training
             use_ft_pg = (

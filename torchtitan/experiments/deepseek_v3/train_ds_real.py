@@ -29,7 +29,7 @@ from torchtitan.config_manager import ConfigManager, JobConfig
 from torchtitan.datasets.hf_datasets import build_hf_dataloader
 from torchtitan.distributed import ParallelDims
 
-from torchtitan.experiments.deepseek_v3.infra.parallelize_deepseek import (
+from torchtitan.experiments.deepseek_v3.infra.parallelize import (
     parallelize_deepseek,
 )
 

@@ -19,15 +19,13 @@ from torch.distributed.tensor.parallel import (
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
 
-from torchtitan.models.llama3.parallelize_llama import (
+from torchtitan.models.llama3.infra.parallelize import (
     apply_ac,
     apply_compile,
     apply_ddp,
     apply_fsdp,
 )
 from torchtitan.tools.logging import logger
-
-from ..model import MoE
 
 
 def parallelize_deepseek(
