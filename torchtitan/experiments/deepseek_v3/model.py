@@ -115,11 +115,6 @@ class MoE(Llama4MoE):
             persistent=True,
         )
 
-        # NOTE: forward hook, forward pre hook, or backward pre hook
-        #       would conflict with activation checkpointing
-        if self.expert_bias_enabled:
-            self.register_full_backward_hook(self._update_expert_bias)
-
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
@@ -700,9 +695,11 @@ class DecoderLayer(nn.Module):
                 and layer_idx % config.moe_layer_freq == 0):
             self.moe = MoE(config)
             self.feed_forward = None
+            self.moe_enabled = True
         else:
             self.moe = None
             self.feed_forward = MLP(config)
+            self.moe_enabled = False
 
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(

@@ -374,23 +374,6 @@ class MoE(nn.Module):
             persistent=True,
         )
 
-        # NOTE: forward hook, forward pre hook, or backward pre hook
-        #       would conflict with activation checkpointing
-        if self.expert_bias_enabled:
-            # FIXME: Should be register_full_backward_hook.
-            #        Use register_forward_hook for now until wrap_triton is
-            #        supported by compiled autograd.
-            self.register_forward_hook(self._update_expert_bias)
-
-    def _update_expert_bias(self, *_):
-        with torch.no_grad():
-            expert_bias_delta = self.load_balance_coeff * torch.sign(
-                self.tokens_per_expert.mean() - self.tokens_per_expert
-            )
-            expert_bias_delta = expert_bias_delta - expert_bias_delta.mean()
-            self.expert_bias.add_(expert_bias_delta)
-
-            self.tokens_per_expert.zero_()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -424,15 +407,7 @@ class MoE(nn.Module):
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
         if self.expert_bias_enabled and torch.is_grad_enabled():
             with torch.no_grad():
-                num_local_tokens_per_expert_detached = num_local_tokens_per_expert.detach().clone()
-                if self.token_dispatcher.ep_group is not None:
-                    # sum all num_local_tokens_per_expert from ep_mesh
-                    torch.distributed.all_reduce(
-                        num_local_tokens_per_expert_detached,
-                        group=self.token_dispatcher.ep_group,
-                    )
-                # will be used to update the expert bias for load balancing
-                self.tokens_per_expert.add_(num_local_tokens_per_expert_detached)
+                self.tokens_per_expert.add_(num_local_tokens_per_expert)
 
         # shape (bs*slen*top_k, dim)
         token_indices = token_indices.reshape(-1, 1).expand(-1, dim)

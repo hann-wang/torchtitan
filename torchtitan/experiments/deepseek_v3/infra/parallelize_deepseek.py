@@ -134,29 +134,6 @@ def parallelize_deepseek(
             enable_compiled_autograd,
         )
 
-    # for MoE auxiliary-loss-free load balancing
-    if dp_mesh is not None:
-        # NOTE: Currently this sync is blocking (thus exposed) and happens on the
-        # default compute stream. Need to assess if this is OK performance-wise.
-        def _sync_tokens_per_expert(module, *_):
-            assert isinstance(module, MoE)
-            torch.distributed.all_reduce(module.tokens_per_expert,
-                                         group=dp_mesh.get_group())
-
-        for transformer_block in model.model.layers.values():
-            if transformer_block.moe is not None:
-                load_balance_coeff = transformer_block.moe.load_balance_coeff
-                if load_balance_coeff is not None and load_balance_coeff > 0:
-                    # prepend=True so that the sync runs before
-                    # the _update_expert_bias hook in MoE
-                    # FIXME: Should be register_full_backward_hook.
-                    #        Use register_forward_hook for now until wrap_triton is
-                    #        supported by compiled autograd.
-                    transformer_block.moe.register_forward_hook(
-                        _sync_tokens_per_expert, prepend=True)
-                else:
-                    break
-
     return model
 
 
