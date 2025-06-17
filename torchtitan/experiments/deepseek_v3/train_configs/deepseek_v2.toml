@@ -30,7 +30,7 @@ converters = ["float8"]
 [optimizer]
 name = "AdamW"
 lr = 4.2e-4
-eps = 1e-15
+eps = 1e-8
 # B1 = 0.9 / B2 = 0.95
 
 [lr_scheduler]
