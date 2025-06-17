@@ -2016,9 +2016,10 @@ def attention_block_backward_triton_impl(
             do_scale = F8_BWD_MAX / do.abs().max()
             do_fp8 = (do * do_scale).clamp(
                 min=-F8_BWD_MAX, max=F8_BWD_MAX).to(dtype=get_f8_bwd_dtype())
+            # apply qdq to do
+            do = do_fp8.to(do.dtype) / do_scale
             do_scale = 1. / do_scale * torch.ones(_shape, dtype=torch.float32, device=q.device)
-            # apply qdq to o and do
-            do = do_fp8.to(do.dtype) * do_scale
+            # apply qdq to o
             o_scale = F8_BWD_MAX / o.abs().max()
             o = (o * o_scale).clamp(min=-F8_BWD_MAX, max=F8_BWD_MAX) / o_scale
         stride_descalez, stride_descaleh, stride_descalem = do_scale.stride()
