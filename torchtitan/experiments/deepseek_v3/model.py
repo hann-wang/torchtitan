@@ -664,8 +664,6 @@ class AttentionFlashAttention2(Attention):
                 scale=self.softmax_scale,
             ).transpose(1, 2)
         else:
-            if self.use_fp8:
-                assert self.use_fp8_fa_block_scales
             attn_output = flash_attention_forward(
                 query_states,
                 key_states,
@@ -674,6 +672,7 @@ class AttentionFlashAttention2(Attention):
                 dropout=0.0,
                 is_causal=True,
                 use_fp8=self.use_fp8,
+                use_fp8_fa_block_scales=self.use_fp8_fa_block_scales,
             )
 
         attn_output = attn_output.reshape(bsz, q_len,

@@ -194,7 +194,8 @@ def flash_attention_forward(
     is_causal: bool,
     dropout: float = 0.0,
     softmax_scale: Optional[float] = None,
-    use_fp8: Optional[bool] = False,
+    use_fp8: bool = False,
+    use_fp8_fa_block_scales: bool = True,
 ):
     """
     Calls the forward method of Flash Attention - if the input hidden states contain at least one padding token
@@ -260,7 +261,8 @@ def flash_attention_forward(
         # use_exp2
         True,
         "bshd",
-        use_fp8,
+        use_fp8=use_fp8,
+        use_fp8_fa_block_scales=use_fp8_fa_block_scales,
     )
     attn_output = triton_results[0]
 

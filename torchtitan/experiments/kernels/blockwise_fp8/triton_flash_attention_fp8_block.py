@@ -1427,7 +1427,6 @@ def _bwd_kernel_dkdv(
 
     if USE_FP8:
         blk_k_descale = k_descale.gather(index=idx_tensor, axis=0)
-
     else:
         blk_k_descale = 1.
 
@@ -1931,6 +1930,7 @@ def attention_block_backward_triton_impl(
     max_seqlen_k: Optional[int],
     use_exp2: bool,
     use_fp8: bool,
+    use_fp8_fa_block_scales: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if DEBUG:
         print("####################################################")
@@ -2006,11 +2006,21 @@ def attention_block_backward_triton_impl(
         )
 
     if use_fp8:
-        do_fp8 = torch.empty(do.shape,
-                             dtype=get_f8_bwd_dtype(),
-                             device=q.device)
         _shape = (batch, nheads_q, triton.cdiv(max_seqlen_q, FIXED_BLOCK_M))
-        do_scale = torch.empty(_shape, dtype=torch.float32, device=q.device)
+        if use_fp8_fa_block_scales:
+            do_fp8 = torch.empty(do.shape,
+                                 dtype=get_f8_bwd_dtype(),
+                                 device=q.device)
+            do_scale = torch.empty(_shape, dtype=torch.float32, device=q.device)
+        else:
+            do_scale = F8_BWD_MAX / do.abs().max()
+            do_fp8 = (do * do_scale).clamp(
+                min=-F8_BWD_MAX, max=F8_BWD_MAX).to(dtype=get_f8_bwd_dtype())
+            do_scale = 1. / do_scale * torch.ones(_shape, dtype=torch.float32, device=q.device)
+            # apply qdq to o and do
+            do = do_fp8.to(do.dtype) * do_scale
+            o_scale = F8_BWD_MAX / o.abs().max()
+            o = (o * o_scale).clamp(min=-F8_BWD_MAX, max=F8_BWD_MAX) / o_scale
         stride_descalez, stride_descaleh, stride_descalem = do_scale.stride()
         stride_qscalez, stride_qscaleh, stride_qscalem = q_descale.stride()
         stride_kscalez, stride_kscaleh, stride_kscalem = k_descale.stride()
@@ -2034,7 +2044,7 @@ def attention_block_backward_triton_impl(
         do_fp8,
         do_scale,
         softmax_lse_delta,
-        use_fp8,
+        use_fp8 and use_fp8_fa_block_scales,
         stride_oz,
         stride_oh,
         stride_om,
@@ -2314,6 +2324,7 @@ class _triton_attention_block(torch.autograd.Function):
         use_exp2: bool,
         layout: str,
         use_fp8: bool = False,
+        use_fp8_fa_block_scales: bool = True,
     ):
         if use_fp8:
             float8_fw = get_f8_fwd_dtype()
@@ -2327,8 +2338,28 @@ class _triton_attention_block(torch.autograd.Function):
             assert q.dtype != float8_fw
             assert k.dtype != float8_fw
             assert v.dtype != float8_fw
-            q, q_descale = block_scaling_node(q, FIXED_BLOCK_M)
-            k, k_descale = block_scaling_node(k, FIXED_BLOCK_N)
+            if use_fp8_fa_block_scales:
+                q, q_descale = block_scaling_node(q, FIXED_BLOCK_M)
+                k, k_descale = block_scaling_node(k, FIXED_BLOCK_N)
+            else:
+                b, s, h, _ = q.shape
+                q_scale = F8_FWD_MAX / q.abs().max()
+                q = check_and_convert(q, q_scale)
+                q_descale = 1. / q_scale * torch.ones(b,
+                                                      h,
+                                                      s // FIXED_BLOCK_M,
+                                                      dtype=torch.float32,
+                                                      device=q.device)
+
+                b, s, h, _ = k.shape
+                k_scale = F8_FWD_MAX / k.abs().max()
+                k = check_and_convert(k, k_scale)
+                k_descale = 1. / k_scale * torch.ones(b,
+                                                      h,
+                                                      s // FIXED_BLOCK_N,
+                                                      dtype=torch.float32,
+                                                      device=k.device)
+
             v_scale = F8_FWD_MAX / v.abs().max()
             v = check_and_convert(v, v_scale)
         else:
@@ -2372,6 +2403,7 @@ class _triton_attention_block(torch.autograd.Function):
         ctx.cu_seqlens_k = cu_seqlens_k
         ctx.max_seqlens_q = max_seqlens_q
         ctx.max_seqlens_k = max_seqlens_k
+        ctx.use_fp8_fa_block_scales = use_fp8_fa_block_scales
 
         return output, softmax_lse, exp_scores
 
@@ -2420,8 +2452,9 @@ class _triton_attention_block(torch.autograd.Function):
             max_seqlen_k=ctx.max_seqlens_k,
             use_exp2=ctx.use_exp2,
             use_fp8=ctx.use_fp8,
+            use_fp8_fa_block_scales=ctx.use_fp8_fa_block_scales,
         )
-        return dq / _rescale, dk / _rescale, dv / _rescale, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq / _rescale, dk / _rescale, dv / _rescale, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 @attention_block_backward_triton_impl.register_fake
@@ -2446,6 +2479,7 @@ def _fake_attention_backward_triton_impl(
     max_seqlen_k: int,
     use_exp2: bool,
     use_fp8: bool,
+    use_fp8_fa_block_scales: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return torch.empty_like(q, dtype=fwd_torch_dtype), torch.empty_like(
         k, dtype=fwd_torch_dtype), torch.empty_like(v, dtype=fwd_torch_dtype),
@@ -2538,6 +2572,7 @@ def triton_attention_block(
     use_exp2: bool,
     layout: str,
     use_fp8: bool = False,
+    use_fp8_fa_block_scales: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _triton_attention_block.apply(
         q,
@@ -2556,4 +2591,5 @@ def triton_attention_block(
         use_exp2,
         layout,
         use_fp8,
+        use_fp8_fa_block_scales,
     )

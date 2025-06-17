@@ -136,24 +136,44 @@ class Float8Converter(ModelConverter):
         if self.enable_fp8_gmm:
             self._add_gmm_observer(model)
 
-    def _add_attention_observer(self, model: nn.Module):
-        for mod in model.children():
+    def _add_attention_observer(self, model: nn.Module, prefix: str=""):
+        for mod_name, mod in model.named_children():
             if mod.__class__.__name__.endswith("FlashAttention2"):
-                mod.use_fp8 = True
-                mod.use_fp8_fa_block_scales = self.use_fp8_fa_block_scales
-                logger.info(
-                    f"Enable FP8 kernel for {mod.__class__.__name__} with use_fp8_fa_block_scales={self.use_fp8_fa_block_scales}."
-                )
+                skip = False
+                full_name = f"{prefix}{'.' if prefix else ''}{mod_name}"
+                for f in self.filter_fqns:
+                    if f in full_name:
+                        skip = True
+                        break
+                if not skip:
+                    mod.use_fp8 = True
+                    mod.use_fp8_fa_block_scales = self.use_fp8_fa_block_scales
+                    logger.info(
+                        f"Enable FP8 kernel for {full_name} with use_fp8_fa_block_scales={self.use_fp8_fa_block_scales}."
+                    )
+                else:
+                    logger.info(
+                        f"Skip enabling FP8 kernel for {full_name}."
+                    )
             else:
-                self._add_attention_observer(mod)
+                self._add_attention_observer(mod, f"{prefix}{'.' if prefix else ''}{mod_name}")
 
-    def _add_gmm_observer(self, model: nn.Module):
-        for mod in model.children():
+    def _add_gmm_observer(self, model: nn.Module, prefix: str=""):
+        for mod_name, mod in model.named_children():
             if mod.__class__.__name__.endswith("GroupedExperts"):
-                mod.use_fp8 = True
-                logger.info(f"Enable FP8 kernel for {mod.__class__.__name__}.")
+                skip = False
+                full_name = f"{prefix}{'.' if prefix else ''}{mod_name}"
+                for f in self.filter_fqns:
+                    if f in full_name:
+                        skip = True
+                        break
+                if not skip:
+                    mod.use_fp8 = True
+                    logger.info(f"Enable FP8 kernel for {full_name}.")
+                else:
+                    logger.info(f"Skip enabling FP8 kernel for {full_name}.")
             else:
-                self._add_gmm_observer(mod)
+                self._add_gmm_observer(mod, f"{prefix}{'.' if prefix else ''}{mod_name}")
 
     def post_optimizer_hook(self, model: nn.Module | list[nn.Module]):
         if not self.enabled:
