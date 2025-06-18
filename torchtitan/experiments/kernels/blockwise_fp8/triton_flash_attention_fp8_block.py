@@ -28,6 +28,8 @@ import triton.language as tl
 from torch._library import triton_op, wrap_triton
 from torchao.float8.float8_tensor import Float8Tensor
 
+from torchtitan.experiments.kernels.blockwise_fp8.differentiable_gradient_estimator import dge_bwd
+
 fwd_torch_dtype: tl.constexpr = torch.bfloat16
 bwd_torch_dtype: tl.constexpr = torch.float32
 # Seed the RNG so we get reproducible results for testing.
@@ -2310,11 +2312,14 @@ def block_scaling_node(tensor,
     MAX_E4M3 = torch.finfo(float8_dtype).max
     scale = MAX_E4M3 / tensor.abs().max(dim=-1)[0]
     tensor = tensor * scale.reshape(scale.shape + (1, ))
-    tensor = tensor.clamp(-MAX_E4M3, MAX_E4M3)
+    tensor = tensor.clamp(-MAX_E4M3,
+                          MAX_E4M3).reshape(B, H, L,
+                                            D).permute(0, 2, 1,
+                                                       3).contiguous()
+    dge_scale = dge_bwd(tensor, float8_dtype)
     tensor = tensor.to(float8_dtype)
-    tensor = tensor.reshape(B, H, L, D).permute(0, 2, 1, 3).contiguous()
     # [B, L, H, D]
-    return tensor, 1. / scale.to(torch.float32).contiguous()
+    return tensor, 1. / scale.to(torch.float32).contiguous(), dge_scale
 
 
 class _triton_attention_block(torch.autograd.Function):
@@ -2347,19 +2352,21 @@ class _triton_attention_block(torch.autograd.Function):
 
             def check_and_convert(t, scale):
                 finfo = torch.finfo(float8_fw)
-                return ((t * scale).clamp(min=finfo.min, max=finfo.max).to(
-                    dtype=float8_fw) if t.dtype != float8_fw else t)
+                t_scaled = (t * scale).clamp(min=finfo.min, max=finfo.max)
+                dge_scale = dge_bwd(t_scaled, float8_fw)
+                t_fp8 = t_scaled.to(dtype=float8_fw)
+                return t_fp8, dge_scale
 
             assert q.dtype != float8_fw
             assert k.dtype != float8_fw
             assert v.dtype != float8_fw
             if use_fp8_fa_block_scales:
-                q, q_descale = block_scaling_node(q, FIXED_BLOCK_M)
-                k, k_descale = block_scaling_node(k, FIXED_BLOCK_N)
+                q, q_descale, q_dge_scale = block_scaling_node(q, FIXED_BLOCK_M)
+                k, k_descale, k_dge_scale = block_scaling_node(k, FIXED_BLOCK_N)
             else:
                 b, s, h, _ = q.shape
                 q_scale = F8_FWD_MAX / q.abs().max()
-                q = check_and_convert(q, q_scale)
+                q, q_dge_scale = check_and_convert(q, q_scale)
                 q_descale = 1. / q_scale * torch.ones(b,
                                                       h,
                                                       s // FIXED_BLOCK_M,
@@ -2368,7 +2375,7 @@ class _triton_attention_block(torch.autograd.Function):
 
                 b, s, h, _ = k.shape
                 k_scale = F8_FWD_MAX / k.abs().max()
-                k = check_and_convert(k, k_scale)
+                k, k_dge_scale = check_and_convert(k, k_scale)
                 k_descale = 1. / k_scale * torch.ones(b,
                                                       h,
                                                       s // FIXED_BLOCK_N,
@@ -2376,14 +2383,18 @@ class _triton_attention_block(torch.autograd.Function):
                                                       device=k.device)
             if use_hp_v:
                 v_scale = torch.scalar_tensor(1., device=q.device)
+                v_dge_scale = v_scale
             else:
                 v_scale = F8_FWD_MAX / v.abs().max()
-                v = check_and_convert(v, v_scale)
+                v, v_dge_scale = check_and_convert(v, v_scale)
         else:
             q_descale = torch.scalar_tensor(1., device=q.device)
             k_descale = torch.scalar_tensor(1., device=q.device)
             v_scale = torch.scalar_tensor(1., device=q.device)
             p_scale = 1.
+            q_dge_scale = k_dge_scale = v_dge_scale = torch.scalar_tensor(
+                1., device=q.device)
+        # print(f"q_dge_scale={q_dge_scale}, k_dge_scale={k_dge_scale}, v_dge_scale={v_dge_scale}")
 
         output, softmax_lse, exp_scores = torch.ops.torchtitan.attention_block_forward_triton_impl(
             q,
@@ -2408,8 +2419,21 @@ class _triton_attention_block(torch.autograd.Function):
             use_fp8=use_fp8,
         )
 
-        ctx.save_for_backward(q, k, v, output, softmax_lse, alibi_slopes, bias,
-                              q_descale, k_descale, v_scale)
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            output,
+            softmax_lse,
+            alibi_slopes,
+            bias,
+            q_descale,
+            k_descale,
+            v_scale,
+            q_dge_scale,
+            k_dge_scale,
+            v_dge_scale,
+        )
         ctx.use_fp8 = use_fp8
         ctx.sm_scale = sm_scale
         ctx.causal = causal
@@ -2428,7 +2452,8 @@ class _triton_attention_block(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         do = grad_outputs[0]
-        q, k, v, o, softmax_lse, alibi_slopes, bias, q_descale, k_descale, v_scale = ctx.saved_tensors
+        (q, k, v, o, softmax_lse, alibi_slopes, bias, q_descale, k_descale,
+         v_scale, q_dge_scale, k_dge_scale, v_dge_scale) = ctx.saved_tensors
         assert bias is None, "Currently bias is not supported by fa backward function."
         assert do.dtype is torch.bfloat16, f"do should be bfloat16 but get {do.dtype}"
 
@@ -2473,7 +2498,7 @@ class _triton_attention_block(torch.autograd.Function):
             use_fp8_fa_block_scales=ctx.use_fp8_fa_block_scales,
             use_hp_v=ctx.use_hp_v,
         )
-        return dq / _rescale, dk / _rescale, dv / _rescale, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq / _rescale * q_dge_scale, dk / _rescale * k_dge_scale, dv / _rescale * v_dge_scale, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 @attention_block_backward_triton_impl.register_fake
