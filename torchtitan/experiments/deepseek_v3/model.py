@@ -45,7 +45,7 @@ from torchtitan.experiments.deepseek_v3.model_config import ModelArgs
 from torchtitan.experiments.kernels.moe.token_dispatcher import DefaultTokenDispatcher
 from torchtitan.experiments.kernels.blockwise_fp8.blockwise_fa import flash_attention_forward
 
-USE_SDPA = True
+USE_SDPA = False
 
 
 def check_and_convert(t, scale):

@@ -620,6 +620,7 @@ def cg_grouped_gemm(
     expert_weights: torch.Tensor,
     expert_indices: torch.Tensor,
     use_fp8: bool = False,
+    transpose_weight: bool = True,
 ) -> torch.Tensor:
     """
     Interface for contiguous grouped GEMM with full backward pass support.
@@ -651,7 +652,8 @@ def cg_grouped_gemm(
         expert_weights = expert_weights.to_local()
         expert_indices = expert_indices.to_local()
 
-    expert_weights = expert_weights.transpose(-1, -2).contiguous()
+    if transpose_weight:
+        expert_weights = expert_weights.transpose(-1, -2).contiguous()
     res = ContiguousGroupedGEMM.apply(inputs, expert_weights, expert_indices,
                                        use_fp8)
 
@@ -775,10 +777,13 @@ def verify_cg_gemm_backward(
     expert_weights.grad.zero_()
 
     # Compute with our implementation
-    outputs = cg_grouped_gemm(inputs,
-                              expert_weights,
-                              expert_indices,
-                              use_fp8=use_fp8)
+    outputs = cg_grouped_gemm(
+        inputs,
+        expert_weights,
+        expert_indices,
+        use_fp8=use_fp8,
+        transpose_weight=False,
+    )
     loss = torch.nn.functional.mse_loss(outputs, target)
     loss.backward()
 
@@ -912,7 +917,13 @@ def benchmark_cg_gemm_backward(
     # Benchmark our Triton implementation
     def run_triton_backward():
         # Forward pass with our implementation
-        outputs = cg_grouped_gemm(inputs, expert_weights, expert_indices, use_fp8=use_fp8)
+        outputs = cg_grouped_gemm(
+            inputs,
+            expert_weights,
+            expert_indices,
+            use_fp8=use_fp8,
+            transpose_weight=False,
+        )
 
         # Backward pass
         outputs.backward(grad_output)
