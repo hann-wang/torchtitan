@@ -28,7 +28,7 @@ import triton.language as tl
 from torch._library import triton_op, wrap_triton
 from torchao.float8.float8_tensor import Float8Tensor
 
-from torchtitan.experiments.kernels.blockwise_fp8.differentiable_gradient_estimator import dge_bwd
+from torchtitan.experiments.kernels.blockwise_fp8.differentiable_gradient_estimator import (dge_bwd, BREAK_POINTS, INTERVALS,)
 
 fwd_torch_dtype: tl.constexpr = torch.bfloat16
 bwd_torch_dtype: tl.constexpr = torch.float32
@@ -1246,27 +1246,32 @@ def get_autotune_bwd_configs():
 autotune_bwd_configs, autotune_bwd_keys = get_autotune_bwd_configs()
 
 @triton.jit
+def triton_pow(x, y):
+    return tl.exp(tl.log(x) * y)
+
+@triton.jit
 def dge_bwd_triton(
     x,
     break_points,
     intervals,
-    n_breaks: tl.constexpr,
+    n_breaks: tl.constexpr = 255,
     k: tl.constexpr = 5,
 ):
-    idx = 0
+    idx = tl.full([64, 64], 0, dtype=tl.int32)
     for i in range(0, n_breaks - 1):
-        bp = tl.gather(break_points, i, dim=0)
+        idx_i = tl.full([1], i, dtype=tl.int32)
+        bp = tl.gather(break_points, idx_i, axis=0)
         idx = tl.where(x >= bp, i, idx)
 
-    delta = tl.gather(intervals_ptr, idx, dim=0)
+    delta = tl.gather(intervals, idx.view(64*64), axis=0).view(64, 64)
     half_delta = delta * 0.5
-    mid_point = tl.gather(break_points, idx, dim=0) + half_delta
+    mid_point = tl.gather(break_points, idx.view(64*64), axis=0).view(64, 64) + half_delta
 
     abs_diff = tl.abs(x - mid_point)
     pow1 = 1.0 / k
     pow2 = 1.0 - pow1
     safe_abs_diff = tl.where(abs_diff > 1e-7, abs_diff, 1e-7)
-    out = (half_delta ** pow2) * (safe_abs_diff ** (pow1 - 1.0)) / k
+    out = triton_pow(half_delta, pow2) * triton_pow(safe_abs_diff, (pow1 - 1.0)) / k
     out = tl.clamp(out, 0.0, 3.0)
     return out
 
@@ -1291,6 +1296,8 @@ def _bwd_kernel_dkdv(
     DK,
     DV,
     LD,
+    break_points_ptr,
+    intervals_ptr,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -1411,12 +1418,23 @@ def _bwd_kernel_dkdv(
         k_descale_offset = k_descale_ptr + off_z * stride_kscalez + off_h_k * stride_kscaleh + tl.arange(
             0, padded_kscale_block_num)  #  + q_start * stride_qm
         k_descale = tl.load(k_descale_offset, mask=kscale_mask, other=1.0)
-
+        break_points = tl.load(
+            break_points_ptr + tl.arange(0, 256),
+            mask=tl.arange(0, 256) < 255,
+            other=0.0,
+        )
+        intervals = tl.load(
+            intervals_ptr + tl.arange(0, 256),
+            mask=tl.arange(0, 256) < 254,
+            other=0.0,
+        )
     else:
         q_descale = 1.
         k_descale = 1.
         v_scale = 1.
         do_descale = 1.
+        break_points = 1.
+        intervals = 1.
 
     if CAUSAL:
         causal_boundary = start_n * BLOCK_N - BLOCK_M
@@ -1459,12 +1477,46 @@ def _bwd_kernel_dkdv(
 
     for group_idx in range(GROUP_SIZE):
         dk, dv = _attn_bwd_dkdv(
-            k, v, dk, dv, offs_d_qk, offs_d_v, offs_n, mask_d_qk, mask_d_v,
-            q_offset, do_offset, stride_qm, stride_qk, stride_dom, stride_dok,
-            ld_offset, stride_ldm, BLOCK_M, BLOCK_N, q_descale, do_descale,
-            blk_k_descale, v_scale, p_scale, sm_scale, log_p_scale, lo,
-            num_block_m, causal_boundary, USE_FP8, USE_EXP2, F8_FWD_MAX,
-            N_CTX_Q, N_CTX_K, CAUSAL, group_idx, USE_HP_V)
+            k,
+            v,
+            dk,
+            dv,
+            break_points,
+            intervals,
+            offs_d_qk,
+            offs_d_v,
+            offs_n,
+            mask_d_qk,
+            mask_d_v,
+            q_offset,
+            do_offset,
+            stride_qm,
+            stride_qk,
+            stride_dom,
+            stride_dok,
+            ld_offset,
+            stride_ldm,
+            BLOCK_M,
+            BLOCK_N,
+            q_descale,
+            do_descale,
+            blk_k_descale,
+            v_scale,
+            p_scale,
+            sm_scale,
+            log_p_scale,
+            lo,
+            num_block_m,
+            causal_boundary,
+            USE_FP8,
+            USE_EXP2,
+            F8_FWD_MAX,
+            N_CTX_Q,
+            N_CTX_K,
+            CAUSAL,
+            group_idx,
+            USE_HP_V,
+        )
 
         q_offset += stride_qh
         do_offset += stride_qh
@@ -1492,6 +1544,8 @@ def _attn_bwd_dkdv(
     v,
     dk,
     dv,
+    break_points,
+    intervals,
     offs_d_qk,
     offs_d_v,
     offs_n,
@@ -1590,8 +1644,13 @@ def _attn_bwd_dkdv(
             dp = tl.dot(do, v, out_dtype=tl.float32)
 
         if USE_FP8:
+            p_dge_scale = dge_bwd_triton(
+                p,
+                break_points,
+                intervals,
+            )
             dp_descale = blk_do_descale / v_scale
-            dp = dp * dp_descale
+            dp = dp * dp_descale * p_dge_scale
 
         Di = tl.gather(lds, index=tl.arange(BLOCK_M, 2 * BLOCK_M), axis=0)
         ds = ((p * (dp - Di[:, None])) * sm_scale / p_scale)
@@ -2146,6 +2205,8 @@ def attention_block_backward_triton_impl(
         batch_headsize_q,
         triton.cdiv(max_seqlen_q, FIXED_BLOCK_M),
     )
+    break_points = BREAK_POINTS[get_f8_fwd_dtype()].to(q.device)
+    intervals = INTERVALS[get_f8_fwd_dtype()].to(q.device)
     wrap_triton(_bwd_kernel_dq)[grid_bwd](
         q,
         k,
@@ -2248,6 +2309,8 @@ def attention_block_backward_triton_impl(
         dk,
         dv,
         softmax_lse_delta,
+        break_points,
+        intervals,
         stride_qz,
         stride_qh,
         stride_qm,
