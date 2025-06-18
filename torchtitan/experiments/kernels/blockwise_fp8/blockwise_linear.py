@@ -22,6 +22,7 @@ from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import 
     fp8_blockwise_weight_quant,
     fp8_blockwise_act_dequant,
 )
+from torchtitan.experiments.kernels.blockwise_fp8.differentiable_gradient_estimator import dge_bwd
 
 
 class BlockwiseFP8LinearFunction(torch.autograd.Function):
@@ -49,7 +50,13 @@ class BlockwiseFP8LinearFunction(torch.autograd.Function):
         x = x.contiguous().view(-1, original_shape[-1])  # Ensure x is 2D
 
         x, x_scale = fp8_blockwise_act_quant(x, block_size)
-        weight, w_scale = fp8_blockwise_weight_quant(weight, block_size)
+        weight_fp8, w_scale = fp8_blockwise_weight_quant(weight, block_size)
+
+        weight_scaled = torch.clamp(
+            weight / w_scale.repeat_interleave(
+                block_size, dim=-1).repeat_interleave(block_size, dim=-2),
+            -240, 240)
+        w_dge_scale = dge_bwd(weight_scaled, torch.float8_e4m3fnuz)
 
         # # debug
         # x_scale = torch.ones(
@@ -63,9 +70,9 @@ class BlockwiseFP8LinearFunction(torch.autograd.Function):
         #     device=weight.device,
         # )
 
-        y = blockwise_fp8_gemm(x, x_scale, weight, w_scale, block_size)
+        y = blockwise_fp8_gemm(x, x_scale, weight_fp8, w_scale, block_size)
 
-        ctx.save_for_backward(x, x_scale, weight, w_scale)
+        ctx.save_for_backward(x, x_scale, weight_fp8, w_scale, w_dge_scale)
         ctx.block_size = block_size
 
         return y.view(*original_shape[:-1], -1)  # Reshape back to original
@@ -76,7 +83,7 @@ class BlockwiseFP8LinearFunction(torch.autograd.Function):
         grad_output = grad_output.contiguous().view(-1, original_shape[-1])  # Ensure grad_output is 2D
 
         block_size = ctx.block_size
-        x, x_scale, weight, w_scale = ctx.saved_tensors
+        x, x_scale, weight, w_scale, w_dge_scale = ctx.saved_tensors
 
         # dequant-quant as deepseek-v3 paper
         inputs_dequant = fp8_blockwise_act_dequant(
@@ -137,7 +144,8 @@ class BlockwiseFP8LinearFunction(torch.autograd.Function):
             block_size=block_size,
         )
 
-        return grad_inputs.view(*original_shape[:-1], -1), grad_weights, None
+        return grad_inputs.view(*original_shape[:-1],
+                                -1), grad_weights * w_dge_scale, None
 
 
 single_mesh_dim_strategies = []

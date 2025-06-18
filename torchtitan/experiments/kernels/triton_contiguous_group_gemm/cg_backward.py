@@ -32,6 +32,7 @@ from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import 
     fp8_blockwise_weight_quant,
     fp8_blockwise_act_dequant,
 )
+from torchtitan.experiments.kernels.blockwise_fp8.differentiable_gradient_estimator import dge_bwd
 
 # ============ Triton kernel for contiguous grouped GEMM backward inputs ============
 torch_dtype = torch.bfloat16
@@ -495,8 +496,15 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
                 block_size=ALIGN_SIZE_M,
             )
             # Save for backward
+            weight_scaled = torch.clamp(
+                expert_weights / expert_weight_scales.repeat_interleave(
+                    ALIGN_SIZE_M, dim=-1).repeat_interleave(ALIGN_SIZE_M,
+                                                            dim=-2), -240,
+                240)
+            w_dge_scale = dge_bwd(weight_scaled, torch.float8_e4m3fnuz)
             ctx.save_for_backward(inputs_fp8, input_scales, expert_weights_fp8,
-                                  expert_weight_scales, expert_indices)
+                                  expert_weight_scales, expert_indices,
+                                  w_dge_scale)
         else:
             # Save for backward
             ctx.save_for_backward(inputs, expert_weights, expert_indices)
@@ -523,9 +531,10 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         """Backward pass for contiguous grouped GEMM."""
         use_fp8 = ctx.use_fp8
         if use_fp8:
-            inputs_fp8, input_scales, expert_weights, expert_weight_scales, expert_indices = ctx.saved_tensors
+            inputs_fp8, input_scales, expert_weights, expert_weight_scales, expert_indices, w_dge_scale = ctx.saved_tensors
         else:
             inputs, expert_weights, expert_indices = ctx.saved_tensors
+            w_dge_scale = 1.
 
         # Get number of experts
         num_experts = expert_weights.shape[0]
@@ -597,7 +606,7 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
         # No gradient for expert_indices (it's just an index tensor)
         grad_indices = None
 
-        return grad_inputs, grad_weights, grad_indices, None
+        return grad_inputs, grad_weights * w_dge_scale, grad_indices, None
 
 single_mesh_dim_strategies = []
 replicate_colwise_2x3: PlacementList = [
