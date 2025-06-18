@@ -1245,6 +1245,30 @@ def get_autotune_bwd_configs():
 
 autotune_bwd_configs, autotune_bwd_keys = get_autotune_bwd_configs()
 
+@triton.jit
+def dge_bwd_triton(
+    x,
+    break_points,
+    intervals,
+    n_breaks: tl.constexpr,
+    k: tl.constexpr = 5,
+):
+    idx = 0
+    for i in range(0, n_breaks - 1):
+        bp = tl.gather(break_points, i, dim=0)
+        idx = tl.where(x >= bp, i, idx)
+
+    delta = tl.gather(intervals_ptr, idx, dim=0)
+    half_delta = delta * 0.5
+    mid_point = tl.gather(break_points, idx, dim=0) + half_delta
+
+    abs_diff = tl.abs(x - mid_point)
+    pow1 = 1.0 / k
+    pow2 = 1.0 - pow1
+    safe_abs_diff = tl.where(abs_diff > 1e-7, abs_diff, 1e-7)
+    out = (half_delta ** pow2) * (safe_abs_diff ** (pow1 - 1.0)) / k
+    out = tl.clamp(out, 0.0, 3.0)
+    return out
 
 @triton.autotune(
     configs=autotune_bwd_configs,
