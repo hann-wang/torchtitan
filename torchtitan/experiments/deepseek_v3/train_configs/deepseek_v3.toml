@@ -7,7 +7,7 @@
 # DeepSeek V2 Lite
 
 [job]
-dump_folder = "./deepseek-v3-lite20b-fp8-triton-bs2-fsdp2-ep2-balance-outputs"
+dump_folder = "./deepseek-v3-lite20b-fp8-triton-bs2-fsdp2-ep2-balance-dge-wlinear-wgmm-fa-outputs"
 description = "DeepSeek v3 training"
 
 [profiling]
