@@ -1257,7 +1257,7 @@ def get_autotune_bwd_configs():
         ),
     ], [
         "BLOCK_DMODEL", "ACTUAL_BLOCK_DMODEL_QK", "ACTUAL_BLOCK_DMODEL_V",
-        "CAUSAL", "USE_FP8", "USE_HP_V"
+        "CAUSAL", "USE_FP8"
     ]
 
 
@@ -1340,7 +1340,6 @@ def _bwd_kernel_dkdv(
     USE_FP8: tl.constexpr,
     log_p_scale: tl.constexpr,
     F8_FWD_MAX: tl.constexpr,
-    USE_HP_V: tl.constexpr = False,
 ):
     # program ids
     off_hz = tl.program_id(0)
@@ -1466,7 +1465,7 @@ def _bwd_kernel_dkdv(
             ld_offset, stride_ldm, BLOCK_M, BLOCK_N, q_descale, do_descale,
             blk_k_descale, blk_v_descale, p_scale, sm_scale, log_p_scale, lo,
             num_block_m, causal_boundary, USE_FP8, USE_EXP2, F8_FWD_MAX,
-            N_CTX_Q, N_CTX_K, CAUSAL, group_idx, USE_HP_V)
+            N_CTX_Q, N_CTX_K, CAUSAL, group_idx)
 
         q_offset += stride_qh
         do_offset += stride_qh
@@ -1526,7 +1525,6 @@ def _attn_bwd_dkdv(
     N_CTX_K: tl.constexpr,
     CAUSAL: tl.constexpr,
     GROUP_IDX: tl.constexpr = 0,
-    USE_HP_V: tl.constexpr = False,
 ):
     idx_block_m = tl.full([1],
                           lo // BLOCK_M - 1 + GROUP_IDX * num_block_m,
@@ -1586,10 +1584,7 @@ def _attn_bwd_dkdv(
         do = tl.load(do_ptrs, mask=do_mask, other=0.0)
 
         # compute dp
-        if USE_HP_V:
-            dp = tl.dot(do.to(v.dtype), v, out_dtype=tl.float32)
-        else:
-            dp = tl.dot(do, v, out_dtype=tl.float32)
+        dp = tl.dot(do, v, out_dtype=tl.float32)
 
         if USE_FP8:
             dp_descale = blk_do_descale * v_descale
@@ -1703,7 +1698,6 @@ def _bwd_kernel_dq(
     USE_FP8: tl.constexpr,
     log_p_scale: tl.constexpr,
     F8_FWD_MAX: tl.constexpr,
-    USE_HP_V: tl.constexpr = False,
 ):
     # program ids
     off_hz = tl.program_id(0)
@@ -1829,7 +1823,7 @@ def _bwd_kernel_dq(
                       stride_vn, stride_vk, BLOCK_M, BLOCK_N, blk_q_descale,
                       k_descale, blk_do_descale, v_descale, p_scale, sm_scale,
                       log_p_scale, hi, num_block_m, causal_boundary, USE_FP8,
-                      USE_EXP2, F8_FWD_MAX, N_CTX_Q, N_CTX_K, CAUSAL, USE_HP_V)
+                      USE_EXP2, F8_FWD_MAX, N_CTX_Q, N_CTX_K, CAUSAL)
 
     dq_ptrs = dq_offset + offs_m[:, None] * stride_qm + offs_d_qk[
         None, :] * stride_qk
@@ -1871,7 +1865,6 @@ def _attn_bwd_dq(
     N_CTX_Q: tl.constexpr,
     N_CTX_K: tl.constexpr,
     CAUSAL: tl.constexpr,
-    USE_HP_V: tl.constexpr = False,
 ):
     idx_block_n = tl.full([1], -1, dtype=tl.int32)
     l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
@@ -1926,10 +1919,7 @@ def _attn_bwd_dq(
             p = tl.math.exp(qk - l_i[:, None] + log_p_scale)
 
         # compute dp
-        if USE_HP_V:
-            dp = tl.dot(do.to(v.dtype), tl.trans(v))
-        else:
-            dp = tl.dot(do, tl.trans(v))
+        dp = tl.dot(do, tl.trans(v))
 
         if USE_FP8:
             dp_descale = do_descale * blk_v_descale
@@ -1977,7 +1967,6 @@ def attention_block_backward_triton_impl(
     use_exp2: bool,
     use_fp8: bool,
     use_fp8_fa_block_scales: bool,
-    use_hp_v: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if DEBUG:
         print("####################################################")
@@ -2231,7 +2220,6 @@ def attention_block_backward_triton_impl(
         USE_FP8=use_fp8,
         log_p_scale=log_p_scale,
         F8_FWD_MAX=F8_FWD_MAX,
-        USE_HP_V=use_hp_v,
     )
 
     if use_fp8:
@@ -2321,7 +2309,6 @@ def attention_block_backward_triton_impl(
         USE_FP8=use_fp8,
         log_p_scale=log_p_scale,
         F8_FWD_MAX=F8_FWD_MAX,
-        USE_HP_V=use_hp_v,
     )
 
     if DEBUG:
@@ -2387,7 +2374,6 @@ class _triton_attention_block(torch.autograd.Function):
         layout: str,
         use_fp8: bool = False,
         use_fp8_fa_block_scales: bool = True,
-        use_hp_v: bool = True,
     ):
         if use_fp8:
             float8_fw = get_f8_fwd_dtype()
@@ -2474,7 +2460,6 @@ class _triton_attention_block(torch.autograd.Function):
         ctx.max_seqlens_q = max_seqlens_q
         ctx.max_seqlens_k = max_seqlens_k
         ctx.use_fp8_fa_block_scales = use_fp8_fa_block_scales
-        ctx.use_hp_v = use_hp_v
 
         return output, softmax_lse, exp_scores
 
@@ -2524,7 +2509,6 @@ class _triton_attention_block(torch.autograd.Function):
             use_exp2=ctx.use_exp2,
             use_fp8=ctx.use_fp8,
             use_fp8_fa_block_scales=ctx.use_fp8_fa_block_scales,
-            use_hp_v=ctx.use_hp_v,
         )
         return dq / _rescale, dk / _rescale, dv / _rescale, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
@@ -2551,7 +2535,6 @@ def _fake_attention_backward_triton_impl(
     use_exp2: bool,
     use_fp8: bool,
     use_fp8_fa_block_scales: bool,
-    use_hp_v: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return torch.empty_like(q, dtype=fwd_torch_dtype), torch.empty_like(
         k, dtype=fwd_torch_dtype), torch.empty_like(v, dtype=fwd_torch_dtype),
@@ -2665,5 +2648,4 @@ def triton_attention_block(
         layout,
         use_fp8,
         use_fp8_fa_block_scales,
-        use_hp_v,
     )
