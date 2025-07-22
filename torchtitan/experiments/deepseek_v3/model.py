@@ -573,13 +573,13 @@ class Attention(nn.Module):
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
-        if isinstance(self.kv_b_proj.weight, DTensor) and self.kv_b_proj.weight.placements[0].sharding == Shard(0):
+        if isinstance(self.kv_b_proj.weight, DTensor) and self.kv_b_proj.weight.placements[0] == Shard(0):
             k_pe = GradAllReduce.apply(
                 k_pe, self.kv_b_proj.weight.device_mesh.get_group())
 
         query_states = torch.cat([q_nope, q_pe], dim=-1)
         key_states = torch.cat(
-            [k_nope, k_pe.expand(-1, self.num_heads, -1, -1)], dim=-1)
+            [k_nope, k_pe.expand(-1, current_num_heads, -1, -1)], dim=-1)
 
         if attention_mask is not None:
             # Attention mask was made 4D because the `attn_weights` above is 4D.
@@ -656,14 +656,13 @@ class AttentionFlashAttention2(Attention):
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids, unsqueeze_dim=2)
 
-        if isinstance(self.kv_b_proj.weight, DTensor) and self.kv_b_proj.weight.placements[0].sharding == Shard(0):
-            print("GradAllReduce k_pe", k_pe.shape, self.kv_b_proj.weight.device_mesh.get_group())
+        if isinstance(self.kv_b_proj.weight, DTensor) and self.kv_b_proj.weight.placements[0] == Shard(0):
             k_pe = GradAllReduce.apply(
                 k_pe, self.kv_b_proj.weight.device_mesh.get_group())
 
         query_states = torch.cat([q_nope, q_pe], dim=-1)
         key_states = torch.cat(
-            [k_nope, k_pe.expand(-1, -1, self.num_heads, -1)], dim=-1)
+            [k_nope, k_pe.expand(-1, -1, current_num_heads, -1)], dim=-1)
 
         assert attention_mask is None
         assert q_len == kv_seq_len
