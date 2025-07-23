@@ -24,6 +24,7 @@ from torchtitan.experiments.kernels.blockwise_fp8.blockwise_quantization import 
 )
 
 
+@torch.compiler.allow_in_graph
 class BlockwiseFP8LinearFunction(torch.autograd.Function):
     """
     Custom autograd function for blockwise FP8 linear operations.

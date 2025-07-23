@@ -2316,6 +2316,7 @@ def block_scaling_node(tensor,
     return tensor, 1. / scale.to(torch.float32).contiguous()
 
 
+@torch.compiler.allow_in_graph
 class _triton_attention_block(torch.autograd.Function):
 
     @staticmethod
