@@ -16,12 +16,6 @@ from .infra.parallelize import parallelize_llama, update_router_expert_bias
 from .model.args import TransformerModelArgs
 from .model.model import Transformer
 
-try:
-    from torch.distributed.tensor._ops import cumsum_strategy
-except ImportError:
-    # patch: add dtensor support to torch.cumsum
-    from .model.grouped_mm_utils import cumsum_strategy
-
 __all__ = [
     "TransformerModelArgs",
     "Transformer",

@@ -26,7 +26,6 @@ import torch
 import triton
 import triton.language as tl
 from torch._library import triton_op, wrap_triton
-from torchao.float8.float8_tensor import Float8Tensor
 
 fwd_torch_dtype: tl.constexpr = torch.bfloat16
 bwd_torch_dtype: tl.constexpr = torch.float32
@@ -2435,8 +2434,6 @@ class _triton_attention_block(torch.autograd.Function):
         if ctx.use_fp8:
             float8_fw = get_f8_fwd_dtype()
             p_scale = torch.finfo(float8_fw).max
-            # expect do in high-precision format
-            assert not isinstance(do, Float8Tensor)
         else:
             p_scale = 1.
 
