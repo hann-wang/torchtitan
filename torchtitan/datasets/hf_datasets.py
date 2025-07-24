@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
 from typing import Any, Callable
+import os
+from dataclasses import dataclass
 
 import torch
-
 from datasets import Dataset, load_dataset
 from datasets.distributed import split_dataset_by_node
 from torch.distributed.checkpoint.stateful import Stateful
@@ -22,7 +22,13 @@ from torchtitan.tools.logging import logger
 
 def _load_c4_dataset(dataset_path: str):
     """Load C4 dataset with default configuration."""
-    return load_dataset(dataset_path, name="en", split="train", streaming=False).to_iterable_dataset()
+    if str(os.environ.get("HF_HUB_OFFLINE", "0")) == "1":
+        return load_dataset(dataset_path,
+                            name="en",
+                            split="train",
+                            streaming=False).to_iterable_dataset()
+    else:
+        return load_dataset(dataset_path, name="en", split="train", streaming=True)
 
 
 def _process_c4_text(sample: dict[str, Any]) -> str:

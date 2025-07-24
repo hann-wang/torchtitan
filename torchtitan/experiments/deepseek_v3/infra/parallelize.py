@@ -76,13 +76,7 @@ def parallelize_deepseek(
 
     # turn on per-TransformerBlock compile after AC wrapping and before FSDP
     if job_config.training.compile:
-        if job_config.parallelism.enable_tp2ep:
-            # TODO: enable fullgraph after https://github.com/pytorch/pytorch/issues/155205 resolved.
-            torch._dynamo.disallow_in_graph(
-                torch.ops._c10d_functional_autograd.all_to_all_single)
-            apply_compile(model, fullgraph=False)
-        else:
-            apply_compile(model)
+        apply_compile(model)
 
         # NOTE: needed for torch.compile to work with dynamic shapes in token-choice MoE
         torch._dynamo.config.capture_scalar_outputs = True

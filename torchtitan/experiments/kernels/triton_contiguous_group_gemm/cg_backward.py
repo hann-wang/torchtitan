@@ -475,6 +475,8 @@ def cg_grouped_gemm_backward_inputs_fake(
 
 # =============== Update the autograd function =================
 
+
+@torch.compiler.allow_in_graph
 class ContiguousGroupedGEMM(torch.autograd.Function):
     """
     Autograd function for contiguous grouped GEMM with complete backward pass.

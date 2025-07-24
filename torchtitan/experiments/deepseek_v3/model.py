@@ -38,6 +38,7 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor, Shard
 
 from torchtitan.experiments.llama4.model.moe import MoE as Llama4MoE, GroupedExperts, TokenChoiceTopKRouter
 from torchtitan.experiments.deepseek_v3.attn_mask_utils import _prepare_4d_causal_attention_mask
@@ -409,6 +410,22 @@ class MLP(nn.Module):
         pass
 
 
+class GradAllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        group = ctx.group
+        world_size = dist.get_world_size(group=group)
+        if dist.is_initialized() and world_size > 1:
+            grad_output = grad_output.contiguous()
+            dist.all_reduce(grad_output.contiguous(), group=group)
+        return grad_output, None
+
+
 class Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -556,15 +573,13 @@ class Attention(nn.Module):
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids)
 
-        query_states = k_pe.new_empty(bsz, current_num_heads, q_len,
-                                      self.q_head_dim)
-        query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+        if isinstance(self.kv_b_proj.weight, DTensor) and self.kv_b_proj.weight.placements[0] == Shard(0):
+            k_pe = GradAllReduce.apply(
+                k_pe, self.kv_b_proj.weight.device_mesh.get_group())
 
-        key_states = k_pe.new_empty(bsz, current_num_heads, q_len,
-                                    self.q_head_dim)
-        key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+        query_states = torch.cat([q_nope, q_pe], dim=-1)
+        key_states = torch.cat(
+            [k_nope, k_pe.expand(-1, current_num_heads, -1, -1)], dim=-1)
 
         if attention_mask is not None:
             # Attention mask was made 4D because the `attn_weights` above is 4D.
@@ -641,15 +656,13 @@ class AttentionFlashAttention2(Attention):
 
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, position_ids, unsqueeze_dim=2)
 
-        query_states = k_pe.new_empty(bsz, q_len, current_num_heads,
-                                      self.q_head_dim)
-        query_states[:, :, :, :self.qk_nope_head_dim] = q_nope
-        query_states[:, :, :, self.qk_nope_head_dim:] = q_pe
+        if isinstance(self.kv_b_proj.weight, DTensor) and self.kv_b_proj.weight.placements[0] == Shard(0):
+            k_pe = GradAllReduce.apply(
+                k_pe, self.kv_b_proj.weight.device_mesh.get_group())
 
-        key_states = k_pe.new_empty(bsz, q_len, current_num_heads,
-                                    self.q_head_dim)
-        key_states[:, :, :, :self.qk_nope_head_dim] = k_nope
-        key_states[:, :, :, self.qk_nope_head_dim:] = k_pe
+        query_states = torch.cat([q_nope, q_pe], dim=-1)
+        key_states = torch.cat(
+            [k_nope, k_pe.expand(-1, -1, current_num_heads, -1)], dim=-1)
 
         assert attention_mask is None
         assert q_len == kv_seq_len

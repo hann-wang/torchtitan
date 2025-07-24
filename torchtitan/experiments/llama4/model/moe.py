@@ -401,7 +401,7 @@ class MoE(nn.Module):
             self.token_dispatcher = TorchAllToAllTokenDispatcher(
                 num_experts=self.num_experts,
                 ep_size=self.experts.w1.device_mesh.size(),
-                ep_group=self.experts.w1.device_mesh.get_group(),
+                ep_mesh=self.experts.w1.device_mesh,
             )
 
         # Prevent extra local tokens accumulation on evaluation or activation recomputation
