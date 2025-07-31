@@ -35,7 +35,7 @@ from torchtitan.tools.profiling import (
 )
 
 
-torch.set_default_dtype(torch.bfloat16)
+# torch.set_default_dtype(torch.bfloat16)
 
 class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     job_config: JobConfig
@@ -169,7 +169,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             hf_config = AutoConfig.from_pretrained(job_config.model.path)
             hf_config._attn_implementation = "flash_attention_2"
             hf_config.pad_token_id = None
-            hf_config.torch_dtype = torch.bfloat16
+            #hf_config.torch_dtype = torch.bfloat16
             model_args.update_from_config(hf_config)
             with torch.device("meta"):
                 model = model_cls(hf_config)
@@ -269,7 +269,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 m.to_empty(device=init_device)
                 with torch.no_grad():
                     m.init_weights(buffer_device=buffer_device)
-                    utils.convert_model_to_bfloat16(m)
+                    #utils.convert_model_to_bfloat16(m)
                 m.train()
 
             # confirm that user will be able to view loss metrics on the console
@@ -287,7 +287,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 else:
                     utils.reset_params(model)
                     model.init_weights()
-                utils.convert_model_to_bfloat16(model)
+                #utils.convert_model_to_bfloat16(model)
             model.train()
 
             self.model_parts = [model]
