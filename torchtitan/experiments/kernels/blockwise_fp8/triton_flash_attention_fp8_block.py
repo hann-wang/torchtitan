@@ -2291,8 +2291,9 @@ def attention_block_backward_triton_impl(
         print("dv:", dv, dv.shape)
         # print("delta:", delta, delta.shape)
 
-    return dq.to(fwd_torch_dtype), dk.to(fwd_torch_dtype), dv.to(
-        fwd_torch_dtype)
+    # return dq.to(fwd_torch_dtype), dk.to(fwd_torch_dtype), dv.to(
+    #     fwd_torch_dtype)
+    return dq, dk, dv
 
 
 def block_scaling_node(tensor,
