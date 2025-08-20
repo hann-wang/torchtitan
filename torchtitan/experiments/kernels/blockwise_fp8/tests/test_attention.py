@@ -297,7 +297,6 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         max_seqlen_k=seqlen_kv,
         use_exp2=True,
         use_fp8=False,
-        use_fp8_fa_block_scales=True,
     )
 
     dq_fp8, dk_fp8, dv_fp8 = attention_block_backward_triton_impl(
@@ -321,7 +320,6 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         max_seqlen_k=seqlen_kv,
         use_exp2=True,
         use_fp8=True,
-        use_fp8_fa_block_scales=True,
     )
 
     dq_snr = compute_snr(dq, dq_fp8)

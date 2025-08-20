@@ -146,8 +146,8 @@ def get_f8_bwd_dtype():
 
 def get_tl_f8_bwd_dtype():
     if USE_FP8E5M2_BWD:
-        return tl.float8e5b16 if is_hip() else tl.float8e5
-    return tl.float8e4b8 if is_hip() else tl.float8e4nv
+        return tl.float8e5b16 if is_hip() and not is_cdna4() else tl.float8e5
+    return tl.float8e4b8 if is_hip() and not is_cdna4() else tl.float8e4nv
 
 
 F8_FWD_MAX: tl.constexpr = torch.finfo(get_f8_fwd_dtype()).max
@@ -1464,12 +1464,42 @@ def _bwd_kernel_dkdv(
 
     for group_idx in range(GROUP_SIZE):
         dk, dv = _attn_bwd_dkdv(
-            k, v, dk, dv, offs_d_qk, offs_d_v, offs_n, mask_d_qk, mask_d_v,
-            q_offset, do_offset, stride_qm, stride_qk, stride_dom, stride_dok,
-            ld_offset, stride_ldm, BLOCK_M, BLOCK_N, q_descale_offset, do_descale_offset,
-            blk_k_descale, blk_v_descale, p_scale, sm_scale, log_p_scale, lo,
-            num_block_m, causal_boundary, USE_FP8, USE_EXP2, F8_FWD_MAX,
-            N_CTX_Q, N_CTX_K, CAUSAL,)
+            k,
+            v,
+            dk,
+            dv,
+            offs_d_qk,
+            offs_d_v,
+            offs_n,
+            mask_d_qk,
+            mask_d_v,
+            q_offset,
+            do_offset,
+            stride_qm,
+            stride_qk,
+            stride_dom,
+            stride_dok,
+            ld_offset,
+            stride_ldm,
+            BLOCK_M,
+            BLOCK_N,
+            q_descale_offset,
+            do_descale_offset,
+            blk_k_descale,
+            blk_v_descale,
+            p_scale,
+            sm_scale,
+            log_p_scale,
+            lo,
+            num_block_m,
+            causal_boundary,
+            USE_FP8,
+            USE_EXP2,
+            F8_FWD_MAX,
+            N_CTX_Q,
+            N_CTX_K,
+            CAUSAL,
+        )
 
         q_offset += stride_qh
         do_offset += stride_qh
@@ -1530,7 +1560,6 @@ def _attn_bwd_dkdv(
     N_CTX_Q: tl.constexpr,
     N_CTX_K: tl.constexpr,
     CAUSAL: tl.constexpr,
-    GROUP_IDX: tl.constexpr = 0,
 ):
     idx_block_m = lo // BLOCK_M - 1
 
@@ -1808,12 +1837,41 @@ def _bwd_kernel_dq(
     mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
     lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
 
-    dq = _attn_bwd_dq(dq, q, offs_d_qk, offs_d_v, offs_m, lds, do, mask_d_qk,
-                      mask_d_v, k_offset, v_offset, stride_kn, stride_kk,
-                      stride_vn, stride_vk, BLOCK_M, BLOCK_N, blk_q_descale,
-                      k_descale, blk_do_descale, v_descale, p_scale, sm_scale,
-                      log_p_scale, hi, num_block_m, causal_boundary, USE_FP8,
-                      USE_EXP2, F8_FWD_MAX, N_CTX_Q, N_CTX_K, CAUSAL)
+    dq = _attn_bwd_dq(
+        dq,
+        q,
+        offs_d_qk,
+        offs_d_v,
+        offs_m,
+        lds,
+        do,
+        mask_d_qk,
+        mask_d_v,
+        k_offset,
+        v_offset,
+        stride_kn,
+        stride_kk,
+        stride_vn,
+        stride_vk,
+        BLOCK_M,
+        BLOCK_N,
+        blk_q_descale,
+        k_descale,
+        blk_do_descale,
+        v_descale,
+        p_scale,
+        sm_scale,
+        log_p_scale,
+        hi,
+        num_block_m,
+        causal_boundary,
+        USE_FP8,
+        USE_EXP2,
+        F8_FWD_MAX,
+        N_CTX_Q,
+        N_CTX_K,
+        CAUSAL,
+    )
 
     dq_ptrs = dq_offset + offs_m[:, None] * stride_qm + offs_d_qk[
         None, :] * stride_qk
@@ -1955,7 +2013,6 @@ def attention_block_backward_triton_impl(
     max_seqlen_k: Optional[int],
     use_exp2: bool,
     use_fp8: bool,
-    use_fp8_fa_block_scales: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if DEBUG:
         print("####################################################")
@@ -2025,19 +2082,8 @@ def attention_block_backward_triton_impl(
 
     if use_fp8:
         _shape = (batch, nheads_q, triton.cdiv(max_seqlen_q, FIXED_BLOCK_M))
-        if use_fp8_fa_block_scales:
-            do_fp8 = torch.empty_like(do, dtype=get_f8_bwd_dtype())
-            do_scale = torch.empty(_shape, dtype=torch.float32, device=q.device)
-        else:
-            do_scale = F8_BWD_MAX / do.abs().max()
-            do_fp8 = (do * do_scale).clamp(
-                min=-F8_BWD_MAX, max=F8_BWD_MAX).to(dtype=get_f8_bwd_dtype())
-            # apply qdq to do
-            do = do_fp8.to(do.dtype) / do_scale
-            do_scale = 1. / do_scale * torch.ones(_shape, dtype=torch.float32, device=q.device)
-            # apply qdq to o
-            o_scale = F8_BWD_MAX / o.abs().max()
-            o = (o * o_scale).clamp(min=-F8_BWD_MAX, max=F8_BWD_MAX) / o_scale
+        do_fp8 = torch.empty_like(do, dtype=get_f8_bwd_dtype())
+        do_scale = torch.empty(_shape, dtype=torch.float32, device=q.device)
         stride_descalez, stride_descaleh, stride_descalem = do_scale.stride()
         stride_qscalez, stride_qscaleh, stride_qscalem = q_descale.stride()
         stride_kscalez, stride_kscaleh, stride_kscalem = k_descale.stride()
@@ -2065,7 +2111,7 @@ def attention_block_backward_triton_impl(
         do_fp8,
         do_scale,
         softmax_lse_delta,
-        use_fp8 and use_fp8_fa_block_scales,
+        use_fp8,
         stride_oz,
         stride_oh,
         stride_om,
@@ -2357,7 +2403,6 @@ class _triton_attention_block(torch.autograd.Function):
         use_exp2: bool,
         layout: str,
         use_fp8: bool = False,
-        use_fp8_fa_block_scales: bool = True,
     ):
         if use_fp8:
             float8_fw = get_f8_fwd_dtype()
@@ -2371,37 +2416,9 @@ class _triton_attention_block(torch.autograd.Function):
             assert q.dtype != float8_fw
             assert k.dtype != float8_fw
             assert v.dtype != float8_fw
-            if use_fp8_fa_block_scales:
-                q, q_descale = block_scaling_node(q, FIXED_BLOCK_M)
-                k, k_descale = block_scaling_node(k, FIXED_BLOCK_N)
-                v, v_descale = block_scaling_node(v, FIXED_BLOCK_N)
-            else:
-                b, s, h, _ = q.shape
-                q_scale = F8_FWD_MAX / q.abs().max()
-                q = check_and_convert(q, q_scale)
-                q_descale = 1. / q_scale * torch.ones(b,
-                                                      h,
-                                                      s // FIXED_BLOCK_M,
-                                                      dtype=torch.float32,
-                                                      device=q.device)
-
-                b, s, h, _ = k.shape
-                k_scale = F8_FWD_MAX / k.abs().max()
-                k = check_and_convert(k, k_scale)
-                k_descale = 1. / k_scale * torch.ones(b,
-                                                      h,
-                                                      s // FIXED_BLOCK_N,
-                                                      dtype=torch.float32,
-                                                      device=k.device)
-
-                b, s, h, _ = v.shape
-                v_scale = F8_FWD_MAX / v.abs().max()
-                v = check_and_convert(v, v_scale)
-                v_descale = 1. / v_scale * torch.ones(b,
-                                                      h,
-                                                      s // FIXED_BLOCK_N,
-                                                      dtype=torch.float32,
-                                                      device=v.device)
+            q, q_descale = block_scaling_node(q, FIXED_BLOCK_M)
+            k, k_descale = block_scaling_node(k, FIXED_BLOCK_N)
+            v, v_descale = block_scaling_node(v, FIXED_BLOCK_N)
         else:
             q_descale = torch.scalar_tensor(1., device=q.device)
             k_descale = torch.scalar_tensor(1., device=q.device)
@@ -2443,7 +2460,6 @@ class _triton_attention_block(torch.autograd.Function):
         ctx.cu_seqlens_k = cu_seqlens_k
         ctx.max_seqlens_q = max_seqlens_q
         ctx.max_seqlens_k = max_seqlens_k
-        ctx.use_fp8_fa_block_scales = use_fp8_fa_block_scales
 
         return output, softmax_lse, exp_scores
 
@@ -2490,7 +2506,6 @@ class _triton_attention_block(torch.autograd.Function):
             max_seqlen_k=ctx.max_seqlens_k,
             use_exp2=ctx.use_exp2,
             use_fp8=ctx.use_fp8,
-            use_fp8_fa_block_scales=ctx.use_fp8_fa_block_scales,
         )
         return dq / _rescale, dk / _rescale, dv / _rescale, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
@@ -2516,7 +2531,6 @@ def _fake_attention_backward_triton_impl(
     max_seqlen_k: int,
     use_exp2: bool,
     use_fp8: bool,
-    use_fp8_fa_block_scales: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return torch.empty_like(q, dtype=fwd_torch_dtype), torch.empty_like(
         k, dtype=fwd_torch_dtype), torch.empty_like(v, dtype=fwd_torch_dtype),
@@ -2609,8 +2623,6 @@ def triton_attention_block(
     use_exp2: bool,
     layout: str,
     use_fp8: bool = False,
-    use_fp8_fa_block_scales: bool = True,
-    use_hp_v: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return _triton_attention_block.apply(
         q,
@@ -2629,5 +2641,4 @@ def triton_attention_block(
         use_exp2,
         layout,
         use_fp8,
-        use_fp8_fa_block_scales,
     )
