@@ -23,6 +23,7 @@ flavor = "debugmodel"
 # test tokenizer, for debug purpose only
 hf_assets_path = "./tests/assets/tokenizer"
 # converters = ["float8"]
+# converters = ["mx"]
 
 [optimizer]
 name = "AdamW"
@@ -63,7 +64,7 @@ export_dtype = "float32"
 async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem"]
 
 [activation_checkpoint]
-mode = "selective"  # ["none", "selective", "full"]
+mode = "none"  # ["none", "selective", "full"]
 selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
 
 [compile]
@@ -73,5 +74,16 @@ components = ["model", "loss"]
 [float8]
 enable_fsdp_float8_all_gather = false
 precompute_float8_dynamic_scale_for_fsdp = false
-filter_fqns = ["output", "router.gate"]
+filter_fqns = ["output", "router.gate", "attention.wq", "attention.wq_a", "attention.wq_b", "attention.wkv_a", "attention.wkv_b", "attention.wo"]
 moe_fqns_prototype = ["experts"]
+recipe_name = "blockwise"
+enable_fp8_fa = true
+enable_fp8_gmm = true
+enable_fp8_linear = true
+
+[mx]
+filter_fqns = ["output", "router.gate", "attention.wq", "attention.wq_a", "attention.wq_b", "attention.wkv_a", "attention.wkv_b", "attention.wo"]
+recipe_name = "mxfp4_1d2d"
+enable_mxfp4_fa = false
+enable_mxfp4_gmm = true
+enable_mxfp4_linear = true

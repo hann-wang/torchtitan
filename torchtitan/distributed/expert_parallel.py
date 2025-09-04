@@ -20,9 +20,9 @@ from torch.distributed.tensor import (
 )
 from torch.distributed.tensor.parallel import ParallelStyle
 
-
-TOKEN_GROUP_ALIGN_SIZE_M = 8
-ValidTokenGroupAlignmentSize = Literal[8, 16, 32]
+# this was 8 for torch._grouped_mm
+TOKEN_GROUP_ALIGN_SIZE_M = 128
+ValidTokenGroupAlignmentSize = Literal[8, 16, 32, 128]
 
 
 def set_token_group_alignment_size_m(

@@ -30,30 +30,32 @@ __all__ = [
 
 
 deepseekv3_configs = {
-    "debugmodel": DeepSeekV3ModelArgs(
+    "debugmodel":
+    DeepSeekV3ModelArgs(
         vocab_size=2000,
-        dim=256,
+        dim=2048,
         inter_dim=1024,
-        moe_inter_dim=256,
-        n_layers=6,
+        moe_inter_dim=512,
+        n_layers=2,
         n_dense_layers=1,
-        n_heads=16,
+        n_heads=8,
         moe_args=MoEArgs(
             num_experts=8,
-            num_shared_experts=2,
-            top_k=3,
+            num_shared_experts=1,
+            top_k=1,
             score_func="softmax",
             route_norm=True,
             score_before_experts=False,
         ),
         q_lora_rank=0,
         kv_lora_rank=512,
-        qk_nope_head_dim=128,
+        qk_nope_head_dim=64,
         qk_rope_head_dim=64,
         v_head_dim=128,
         mscale=0.70,
     ),
-    "debugmodel_flex_attn": DeepSeekV3ModelArgs(
+    "debugmodel_flex_attn":
+    DeepSeekV3ModelArgs(
         vocab_size=2000,
         dim=256,
         inter_dim=1024,
@@ -78,7 +80,8 @@ deepseekv3_configs = {
         use_flex_attn=True,
         attn_mask_type="block_causal",
     ),
-    "16B": DeepSeekV3ModelArgs(
+    "16B":
+    DeepSeekV3ModelArgs(
         vocab_size=102400,
         dim=2048,
         inter_dim=10944,
@@ -103,7 +106,8 @@ deepseekv3_configs = {
         use_flex_attn=True,
         attn_mask_type="block_causal",
     ),
-    "236B": DeepSeekV3ModelArgs(
+    "236B":
+    DeepSeekV3ModelArgs(
         vocab_size=102400,
         dim=5120,
         inter_dim=12288,
@@ -130,7 +134,8 @@ deepseekv3_configs = {
         use_flex_attn=True,
         attn_mask_type="block_causal",
     ),
-    "671B": DeepSeekV3ModelArgs(
+    "671B":
+    DeepSeekV3ModelArgs(
         vocab_size=129280,
         dim=7168,
         inter_dim=18432,

@@ -161,6 +161,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_converters = build_model_converters(job_config, parallel_dims)
         model_converters.convert(model)
 
+        logger.info(f"Model after conversion: {model}")
+
         # metrics logging
         build_metrics_processor_fn = (
             build_metrics_processor

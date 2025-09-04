@@ -225,10 +225,10 @@ class GroupedExperts(nn.Module):
         )
 
         return expert_parallel(internal_function)(
-            self.w1,
-            self.w2,
-            self.w3,
-            x,
+            self.w1.bfloat16(),
+            self.w2.bfloat16(),
+            self.w3.bfloat16(),
+            x.bfloat16(),
             num_tokens_per_expert,
         )
 

@@ -87,6 +87,7 @@ class MXConverter(ModelConverter):
             self.enabled = True
             logger.info(f"Float8 training active with recipe {mx_job_config.recipe_name}")
         else:
+            self.filter_fqns = mx_job_config.filter_fqns
             self.enabled = True
             set_token_group_alignment_size_m(ALIGN_SIZE_M)
             logger.info(f"Setting token group alignment size to {ALIGN_SIZE_M}")
