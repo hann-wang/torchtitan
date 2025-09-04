@@ -6,12 +6,15 @@
 
 from dataclasses import dataclass
 from typing import Literal
+from functools import partial
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.distributed.expert_parallel import expert_parallel
+from torchtitan.experiments.kernels.blockwise_fp8 import cg_grouped_gemm
+from torchtitan.experiments.kernels.blockwise_fp4 import mxfp4_grouped_gemm
 
 
 @dataclass
@@ -124,6 +127,57 @@ def _run_experts_grouped_mm(
     return out
 
 
+def _run_experts_triton_grouped_gemm(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w3: torch.Tensor,
+    x: torch.Tensor,
+    num_tokens_per_expert: torch.Tensor,
+    use_fp8: bool = False,
+    use_mxfp4: bool = False,
+    use_2dblock_x: bool = False,
+    use_2dblock_w: bool = True,
+) -> torch.Tensor:
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+    # grouped mm between a 2D tensor and a 3D tensor
+    assert x.dim() == 2
+
+    if not use_mxfp4:
+        gmm = cg_grouped_gemm
+        extra_kwargs = {"use_fp8": use_fp8}
+    else:
+        gmm = mxfp4_grouped_gemm
+        extra_kwargs = {
+            "use_2dblock_x": use_2dblock_x,
+            "use_2dblock_w": use_2dblock_w
+        }
+
+    from torchtitan.experiments.deepseek_v3 import dsgemm_utils
+    # Create indices from offsets without CPU-GPU sync
+    m_indices = dsgemm_utils.create_indices_from_offsets_nosync(offsets)
+    gate_proj = gmm(
+        x,
+        w1,
+        m_indices,
+        **extra_kwargs,
+    )
+    up_proj = gmm(
+        x,
+        w3,
+        m_indices,
+        **extra_kwargs,
+    )
+    hidden_outputs = F.silu(gate_proj) * up_proj
+    out = gmm(
+        hidden_outputs,
+        w2,
+        m_indices,
+        **extra_kwargs,
+    )
+
+    return out
+
+
 class GroupedExperts(nn.Module):
     def __init__(
         self,
@@ -138,20 +192,45 @@ class GroupedExperts(nn.Module):
         self.w2 = nn.Parameter(torch.empty(num_experts, dim, hidden_dim))
         self.w3 = nn.Parameter(torch.empty(num_experts, hidden_dim, dim))
         self.use_grouped_mm = use_grouped_mm
+        assert self.use_grouped_mm
+
+        self.use_fp8 = False
+        self.use_mxfp4 = False
+        self.use_2dblock_x = False
+        self.use_2dblock_w = True
+
+    def __repr__(self):
+        return f"{super().__repr__()} [use_fp8={self.use_fp8}, use_mxfp4={self.use_mxfp4}, use_2dblock_x={self.use_2dblock_x}, use_2dblock_w={self.use_2dblock_w}]"
 
     def forward(
         self,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
-        if self.use_grouped_mm:
-            return _run_experts_grouped_mm(
-                self.w1, self.w2, self.w3, x, num_tokens_per_expert
-            )
-        else:
-            return _run_experts_for_loop(
-                self.w1, self.w2, self.w3, x, num_tokens_per_expert
-            )
+        # if self.use_grouped_mm:
+        #     return _run_experts_grouped_mm(
+        #         self.w1, self.w2, self.w3, x, num_tokens_per_expert
+        #     )
+        # else:
+        #     return _run_experts_for_loop(
+        #         self.w1, self.w2, self.w3, x, num_tokens_per_expert
+        #     )
+
+        internal_function = partial(
+            _run_experts_triton_grouped_gemm,
+            use_fp8=self.use_fp8,
+            use_mxfp4=self.use_mxfp4,
+            use_2dblock_x=self.use_2dblock_x,
+            use_2dblock_w=self.use_2dblock_w,
+        )
+
+        return expert_parallel(internal_function)(
+            self.w1,
+            self.w2,
+            self.w3,
+            x,
+            num_tokens_per_expert,
+        )
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.w1, mean=0.0, std=0.02)

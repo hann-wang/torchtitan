@@ -61,6 +61,10 @@ class Float8Converter(ModelConverter):
         self.filter_fqns = float8_config.filter_fqns
         self.moe_fqns = float8_config.moe_fqns_prototype
         self.filter_fn = self._init_filter_fn(float8_config)
+        self.enable_fp8_fa = float8_config.enable_fp8_fa
+        self.enable_fp8_gmm = float8_config.enable_fp8_gmm
+        self.enable_fp8_linear = float8_config.enable_fp8_linear
+        self.use_blockwise_fp8_linear = float8_config.recipe_name == "blockwise"
 
         # Validate MoE training prototype limitations.
         if self.moe_fqns:
@@ -81,7 +85,8 @@ class Float8Converter(ModelConverter):
                 "with `float8_config.recipe_name` is not supported"
             )
 
-            self.config = Float8LinearConfig.from_recipe_name(float8_config.recipe_name)
+            if float8_config.recipe_name != "blockwise":
+                self.config = Float8LinearConfig.from_recipe_name(float8_config.recipe_name)
             self.precompute_scale = False
             logger.info(
                 f"Float8 training active with recipe {float8_config.recipe_name}"
@@ -159,21 +164,73 @@ class Float8Converter(ModelConverter):
         # be converted back to nn.Linear:
         # https://github.com/pytorch/ao/blob/c2a6568a04075acc371a338206216bb65536fb27/torchao/quantization/quant_api.py#L294-L299
         # TODO: add warning in torchao when this happens, or find a better way to avoid this.
-        if self.moe_fqns:
+        if self.moe_fqns and not self.use_blockwise_fp8_linear:
             self._convert_moe_layers(model)
 
-        from torchao.float8 import convert_to_float8_training
+        if self.enable_fp8_linear:
+            from torchao.float8.float8_linear_utils import convert_to_float8_training, swap_linear_layers
 
-        # Mutates the model inplace replacing instances of nn.Linear with Float8Linear
-        convert_to_float8_training(
-            model,
-            config=self.config,
-            module_filter_fn=self.filter_fn,
-        )
-        logger.info(
-            "Swapped to Float8Linear layers with enable_fsdp_float8_all_gather="
-            f"{self.config.enable_fsdp_float8_all_gather}"
-        )
+            if self.use_blockwise_fp8_linear:
+                from torchtitan.experiments.kernels.blockwise_fp8 import BlockwiseFP8Linear
+                from_float = lambda m: BlockwiseFP8Linear.from_float(m)
+                swap_linear_layers(
+                    model,
+                    from_float,
+                    module_filter_fn=self.filter_fn,
+                )
+                logger.info("Swapped to BlockwiseFP8Linear layers")
+            else:
+                # Mutates the model inplace replacing instances of nn.Linear with Float8Linear
+                convert_to_float8_training(
+                    model,
+                    config=self.config,
+                    module_filter_fn=self.filter_fn,
+                )
+                logger.info(
+                    "Swapped to Float8Linear layers with enable_fsdp_float8_all_gather="
+                    f"{self.config.enable_fsdp_float8_all_gather}"
+                )
+
+        if self.enable_fp8_fa:
+            self._enable_fp8_fa(model)
+        if self.enable_fp8_gmm:
+            self._enable_fp8_gmm(model)
+
+    def _enable_fp8_fa(self, model: nn.Module, prefix: str = ""):
+        for mod_name, mod in model.named_children():
+            if mod.__class__.__name__.endswith("FlashAttention2"):
+                skip = False
+                full_name = f"{prefix}{'.' if prefix else ''}{mod_name}"
+                for f in self.filter_fqns:
+                    if f in full_name:
+                        skip = True
+                        break
+                if not skip:
+                    mod.use_fp8 = True
+                    logger.info(f"Enable FP8 kernel for {full_name}.")
+                else:
+                    logger.info(f"Skip enabling FP8 kernel for {full_name}.")
+            else:
+                self._enable_fp8_fa(
+                    mod, f"{prefix}{'.' if prefix else ''}{mod_name}")
+
+    def _enable_fp8_gmm(self, model: nn.Module, prefix: str = ""):
+        for mod_name, mod in model.named_children():
+            if mod.__class__.__name__.endswith("GroupedExperts"):
+                skip = False
+                full_name = f"{prefix}{'.' if prefix else ''}{mod_name}"
+                for f in self.filter_fqns:
+                    if f in full_name:
+                        skip = True
+                        break
+                if not skip:
+                    mod.use_fp8 = True
+                    logger.info(f"Enable FP8 kernel for {full_name}.")
+                else:
+                    logger.info(f"Skip enabling FP8 kernel for {full_name}.")
+            else:
+                self._enable_fp8_gmm(
+                    mod, f"{prefix}{'.' if prefix else ''}{mod_name}")
 
     def _convert_moe_layers(self, model: nn.Module):
         """

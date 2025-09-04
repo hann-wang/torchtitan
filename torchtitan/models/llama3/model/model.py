@@ -13,8 +13,11 @@ from torch import nn
 
 from torchtitan.models.attention import build_attention
 from torchtitan.protocols.train_spec import ModelProtocol
+from torchtitan.experiments.kernels.blockwise_fp8.blockwise_fa import flash_attention_forward
 
 from .args import TransformerModelArgs
+
+USE_SDPA = True
 
 
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
@@ -198,6 +201,86 @@ class Attention(nn.Module):
         return self.wo(output)
 
 
+class AttentionFlashAttention2(Attention):
+    """
+    Multi-head attention module.
+
+    Args:
+        model_args (ModelArgs): Model configuration arguments.
+
+    Attributes:
+        n_kv_heads (int): Number of key and value heads.
+        n_heads (int): Number of query heads.
+        n_rep (int): Number of repetitions for local heads.
+        head_dim (int): Dimension size of each attention head.
+        wq (Linear): Linear transformation for queries.
+        wk (Linear): Linear transformation for keys.
+        wv (Linear): Linear transformation for values.
+        wo (Linear): Linear transformation for output.
+
+    """
+
+    def __init__(self, model_args: TransformerModelArgs):
+        super().__init__(model_args)
+        self.use_fp8 = False
+        self.use_mxfp4 = False
+
+        assert not self.use_mxfp4, "MXFP4 FA is not implemented!!!"
+
+    def __repr__(self):
+        return f"{super().__repr__()} [use_fp8={self.use_fp8}, use_mxfp4={self.use_mxfp4}]"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        """
+        Forward pass of the attention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+            freqs_cis (torch.Tensor): Precomputed frequency tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after attention.
+
+        """
+        bs, seqlen, _ = x.shape
+        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
+        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
+        # local heads from sizes of xq, xk, and xv as TP may have sharded them
+        # after the above linear ops.
+        xq = xq.view(bs, seqlen, -1, self.head_dim)
+        xk = xk.view(bs, seqlen, -1, self.head_dim)
+        xv = xv.view(bs, seqlen, -1, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        if not self.use_fp8 and USE_SDPA:
+            output = F.scaled_dot_product_attention(
+                xq.transpose(1, 2),
+                xk.transpose(1, 2),
+                xv.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=True,
+                enable_gqa=self.n_rep > 1,
+            ).transpose(1, 2)
+        else:
+            output = flash_attention_forward(
+                xq,
+                xk,
+                xv,
+                dropout=0.0,
+                is_causal=True,
+                use_fp8=self.use_fp8,
+            )
+
+        output = output.view(bs, seqlen, -1).contiguous()
+        return self.wo(output)
+
+
 class FeedForward(nn.Module):
     """
     FeedForward module
@@ -266,7 +349,8 @@ class TransformerBlock(nn.Module):
         super().__init__()
         self.n_heads = model_args.n_heads
         self.dim = model_args.dim
-        self.attention = Attention(model_args)
+        # self.attention = Attention(model_args)
+        self.attention = AttentionFlashAttention2(model_args)
         self.feed_forward = FeedForward(
             dim=model_args.dim,
             hidden_dim=4 * model_args.dim,

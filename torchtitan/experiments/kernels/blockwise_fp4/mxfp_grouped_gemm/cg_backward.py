@@ -10,13 +10,6 @@ import triton
 from torch.library import triton_op, wrap_triton
 # from torch.library import custom_op as triton_op
 # wrap_triton = lambda x: x
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._op_schema import PlacementList
-from torch.distributed.tensor.placement_types import (
-    Partial,
-    Replicate,
-    Shard,
-)
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
@@ -786,38 +779,6 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
         return grad_inputs, grad_weights, None, None, None, None
 
 
-single_mesh_dim_strategies_transw = []
-replicate_colwise_2x3_transw: PlacementList = [
-    Shard(1),
-    Replicate(),  # mat1
-    Shard(2),  # mat2
-    Replicate(),  # offs
-]
-colwise_rowwise_2x3_transw: PlacementList = [
-    Partial(),
-    Shard(1),  # mat1
-    Shard(1),  # mat2
-    Replicate(),  # offs
-]
-single_mesh_dim_strategies_transw.extend(
-    [replicate_colwise_2x3_transw, colwise_rowwise_2x3_transw])
-single_mesh_dim_strategies = []
-replicate_colwise_2x3: PlacementList = [
-    Shard(1),
-    Replicate(),  # mat1
-    Shard(1),  # mat2
-    Replicate(),  # offs
-]
-colwise_rowwise_2x3: PlacementList = [
-    Partial(),
-    Shard(1),  # mat1
-    Shard(2),  # mat2
-    Replicate(),  # offs
-]
-single_mesh_dim_strategies.extend(
-    [replicate_colwise_2x3, colwise_rowwise_2x3])
-
-
 def mxfp4_grouped_gemm(
     inputs: torch.Tensor,
     expert_weights: torch.Tensor,
@@ -840,23 +801,6 @@ def mxfp4_grouped_gemm(
     if expert_indices.dtype != torch.int32:
         expert_indices = expert_indices.to(torch.int32)
 
-    tp_mesh = None
-    if isinstance(inputs, DTensor):
-        tp_mesh = inputs.device_mesh
-        output_placement = None
-        allowed_placements = single_mesh_dim_strategies_transw if trans_weights else single_mesh_dim_strategies
-        for available_placement in allowed_placements:
-            if available_placement[1:] == [
-                    inputs.placements[-1], expert_weights.placements[-1],
-                    expert_indices.placements[-1]
-            ]:
-                output_placement = available_placement[0]
-                break
-        assert output_placement is not None, "No suitable placement found for CG-Grouped-Gemm"
-        inputs = inputs.to_local()
-        expert_weights = expert_weights.to_local()
-        expert_indices = expert_indices.to_local()
-
     res = MXFP4GroupedGEMM.apply(
         inputs,
         expert_weights,
@@ -866,14 +810,6 @@ def mxfp4_grouped_gemm(
         use_2dblock_w,
     )
 
-    if tp_mesh is not None:
-        # Convert result to DTensor with appropriate placements
-        res = DTensor.from_local(
-            res,
-            device_mesh=tp_mesh,
-            placements=(output_placement,),
-            run_check=False,
-        )
     return res
 
 

@@ -569,8 +569,23 @@ class Float8:
     precompute_float8_dynamic_scale_for_fsdp: bool = False
     """Whether precompute float8 scales dynamically for FSDP, recommended for tensorwise scaling"""
 
-    recipe_name: Literal["tensorwise", "rowwise", "rowwise_with_gw_hp"] | None = None
+    recipe_name: Literal[
+        "tensorwise",
+        "rowwise",
+        "rowwise_with_gw_hp",
+        "blockwise"
+
+    ] | None = None
     """If specified, creates float8 config from recipe name"""
+
+    enable_fp8_fa: bool = False
+    """Whether to use FP8 FlashAttention Triton kernel"""
+
+    enable_fp8_gmm: bool = False
+    """Whether to use FP8 grouped_gemm Triton kernel"""
+
+    enable_fp8_linear: bool = True
+    """Whether to use FP8 Linear module"""
 
     filter_fqns: list[str] = field(default_factory=list)
     """
@@ -599,11 +614,25 @@ class MX:
     mxfp8_dim1_cast_kernel_choice: Literal["triton", "cuda", "torch"] = "triton"
     """Temp work around for inductor performance gap"""
 
-    recipe_name: str = "mxfp8_cublas"
+    recipe_name: Literal[
+        "mxfp8_cublas",
+        "mxfp4_1d1d",
+        "mxfp4_1d2d",
+        "mxfp4_2d2d",
+    ] = "mxfp8_cublas"
     """
     If specified, creates MX config from recipe name. See
     https://github.com/pytorch/ao/tree/main/torchao/prototype/mx_formats for more information.
     """
+
+    enable_mxfp4_fa: bool = False
+    """Whether to use MXFP4 FlashAttention Triton kernel"""
+
+    enable_mxfp4_gmm: bool = False
+    """Whether to use MXFP4 grouped_gemm Triton kernel"""
+
+    enable_mxfp4_linear: bool = True
+    """Whether to use MXFP4 Linear module"""
 
     filter_fqns: list[str] = field(default_factory=lambda: ["output"])
     """

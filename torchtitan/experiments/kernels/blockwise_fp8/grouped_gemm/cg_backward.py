@@ -10,13 +10,6 @@ import triton
 from torch.library import triton_op, wrap_triton
 # from torch.library import custom_op as triton_op
 # wrap_triton = lambda x: x
-from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._op_schema import PlacementList
-from torch.distributed.tensor.placement_types import (
-    Partial,
-    Replicate,
-    Shard,
-)
 import triton.language as tl
 
 # Import configs and utilities from cg_forward
@@ -601,28 +594,13 @@ class ContiguousGroupedGEMM(torch.autograd.Function):
 
         return grad_inputs, grad_weights, grad_indices, None
 
-single_mesh_dim_strategies = []
-replicate_colwise_2x3: PlacementList = [
-    Shard(1),
-    Replicate(),  # mat1
-    Shard(2),  # mat2
-    Replicate(),  # offs
-]
-colwise_rowwise_2x3: PlacementList = [
-    Partial(),
-    Shard(1),  # mat1
-    Shard(1),  # mat2
-    Replicate(),  # offs
-]
-single_mesh_dim_strategies.extend(
-    [replicate_colwise_2x3, colwise_rowwise_2x3])
 
 def cg_grouped_gemm(
     inputs: torch.Tensor,
     expert_weights: torch.Tensor,
     expert_indices: torch.Tensor,
     use_fp8: bool = False,
-    transpose_weight: bool = True,
+    trans_weights: bool = True,
 ) -> torch.Tensor:
     """
     Interface for contiguous grouped GEMM with full backward pass support.
@@ -638,35 +616,11 @@ def cg_grouped_gemm(
     if expert_indices.dtype != torch.int32:
         expert_indices = expert_indices.to(torch.int32)
 
-    tp_mesh = None
-    if isinstance(inputs, DTensor):
-        tp_mesh = inputs.device_mesh
-        output_placement = None
-        for available_placement in single_mesh_dim_strategies:
-            if available_placement[1:] == [
-                    inputs.placements[-1], expert_weights.placements[-1],
-                    expert_indices.placements[-1]
-            ]:
-                output_placement = available_placement[0]
-                break
-        assert output_placement is not None, "No suitable placement found for CG-Grouped-Gemm"
-        inputs = inputs.to_local()
-        expert_weights = expert_weights.to_local()
-        expert_indices = expert_indices.to_local()
-
-    if transpose_weight:
+    if not trans_weights:
         expert_weights = expert_weights.transpose(-1, -2).contiguous()
     res = ContiguousGroupedGEMM.apply(inputs, expert_weights, expert_indices,
                                        use_fp8)
 
-    if tp_mesh is not None:
-        # Convert result to DTensor with appropriate placements
-        res = DTensor.from_local(
-            res,
-            device_mesh=tp_mesh,
-            placements=(output_placement,),
-            run_check=False,
-        )
     return res
 
 
@@ -784,7 +738,7 @@ def verify_cg_gemm_backward(
         expert_weights,
         expert_indices,
         use_fp8=use_fp8,
-        transpose_weight=False,
+        trans_weights=True,
     )
     loss = torch.nn.functional.mse_loss(outputs, target)
     loss.backward()
@@ -924,7 +878,7 @@ def benchmark_cg_gemm_backward(
             expert_weights,
             expert_indices,
             use_fp8=use_fp8,
-            transpose_weight=False,
+            trans_weights=True,
         )
 
         # Backward pass

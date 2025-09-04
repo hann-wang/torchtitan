@@ -9,12 +9,16 @@ from typing import Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from torchtitan.models.attention import build_attention
 from torchtitan.models.moe import FeedForward, MoE
 from torchtitan.protocols.train_spec import ModelProtocol
+from torchtitan.experiments.kernels.blockwise_fp8.blockwise_fa import flash_attention_forward
 
 from .args import DeepSeekV3ModelArgs
+
+USE_SDPA = True
 
 
 # Adapted from https://github.com/DeepSeek-ai/DeepSeek-V3/blob/main/inference/model.py#L294
@@ -259,6 +263,96 @@ class Attention(nn.Module):
             self.q_norm.reset_parameters()
 
 
+class AttentionFlashAttention2(Attention):
+    """
+    Multi-head attention (MLA) module.
+    """
+
+    def __init__(self, model_args: DeepSeekV3ModelArgs):
+        super().__init__(model_args)
+        self.use_fp8 = False
+        self.use_mxfp4 = False
+
+        assert not self.use_mxfp4, "MXFP4 FA is not implemented!!!"
+
+    def __repr__(self):
+        return f"{super().__repr__()} [use_fp8={self.use_fp8}, use_mxfp4={self.use_mxfp4}]"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ):
+        """
+        Forward pass for the Multi-Head Latent Attention (MLA) Layer.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, dim).
+            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+
+        Returns:
+            torch.Tensor: Output tensor with the same shape as the input.
+        """
+        bsz, seqlen, _ = x.size()
+
+        # Query projection
+        if self.q_lora_rank == 0:
+            q = self.wq(x)  # (bsz, seqlen, n_heads * qk_head_dim)
+        else:
+            q = self.wq_a(x)
+            q = self.wq_b(self.q_norm(q))
+        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
+        # local heads from sizes of q and kv as TP may have sharded them after
+        # the above linear ops.
+        q = q.view(bsz, seqlen, -1, self.qk_head_dim)
+        q_nope, q_pe = torch.split(
+            q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis)
+        q = torch.cat([q_nope, q_pe],
+                      dim=-1)  # (bsz, seqlen, n_heads, qk_head_dim)
+
+        # Key-value projection
+        kv = self.wkv_a(x)  # (bsz, seqlen, kv_lora_rank + qk_rope_head_dim)
+        kv, k_pe = torch.split(kv, [self.kv_lora_rank, self.qk_rope_head_dim],
+                               dim=-1)
+
+        k_pe = apply_rotary_emb(
+            k_pe.unsqueeze(2), freqs_cis)  # (bsz, seqlen, 1, qk_rope_head_dim)
+
+        kv = self.wkv_b(self.kv_norm(
+            kv))  # (bsz, seqlen, n_heads * (qk_nope_head_dim + v_head_dim))
+        kv = kv.view(bsz, seqlen, -1, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim],
+                                dim=-1)
+        k = torch.cat([k_nope, k_pe.expand(-1, -1, self.n_heads, -1)],
+                      dim=-1)  # (bsz, seqlen, n_heads, qk_head_dim)
+
+        if not self.use_fp8 and USE_SDPA:
+            output = F.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=0.0,
+                is_causal=True,
+                scale=self.softmax_scale,
+            ).transpose(1, 2)
+        else:
+            output = flash_attention_forward(
+                q,
+                k,
+                v,
+                dropout=0.0,
+                is_causal=True,
+                softmax_scale=self.softmax_scale,
+                use_fp8=self.use_fp8,
+            )
+
+        # Reshape and project output
+        output = output.reshape(bsz, seqlen,
+                                -1)  # (bsz, seqlen, n_heads * v_head_dim)
+        return self.wo(output)  # (bsz, seqlen, dim)
+
+
 class TransformerBlock(nn.Module):
     """
     Transformer block with attention and feed-forward layers.
@@ -267,7 +361,8 @@ class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, model_args: DeepSeekV3ModelArgs):
 
         super().__init__()
-        self.attention = Attention(model_args)
+        # self.attention = Attention(model_args)
+        self.attention = AttentionFlashAttention2(model_args)
         self.attention_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.ffn_norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
 
