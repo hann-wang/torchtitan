@@ -54,31 +54,27 @@ def test_mxfp4_linear_kernel(shape, use_2dblock_a, use_2dblock_b, trans_a, trans
             assert not b.is_contiguous()
         b_axis = -2
     if use_2dblock_a:
-        a_lp, a_scales = convert_to_mxfp4_2dblock(a, axis=a_axis)
-        a_dq = convert_from_mxfp4_2dblock(a_lp,
-                                        a_scales,
-                                        output_dtype=data_type,
-                                        axis=a_axis)
+        a_lp, a_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
+            a, axis=a_axis)
+        a_dq = torch.ops.torchtitan.convert_from_mxfp4_2dblock(
+            a_lp, a_scales, output_dtype=data_type, axis=a_axis)
     else:
-        a_lp, a_scales = convert_to_mxfp4_1dblock(a, axis=a_axis)
-        a_dq = convert_from_mxfp4_1dblock(a_lp,
-                                        a_scales,
-                                        output_dtype=data_type,
-                                        axis=a_axis)
+        a_lp, a_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
+            a, axis=a_axis)
+        a_dq = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
+            a_lp, a_scales, output_dtype=data_type, axis=a_axis)
     if use_2dblock_b:
-        b_lp, b_scales = convert_to_mxfp4_2dblock(b, axis=b_axis)
-        b_dq = convert_from_mxfp4_2dblock(b_lp,
-                                        b_scales,
-                                        output_dtype=data_type,
-                                        axis=b_axis)
+        b_lp, b_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
+            b, axis=b_axis)
+        b_dq = torch.ops.torchtitan.convert_from_mxfp4_2dblock(
+            b_lp, b_scales, output_dtype=data_type, axis=b_axis)
     else:
-        b_lp, b_scales = convert_to_mxfp4_1dblock(b, axis=b_axis)
-        b_dq = convert_from_mxfp4_1dblock(b_lp,
-                                        b_scales,
-                                        output_dtype=data_type,
-                                        axis=b_axis)
+        b_lp, b_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
+            b, axis=b_axis)
+        b_dq = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
+            b_lp, b_scales, output_dtype=data_type, axis=b_axis)
 
-    c = blockwise_mxfp4_gemm(
+    c = torch.ops.torchtitan.blockwise_mxfp4_gemm(
         a_lp,
         a_scales,
         b_lp,

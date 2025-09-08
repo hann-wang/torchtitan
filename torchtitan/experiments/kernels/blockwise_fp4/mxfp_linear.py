@@ -291,16 +291,20 @@ class MXFP4LinearFunction(torch.autograd.Function):
         x = x.reshape(-1, original_shape[-1])  # Ensure x is 2D
 
         if use_2dblock_x:
-            x, x_scale = convert_to_mxfp4_2dblock(x, axis=-1)
+            x, x_scale = torch.ops.torchtitan.convert_to_mxfp4_2dblock(x,
+                                                                       axis=-1)
         else:
-            x, x_scale = convert_to_mxfp4_1dblock(x, axis=-1)
+            x, x_scale = torch.ops.torchtitan.convert_to_mxfp4_1dblock(x,
+                                                                       axis=-1)
 
         if use_2dblock_w:
-            weight, w_scale = convert_to_mxfp4_2dblock(weight, axis=-1)
+            weight, w_scale = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
+                weight, axis=-1)
         else:
-            weight, w_scale = convert_to_mxfp4_1dblock(weight, axis=-1)
+            weight, w_scale = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
+                weight, axis=-1)
 
-        y = blockwise_mxfp4_gemm(
+        y = torch.ops.torchtitan.blockwise_mxfp4_gemm(
             x,
             x_scale,
             weight,
@@ -330,12 +334,12 @@ class MXFP4LinearFunction(torch.autograd.Function):
             weight_mxfp4 = weight
             weight_scales = w_scale
         else:
-            weight_dequant = convert_from_mxfp4_1dblock(
+            weight_dequant = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
                 weight,
                 w_scale,
                 axis=-1,
             )
-            weight_mxfp4, weight_scales = convert_to_mxfp4_1dblock(
+            weight_mxfp4, weight_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 weight_dequant,
                 axis=0,
             )
@@ -345,34 +349,34 @@ class MXFP4LinearFunction(torch.autograd.Function):
             inputs_mxfp4 = x
             input_scales = x_scale
 
-            grad_output_mxfp4, grad_output_scales = convert_to_mxfp4_2dblock(
+            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
                 grad_output,
                 axis=-1,
             )
             grad_output_mxfp4_m = grad_output_mxfp4
             grad_output_scales_m = grad_output_scales
         else:
-            inputs_dequant = convert_from_mxfp4_1dblock(
+            inputs_dequant = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
                 x,
                 x_scale,
                 axis=-1,
             )
-            inputs_mxfp4, input_scales = convert_to_mxfp4_1dblock(
+            inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 inputs_dequant,
                 axis=0,
             )
 
-            grad_output_mxfp4, grad_output_scales = convert_to_mxfp4_1dblock(
+            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=-1,
             )
-            grad_output_mxfp4_m, grad_output_scales_m = convert_to_mxfp4_1dblock(
+            grad_output_mxfp4_m, grad_output_scales_m = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=0,
             )
 
         # Compute gradients
-        grad_inputs = blockwise_mxfp4_gemm(
+        grad_inputs = torch.ops.torchtitan.blockwise_mxfp4_gemm(
             grad_output_mxfp4,
             grad_output_scales,
             weight_mxfp4,
@@ -382,7 +386,7 @@ class MXFP4LinearFunction(torch.autograd.Function):
             k_pack_b=not ctx.use_2dblock_w,
             output_dtype=ctx.original_dtype,
         )
-        grad_weights = blockwise_mxfp4_gemm(
+        grad_weights = torch.ops.torchtitan.blockwise_mxfp4_gemm(
             grad_output_mxfp4_m,
             grad_output_scales_m,
             inputs_mxfp4,

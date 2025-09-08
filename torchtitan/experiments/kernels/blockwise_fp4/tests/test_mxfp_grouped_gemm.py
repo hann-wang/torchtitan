@@ -99,9 +99,9 @@ def test_mxfp_group_gemm(shape, use_2dblock_x, use_2dblock_w, trans_weights,
     loss = torch.nn.functional.mse_loss(outputs, target)
     loss.backward()
 
-    # Check if outputs match
-    print(f"outputs={outputs}")
-    print(f"outputs_ref={outputs_ref}")
+    # # Check if outputs match
+    # print(f"outputs={outputs}")
+    # print(f"outputs_ref={outputs_ref}")
 
     output_snr = calc_snr(outputs, outputs_ref)
     output_sim = calc_cossim(outputs, outputs_ref)

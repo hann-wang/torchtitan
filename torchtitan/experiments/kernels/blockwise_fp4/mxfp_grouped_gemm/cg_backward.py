@@ -652,24 +652,24 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
         original_dtype = inputs.dtype
 
         if use_2dblock_x:
-            inputs_mxfp4, input_scales = convert_to_mxfp4_2dblock(
+            inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
                 inputs,
                 axis=-1,
             )
         else:
-            inputs_mxfp4, input_scales = convert_to_mxfp4_1dblock(
+            inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 inputs,
                 axis=-1,
             )
 
         quant_axis_w = -1 if trans_weights else -2
         if use_2dblock_w:
-            expert_weights_mxfp4, expert_weight_scales = convert_to_mxfp4_2dblock(
+            expert_weights_mxfp4, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
                 expert_weights,
                 axis=quant_axis_w,
             )
         else:
-            expert_weights_mxfp4, expert_weight_scales = convert_to_mxfp4_1dblock(
+            expert_weights_mxfp4, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 expert_weights,
                 axis=quant_axis_w,
             )
@@ -681,7 +681,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
         ctx.trans_weights = trans_weights
         ctx.original_dtype = original_dtype
 
-        res = mxfp4_grouped_gemm_forward(
+        res = torch.ops.torchtitan.mxfp4_grouped_gemm_forward(
             inputs=inputs_mxfp4,
             expert_weights=expert_weights_mxfp4,
             expert_indices=expert_indices,
@@ -709,46 +709,46 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             requant_axis_w = -1
 
         if not ctx.use_2dblock_w:
-            weight_dequant = convert_from_mxfp4_1dblock(
+            weight_dequant = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
                 expert_weights,
                 expert_weight_scales,
                 axis=quant_axis_w,
             )
-            expert_weights, expert_weight_scales = convert_to_mxfp4_1dblock(
+            expert_weights, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 weight_dequant,
                 axis=requant_axis_w,
             )
 
         if ctx.use_2dblock_x:
-            grad_output_mxfp4, grad_output_scales = convert_to_mxfp4_2dblock(
+            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
                 grad_output,
                 axis=-1,
             )
             grad_output_mxfp4_m = grad_output_mxfp4
             grad_output_scales_m = grad_output_scales
         else:
-            inputs_dequant = convert_from_mxfp4_1dblock(
+            inputs_dequant = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
                 inputs,
                 input_scales,
                 output_dtype=ctx.original_dtype,
                 axis=-1,
             )
-            inputs, input_scales = convert_to_mxfp4_1dblock(
+            inputs, input_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 inputs_dequant,
                 axis=0,
             )
 
-            grad_output_mxfp4, grad_output_scales = convert_to_mxfp4_1dblock(
+            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=-1,
             )
-            grad_output_mxfp4_m, grad_output_scales_m = convert_to_mxfp4_1dblock(
+            grad_output_mxfp4_m, grad_output_scales_m = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=0,
             )
 
         # Compute gradients
-        grad_inputs = mxfp4_grouped_gemm_backward_inputs(
+        grad_inputs = torch.ops.torchtitan.mxfp4_grouped_gemm_backward_inputs(
             grad_output=grad_output_mxfp4,
             expert_weights=expert_weights,
             expert_indices=expert_indices,
@@ -761,7 +761,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             output_dtype=ctx.original_dtype,
         )
 
-        grad_weights = mxfp4_grouped_gemm_backward_weights(
+        grad_weights = torch.ops.torchtitan.mxfp4_grouped_gemm_backward_weights(
             grad_output=grad_output_mxfp4_m,
             inputs=inputs,
             expert_indices=expert_indices,

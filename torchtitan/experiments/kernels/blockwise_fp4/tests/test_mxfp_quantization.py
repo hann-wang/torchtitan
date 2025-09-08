@@ -15,6 +15,7 @@ from .utils import (
     convert_to_mxfp4_2dblock_pytorch,
 )
 
+# Note: test failure might be related to https://github.com/pytorch/pytorch/issues/125234
 
 @pytest.mark.parametrize("tensor_shape", [(128, 64), (2048, 2048),
                                           (4, 128, 64)])
@@ -24,12 +25,13 @@ from .utils import (
 def test_mxfp_1d_quantization(tensor_shape, axis, data_type, compile):
 
     if compile:
-        quant_func = torch.compile(convert_to_mxfp4_1dblock, fullgraph=True)
-        dequant_func = torch.compile(convert_from_mxfp4_1dblock,
-                                     fullgraph=True)
+        quant_func = torch.compile(
+            torch.ops.torchtitan.convert_to_mxfp4_1dblock, fullgraph=True)
+        dequant_func = torch.compile(
+            torch.ops.torchtitan.convert_from_mxfp4_1dblock, fullgraph=True)
     else:
-        quant_func = convert_to_mxfp4_1dblock
-        dequant_func = convert_from_mxfp4_1dblock
+        quant_func = torch.ops.torchtitan.convert_to_mxfp4_1dblock
+        dequant_func = torch.ops.torchtitan.convert_from_mxfp4_1dblock
 
     x = prepare_data(tensor_shape, data_type)
     data_lp_ref, scales_ref = convert_to_mxfp4_1dblock_pytorch(x, axis=axis)
@@ -53,12 +55,13 @@ def test_mxfp_1d_quantization(tensor_shape, axis, data_type, compile):
 def test_mxfp_2d_quantization(tensor_shape, axis, data_type, compile):
 
     if compile:
-        quant_func = torch.compile(convert_to_mxfp4_2dblock, fullgraph=True)
-        dequant_func = torch.compile(convert_from_mxfp4_2dblock,
-                                     fullgraph=True)
+        quant_func = torch.compile(
+            torch.ops.torchtitan.convert_to_mxfp4_2dblock, fullgraph=True)
+        dequant_func = torch.compile(
+            torch.ops.torchtitan.convert_from_mxfp4_2dblock, fullgraph=True)
     else:
-        quant_func = convert_to_mxfp4_2dblock
-        dequant_func = convert_from_mxfp4_2dblock
+        quant_func = torch.ops.torchtitan.convert_to_mxfp4_2dblock
+        dequant_func = torch.ops.torchtitan.convert_from_mxfp4_2dblock
 
     x = prepare_data(tensor_shape, data_type)
     data_lp_ref, scales_ref = convert_to_mxfp4_2dblock_pytorch(x, axis=axis)
