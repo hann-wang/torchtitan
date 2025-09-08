@@ -348,8 +348,8 @@ class AttentionFlashAttention2(Attention):
             )
 
         # Reshape and project output
-        output = output.reshape(bsz, seqlen,
-                                -1)  # (bsz, seqlen, n_heads * v_head_dim)
+        output = output.reshape(
+            bsz, seqlen, -1)  # (bsz, seqlen, n_heads * v_head_dim)
         return self.wo(output)  # (bsz, seqlen, dim)
 
 

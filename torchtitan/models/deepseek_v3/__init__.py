@@ -82,7 +82,7 @@ deepseekv3_configs = {
     ),
     "16B":
     DeepSeekV3ModelArgs(
-        vocab_size=102400,
+        vocab_size=129280,
         dim=2048,
         inter_dim=10944,
         moe_inter_dim=1408,
@@ -108,7 +108,7 @@ deepseekv3_configs = {
     ),
     "20B":
     DeepSeekV3ModelArgs(
-        vocab_size=102400,
+        vocab_size=129280,
         dim=7168,
         inter_dim=10240,
         moe_inter_dim=1280,

@@ -92,13 +92,14 @@ def _convert_to_mxfp4_1dblock_kernel(
             pack=1,
         )
     else:
+        x0 = (x1.to(tl.uint16, bitcast=True).to(tl.uint32) << 16) | x0.to(
+            tl.uint16, bitcast=True)
         y = tl.inline_asm_elementwise(
             asm="""
-            v_lshl_add_u32 $2, $2, 16, $1;
-            v_cvt_scalef32_pk_fp4_bf16 $0, $2, $3 op_sel:[0,0,0,0];
+            v_cvt_scalef32_pk_fp4_bf16 $0, $1, $2 op_sel:[0,0,0,0];
             """,
-            constraints="=&v,v,v,v",
-            args=[x0, x1, scales_fp32],
+            constraints="=&v,v,v",
+            args=[x0, scales_fp32],
             dtype=tl.uint16,
             is_pure=True,
             pack=1,
