@@ -109,7 +109,7 @@ deepseekv3_configs = {
     "20B":
     DeepSeekV3ModelArgs(
         vocab_size=129280,
-        dim=7168,
+        dim=2048,
         inter_dim=10240,
         moe_inter_dim=1280,
         n_layers=27,
