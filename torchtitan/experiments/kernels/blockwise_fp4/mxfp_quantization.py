@@ -110,7 +110,7 @@ def _quantize_fp4(x, scales_fp32):
     normal_x = normal_x.to(tl.uint8)
 
     # Merge results
-    e2m1_value = tl.zeros_like(qx).to(tl.uint8) + 0x7
+    e2m1_value = tl.full(qx.type.get_block_shapes(), 0x7, dtype=tl.uint8)
     e2m1_value = tl.where(normal_mask, normal_x, e2m1_value)
     e2m1_value = tl.where(denormal_mask, denormal_x, e2m1_value)
     # add sign back
