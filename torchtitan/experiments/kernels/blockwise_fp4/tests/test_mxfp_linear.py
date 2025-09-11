@@ -93,10 +93,11 @@ def test_mxfp4_linear_kernel(shape, use_2dblock_a, use_2dblock_b, trans_a, trans
 @pytest.mark.parametrize("shape", [(1, 512, 384, 128), (4, 1024, 1024, 2048)])
 @pytest.mark.parametrize("use_2dblock_w", [False, True])
 @pytest.mark.parametrize("use_2dblock_x", [False, True])
+@pytest.mark.parametrize("use_grad_sr", [False, True])
 @pytest.mark.parametrize("compile", [False])
 @pytest.mark.parametrize("data_type", [torch.bfloat16, torch.float32])
 def test_mxfp4_linear_autograd_function(shape, use_2dblock_x, use_2dblock_w,
-                                        compile, data_type):
+                                        use_grad_sr, compile, data_type):
     B, M, N, K = shape
     inputs = prepare_data((B, M, K), data_type).requires_grad_(True)
     weights = prepare_data((N, K), data_type).requires_grad_(True)
@@ -122,7 +123,8 @@ def test_mxfp4_linear_autograd_function(shape, use_2dblock_x, use_2dblock_w,
     mxfp4_linear_func = MXFP4LinearFunction.apply
     if compile:
         mxfp4_linear_func = torch.compile(mxfp4_linear_func, fullgraph=True)
-    outputs = mxfp4_linear_func(inputs, weights, use_2dblock_x, use_2dblock_w)
+    outputs = mxfp4_linear_func(inputs, weights, use_2dblock_x, use_2dblock_w,
+                                use_grad_sr)
     loss = torch.nn.functional.mse_loss(outputs, target)
     loss.backward()
 
@@ -143,6 +145,7 @@ def test_mxfp4_linear_autograd_function(shape, use_2dblock_x, use_2dblock_w,
                  headers=["Tensor", "SNR", "Cosine Sim"],
                  tablefmt="github"))
 
-    assert output_snr > 10
-    assert dx_snr > 10
-    assert dw_snr > 10
+    min_sr = 8 if use_grad_sr else 10
+    assert output_snr > min_sr
+    assert dx_snr > min_sr
+    assert dw_snr > min_sr
