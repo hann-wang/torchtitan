@@ -475,9 +475,10 @@ def convert_to_mxfp4_1dblock(
     axis: int = -1,
     use_asm: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert data_hp.size(
-        axis
-    ) % block_size == 0, f"tensor shape ({data_hp.shape}) at axis={axis} is not divisible by {block_size}"
+    torch._check(
+        data_hp.shape[axis] % block_size == 0,
+        f"tensor shape ({data_hp.shape}) at axis={axis} is not divisible by {block_size}"
+    )
     assert data_hp.dtype in [torch.float32, torch.bfloat16]
     if use_asm is None:
         use_asm = is_cdna4()

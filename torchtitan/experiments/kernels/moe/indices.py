@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
+from torch.library import triton_op, wrap_triton
 import triton
 import triton.language as tl
 
@@ -66,6 +67,7 @@ def _fill_indices_kernel(
 # ==============
 
 
+@triton_op("torchtitan::fill_indices_wrapper", mutates_args={})
 def fill_indices_wrapper(
     tokens_per_expert_group: torch.Tensor,
     start_index_values: torch.Tensor,
@@ -75,7 +77,7 @@ def fill_indices_wrapper(
     max_len: int,
     block_size: int = 128,
     max_blocks: int = 1024,  # cap on total number of blocks to launch
-):
+) -> torch.Tensor:
     # preallocate output
     permuted_indices = torch.full(
         (max_len,), -1, dtype=torch.int32, device=tokens_per_expert_group.device
@@ -87,7 +89,7 @@ def fill_indices_wrapper(
     grid = (num_blocks,)
 
     # launch kernel
-    _fill_indices_kernel[grid](
+    wrap_triton(_fill_indices_kernel)[grid](
         tokens_per_expert_group,
         start_index_values,
         write_offsets,
@@ -97,6 +99,27 @@ def fill_indices_wrapper(
         BLOCK_SIZE=block_size,
     )
     return permuted_indices
+
+
+@fill_indices_wrapper.register_fake
+def fill_indices_wrapper_fake(
+    tokens_per_expert_group: torch.Tensor,
+    start_index_values: torch.Tensor,
+    write_offsets: torch.Tensor,
+    experts_per_rank: int,
+    num_ranks: int,
+    max_len: int,
+    block_size: int = 128,
+    max_blocks: int = 1024,  # cap on total number of blocks to launch
+) -> torch.Tensor:
+    """
+    Fake implementation of the fill_indices_wrapper for testing purposes.
+    It simply returns a tensor filled with -1, simulating the output of the kernel.
+    """
+    return torch.full((max_len, ),
+                      -1,
+                      dtype=torch.int32,
+                      device=tokens_per_expert_group.device)
 
 
 # reference

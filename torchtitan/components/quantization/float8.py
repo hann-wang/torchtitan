@@ -18,7 +18,7 @@ from torchtitan.protocols.model_converter import (
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
-from .utils import module_filter_fn
+from .utils import module_filter_fn, swap_linear_layers
 
 AUTO_FILTER_SMALL_KN_FLAG = "auto_filter_small_kn"
 
@@ -32,30 +32,32 @@ class Float8Converter(ModelConverter):
         model_compile_enabled = (
             compile_config.enable and "model" in compile_config.components
         )
-        if has_cuda_capability(8, 9) or (
-            float8_config.emulate and not model_compile_enabled
-        ):
-            pass
-        else:
-            raise ValueError(
-                "Failed to swap to Float8Linear because float8 is only supported on SM89 or later."
-                "To enable testing on older hardware, set `float8.emulate` to True in eager mode.",
-            )
-        try:
-            from torchao.float8 import Float8LinearConfig
-        except ImportError as e:
-            raise ImportError(
-                "torchao is not installed. Please install it to use float8 linear layers."
-            ) from e
 
-        if float8_config.recipe_name is not None and not hasattr(
-            Float8LinearConfig, "from_recipe_name"
-        ):
-            logger.warning(
-                "Failed to swap to Float8Linear with recipe lookup because the torchao version "
-                "is too old, please install torchao v0.9.0 or later and try again",
-            )
-            return
+        if float8_config.recipe_name != "blockwise":
+            if has_cuda_capability(8, 9) or (
+                float8_config.emulate and not model_compile_enabled
+            ):
+                pass
+            else:
+                raise ValueError(
+                    "Failed to swap to Float8Linear because float8 is only supported on SM89 or later."
+                    "To enable testing on older hardware, set `float8.emulate` to True in eager mode.",
+                )
+            try:
+                from torchao.float8 import Float8LinearConfig
+            except ImportError as e:
+                raise ImportError(
+                    "torchao is not installed. Please install it to use float8 linear layers."
+                ) from e
+
+            if float8_config.recipe_name is not None and not hasattr(
+                Float8LinearConfig, "from_recipe_name"
+            ):
+                logger.warning(
+                    "Failed to swap to Float8Linear with recipe lookup because the torchao version "
+                    "is too old, please install torchao v0.9.0 or later and try again",
+                )
+                return
 
         self.enabled = True
         self.filter_fqns = float8_config.filter_fqns
@@ -168,8 +170,6 @@ class Float8Converter(ModelConverter):
             self._convert_moe_layers(model)
 
         if self.enable_fp8_linear:
-            from torchao.float8.float8_linear_utils import convert_to_float8_training, swap_linear_layers
-
             if self.use_blockwise_fp8_linear:
                 from torchtitan.experiments.kernels.blockwise_fp8 import BlockwiseFP8Linear
                 from_float = lambda m: BlockwiseFP8Linear.from_float(m)
@@ -180,6 +180,8 @@ class Float8Converter(ModelConverter):
                 )
                 logger.info("Swapped to BlockwiseFP8Linear layers")
             else:
+                from torchao.float8.float8_linear_utils import convert_to_float8_training
+
                 # Mutates the model inplace replacing instances of nn.Linear with Float8Linear
                 convert_to_float8_training(
                     model,
