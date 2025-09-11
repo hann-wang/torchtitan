@@ -72,7 +72,7 @@ def get_peak_flops(device_name: str) -> int:
         filtered_lines = [
             line
             for line in result.stdout.splitlines()
-            if "NVIDIA" in line and "H100" in line
+            if ("NVIDIA" in line or "AMD" in line)
         ]
         # Join all filtered lines into a single string
         device_name = " ".join(filtered_lines) or device_name
@@ -103,6 +103,9 @@ def get_peak_flops(device_name: str) -> int:
     elif "MI250X" in device_name:
         # data from https://www.amd.com/en/products/accelerators/instinct/mi200/mi250x.html (per GCD)
         return 191.5e12
+    elif "Device 75a3" in device_name:
+        # data from https://www.amd.com/en/products/accelerators/instinct/mi350/mi355x.html
+        return 2500e12
     elif "Data Center GPU Max 1550" in device_name:
         # Also known as Ponte Vecchio (PVC).
         # data from https://www.intel.com/content/www/us/en/docs/oneapi/optimization-guide-gpu/2025-0/intel-xe-gpu-architecture.html

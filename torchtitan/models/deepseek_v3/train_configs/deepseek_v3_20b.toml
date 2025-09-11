@@ -1,5 +1,5 @@
 [job]
-dump_folder = "./deepseek-v3-lite20b-mi355-bf16-bs4-outputs"
+dump_folder = "./deepseek-v3-lite20b-mi355-bf16attn-mxfp4gemm1d1d-bs4-outputs"
 description = "DeepSeek-V3 16B model training"
 print_args = false
 
@@ -22,6 +22,7 @@ name = "deepseek_v3"
 flavor = "20B"
 hf_assets_path = "./assets/hf/DeepSeek-V3-Base"
 # converters = ["float8"]
+converters = ["mx"]
 
 [optimizer]
 name = "AdamW"
@@ -39,7 +40,7 @@ local_batch_size = 2
 seq_len = 4096
 max_norm = 1.0  # grad norm clipping
 steps = 3000
-dataset = "c4_test"  # supported datasets: c4_test (2K), c4 (177M)
+dataset = "c4"  # supported datasets: c4_test (2K), c4 (177M)
 
 [parallelism]
 data_parallel_replicate_degree = 1
@@ -80,7 +81,7 @@ enable_fp8_linear = true
 
 [mx]
 filter_fqns = ["output", "router.gate", "attention.wq", "attention.wq_a", "attention.wq_b", "attention.wkv_a", "attention.wkv_b", "attention.wo"]
-recipe_name = "mxfp4_1d2d"
+recipe_name = "mxfp4_1d1d"
 enable_mxfp4_fa = false
 enable_mxfp4_gmm = true
 enable_mxfp4_linear = true

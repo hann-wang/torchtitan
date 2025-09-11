@@ -153,6 +153,7 @@ def generate_permute_indices(
         experts_per_rank: number of experts per rank.
         num_ranks: number of ranks.
         max_len: maximum length of the output index vector.
+            (ignored in order to produce aligned shape for quantization)
         alignment: alignment for each returned element in `m_sizes` and padding min for zero token experts.
         use_cpu: whether to use CPU implementation.
 
@@ -190,6 +191,12 @@ def generate_permute_indices(
     m_offsets = torch.cumsum(m_sizes, 0)
     write_offsets = m_offsets - m_sizes
 
+    # ignores maxlen to produce aligned shape for quantization
+    total_size = m_offsets[-1].item()
+    torch._check_is_size(total_size)
+    torch._check(total_size % alignment == 0)
+    torch._check(total_size // alignment >= experts_per_rank)
+
     # Select the implementation to use
     if use_cpu:
         permuted_indices = fill_indices_cpu(
@@ -198,7 +205,7 @@ def generate_permute_indices(
             write_offsets,
             experts_per_rank,
             num_ranks,
-            max_len,
+            total_size,
         )
     else:
         permuted_indices = fill_indices_wrapper(
@@ -207,7 +214,7 @@ def generate_permute_indices(
             write_offsets,
             experts_per_rank,
             num_ranks,
-            max_len,
+            total_size,
         )
 
     return permuted_indices, m_sizes, m_offsets.to(torch.int32)

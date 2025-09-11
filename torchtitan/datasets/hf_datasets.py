@@ -3,7 +3,7 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
+import os
 from dataclasses import dataclass
 
 from functools import partial
@@ -24,6 +24,8 @@ from torchtitan.tools.logging import logger
 
 def _load_c4_dataset(dataset_path: str, split: str):
     """Load C4 dataset with default configuration."""
+    if os.environ.get("HF_HUB_OFFLINE", "0") != "0" and split == "train":
+        return load_dataset(dataset_path, name="en", split=split).to_iterable_dataset()
     return load_dataset(dataset_path, name="en", split=split, streaming=True)
 
 
