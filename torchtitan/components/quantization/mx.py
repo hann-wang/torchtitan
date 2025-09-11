@@ -113,6 +113,7 @@ class MXConverter(ModelConverter):
                 }
             else:
                 raise ValueError(f"Unknown MXFP4 recipe: {self.mxfp4_recipe}")
+            self.attrs_2dblock["use_sr_grad"] = mx_job_config.use_sr_grad
 
     def _apply_attrs_2dblock(self, mod: nn.Module):
         mod.use_mxfp4 = True
@@ -142,14 +143,16 @@ class MXConverter(ModelConverter):
             logger.info("Swapped to MXLinear layers")
 
         else:
-            from_float = lambda m: MXFP4Linear.from_float(m)
-            swap_linear_layers(
-                model,
-                from_float,
-                module_filter_fn=partial(module_filter_fn,
-                                         filter_fqns=self.filter_fqns),
-            )
-            logger.info("Swapped to MXFP4Linear layers")
+            if self.enable_mxfp4_linear:
+                from_float = lambda m: MXFP4Linear.from_float(
+                    m, **self.attrs_2dblock)
+                swap_linear_layers(
+                    model,
+                    from_float,
+                    module_filter_fn=partial(module_filter_fn,
+                                             filter_fqns=self.filter_fqns),
+                )
+                logger.info("Swapped to MXFP4Linear layers")
 
             if self.enable_mxfp4_fa:
                 self._enable_mxfp4_fa(model)

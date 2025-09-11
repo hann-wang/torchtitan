@@ -273,6 +273,7 @@ class MXFP4LinearFunction(torch.autograd.Function):
         weight,
         use_2dblock_x,
         use_2dblock_w,
+        use_sr_grad,
     ):
         """
         Forward pass for the blockwise FP8 linear operation.
@@ -319,6 +320,7 @@ class MXFP4LinearFunction(torch.autograd.Function):
         ctx.use_2dblock_x = use_2dblock_x
         ctx.use_2dblock_w = use_2dblock_w
         ctx.original_dtype = original_dtype
+        ctx.use_sr_grad = use_sr_grad
 
         return y.view(*original_shape[:-1], -1)  # Reshape back to original
 
@@ -352,6 +354,7 @@ class MXFP4LinearFunction(torch.autograd.Function):
             grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
                 grad_output,
                 axis=-1,
+                use_sr=ctx.use_sr_grad,
             )
             grad_output_mxfp4_m = grad_output_mxfp4
             grad_output_scales_m = grad_output_scales
@@ -369,10 +372,12 @@ class MXFP4LinearFunction(torch.autograd.Function):
             grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=-1,
+                use_sr=ctx.use_sr_grad,
             )
             grad_output_mxfp4_m, grad_output_scales_m = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=0,
+                use_sr=ctx.use_sr_grad,
             )
 
         # Compute gradients
@@ -400,7 +405,7 @@ class MXFP4LinearFunction(torch.autograd.Function):
         )
 
         return grad_inputs.view(*original_shape[:-1],
-                                -1), grad_weights, None, None
+                                -1), grad_weights, None, None, None
 
 
 single_mesh_dim_strategies = []
@@ -434,6 +439,7 @@ class MXFP4Linear(nn.Linear):
                  bias: bool = False,
                  use_2dblock_x: bool = False,
                  use_2dblock_w: bool = True,
+                 use_sr_grad: bool = False,
                  device: torch.device | None = None,
                  dtype: torch.dtype | None = None):
         super().__init__(in_features,
@@ -444,6 +450,7 @@ class MXFP4Linear(nn.Linear):
 
         self.use_2dblock_x = use_2dblock_x
         self.use_2dblock_w = use_2dblock_w
+        self.use_sr_grad = use_sr_grad
         assert not self.bias, "Bias is not supported in MXFP4Linear"
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -481,8 +488,13 @@ class MXFP4Linear(nn.Linear):
             w = self.weight.to_local()
         else:
             w = self.weight
-        y = MXFP4LinearFunction.apply(x, w, self.use_2dblock_x,
-                                      self.use_2dblock_w)
+        y = MXFP4LinearFunction.apply(
+            x,
+            w,
+            self.use_2dblock_x,
+            self.use_2dblock_w,
+            self.use_sr_grad,
+        )
 
         if device_mesh is not None:
             y = DTensor.from_local(y,
@@ -497,6 +509,7 @@ class MXFP4Linear(nn.Linear):
         layer: nn.Linear,
         use_2dblock_x: bool = False,
         use_2dblock_w: bool = True,
+        use_sr_grad: bool = False,
     ):
         """
         Create a MXFP4Linear layer from a standard nn.Linear layer.
@@ -514,6 +527,7 @@ class MXFP4Linear(nn.Linear):
             layer.bias is not None,
             use_2dblock_x=use_2dblock_x,
             use_2dblock_w=use_2dblock_w,
+            use_sr_grad=use_sr_grad,
             device=layer.weight.device,
             dtype=layer.weight.dtype,
         )

@@ -41,6 +41,7 @@ seq_len = 4096
 max_norm = 1.0  # grad norm clipping
 steps = 3000
 dataset = "c4"  # supported datasets: c4_test (2K), c4 (177M)
+seed = 1234
 
 [parallelism]
 data_parallel_replicate_degree = 1
@@ -85,3 +86,4 @@ recipe_name = "mxfp4_1d1d"
 enable_mxfp4_fa = false
 enable_mxfp4_gmm = true
 enable_mxfp4_linear = true
+use_sr_grad = false

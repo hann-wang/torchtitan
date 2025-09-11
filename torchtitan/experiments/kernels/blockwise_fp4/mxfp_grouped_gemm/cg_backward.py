@@ -647,6 +647,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
         trans_weights=True,
         use_2dblock_x=False,
         use_2dblock_w=True,
+        use_sr_grad=False,
     ):
         """Forward pass for contiguous grouped GEMM."""
         original_dtype = inputs.dtype
@@ -680,6 +681,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
         ctx.use_2dblock_w = use_2dblock_w
         ctx.trans_weights = trans_weights
         ctx.original_dtype = original_dtype
+        ctx.use_sr_grad = use_sr_grad
 
         res = torch.ops.torchtitan.mxfp4_grouped_gemm_forward(
             inputs=inputs_mxfp4,
@@ -723,6 +725,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
                 grad_output,
                 axis=-1,
+                use_sr=ctx.use_sr_grad,
             )
             grad_output_mxfp4_m = grad_output_mxfp4
             grad_output_scales_m = grad_output_scales
@@ -741,10 +744,12 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=-1,
+                use_sr=ctx.use_sr_grad,
             )
             grad_output_mxfp4_m, grad_output_scales_m = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
                 grad_output,
                 axis=0,
+                use_sr=ctx.use_sr_grad,
             )
 
         # Compute gradients
@@ -776,7 +781,7 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             output_dtype=ctx.original_dtype,
         )
 
-        return grad_inputs, grad_weights, None, None, None, None
+        return grad_inputs, grad_weights, None, None, None, None, None
 
 
 def mxfp4_grouped_gemm(
@@ -786,6 +791,7 @@ def mxfp4_grouped_gemm(
     trans_weights: bool = True,
     use_2dblock_x: bool = False,
     use_2dblock_w: bool = True,
+    use_sr_grad: bool = False,
 ) -> torch.Tensor:
     """
     Interface for contiguous grouped GEMM with full backward pass support.
@@ -808,6 +814,7 @@ def mxfp4_grouped_gemm(
         trans_weights,
         use_2dblock_x,
         use_2dblock_w,
+        use_sr_grad,
     )
 
     return res

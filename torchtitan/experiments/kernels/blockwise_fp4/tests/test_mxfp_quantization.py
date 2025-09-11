@@ -22,9 +22,13 @@ from .utils import (
                                           (4, 128, 64)])
 @pytest.mark.parametrize("axis", [-1, -2])
 @pytest.mark.parametrize("data_type", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_sr", [False, True])
 @pytest.mark.parametrize("use_asm", [False, True])
 @pytest.mark.parametrize("compile", [False])
-def test_mxfp_1d_quantization(tensor_shape, axis, data_type, use_asm, compile):
+def test_mxfp_1d_quantization(tensor_shape, axis, data_type, use_sr, use_asm,
+                              compile):
+    if use_sr and not use_asm:
+        pytest.skip("Non-asm mode dose not support Stochastic Rounding.")
 
     if compile:
         quant_func = torch.compile(
@@ -42,24 +46,48 @@ def test_mxfp_1d_quantization(tensor_shape, axis, data_type, use_asm, compile):
                                                   output_dtype=data_type,
                                                   axis=axis)
 
-    data_lp, scales = quant_func(x, axis=axis, use_asm=use_asm)
+    data_lp, scales = quant_func(
+        x,
+        axis=axis,
+        use_sr=use_sr,
+        use_asm=use_asm,
+    )
     assert torch.all(scales_ref == scales).item()
-    assert torch.all(data_lp_ref == data_lp).item()
+    if not use_sr:
+        assert torch.all(data_lp_ref == data_lp).item()
+    else:
+        data_lp_ref_lo = (data_lp_ref.to(torch.int8) & 0xF)
+        data_lp_ref_hi = ((data_lp_ref.to(torch.int8) >> 4) & 0xF)
+        data_lp_lo = (data_lp.to(torch.int8) & 0xF)
+        data_lp_hi = ((data_lp.to(torch.int8) >> 4) & 0xF)
+        assert torch.all(
+            torch.max(torch.abs(data_lp_ref_lo - data_lp_lo)) <= 1).item()
+        assert torch.all(
+            torch.max(torch.abs(data_lp_ref_hi - data_lp_hi)) <= 1).item()
 
     x_dq = dequant_func(data_lp,
                         scales,
                         output_dtype=data_type,
                         axis=axis,
                         use_asm=use_asm)
-    assert torch.allclose(x_dq_ref, x_dq)
+
+    if not use_sr:
+        assert torch.allclose(x_dq_ref, x_dq)
+    else:
+        dq_mae = (x_dq_ref - x_dq).abs().mean().item()
+        assert dq_mae < 0.5
 
 
 @pytest.mark.parametrize("tensor_shape", [(128, 64), (2048, 2048)])
 @pytest.mark.parametrize("axis", [-1, 0])
 @pytest.mark.parametrize("data_type", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("use_sr", [False, True])
 @pytest.mark.parametrize("use_asm", [False, True])
 @pytest.mark.parametrize("compile", [False])
-def test_mxfp_2d_quantization(tensor_shape, axis, data_type, use_asm, compile):
+def test_mxfp_2d_quantization(tensor_shape, axis, data_type, use_sr, use_asm,
+                              compile):
+    if use_sr and not use_asm:
+        pytest.skip("Non-asm mode dose not support Stochastic Rounding.")
 
     if compile:
         quant_func = torch.compile(
@@ -76,14 +104,33 @@ def test_mxfp_2d_quantization(tensor_shape, axis, data_type, use_asm, compile):
                                                   scales_ref,
                                                   output_dtype=data_type,
                                                   axis=axis)
-    data_lp, scales = quant_func(x, axis=axis, use_asm=use_asm)
+    data_lp, scales = quant_func(
+        x,
+        axis=axis,
+        use_sr=use_sr,
+        use_asm=use_asm,
+    )
 
     assert torch.all(scales_ref == scales).item()
-    assert torch.all(data_lp_ref == data_lp).item()
+    if not use_sr:
+        assert torch.all(data_lp_ref == data_lp).item()
+    else:
+        data_lp_ref_lo = (data_lp_ref.to(torch.int8) & 0xF)
+        data_lp_ref_hi = ((data_lp_ref.to(torch.int8) >> 4) & 0xF)
+        data_lp_lo = (data_lp.to(torch.int8) & 0xF)
+        data_lp_hi = ((data_lp.to(torch.int8) >> 4) & 0xF)
+        assert torch.all(
+            torch.max(torch.abs(data_lp_ref_lo - data_lp_lo)) <= 1).item()
+        assert torch.all(
+            torch.max(torch.abs(data_lp_ref_hi - data_lp_hi)) <= 1).item()
 
     x_dq = dequant_func(data_lp,
                         scales,
                         output_dtype=data_type,
                         axis=axis,
                         use_asm=use_asm)
-    assert torch.allclose(x_dq_ref, x_dq)
+    if not use_sr:
+        assert torch.allclose(x_dq_ref, x_dq)
+    else:
+        dq_mae = (x_dq_ref - x_dq).abs().mean().item()
+        assert dq_mae < 1

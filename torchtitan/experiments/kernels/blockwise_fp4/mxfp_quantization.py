@@ -175,40 +175,83 @@ def _dequantize_fp4(qx, scales_fp32):
 
 
 @triton.jit
+def _generate_randval(m, n):
+    philox_seed: tl.constexpr = 0x1BF52
+    philox_offset: tl.constexpr = 0x1D4B42
+    ms = tl.arange(0, m)
+    ns = tl.arange(0, n)
+    rng_offsets = philox_offset + ms[:, None] * n + ns[None, :]
+    return tl.randint(philox_seed, rng_offsets)
+
+
+@triton.jit
 def _pack_fp4(
     x0,
     x1,
     scales,
+    m: tl.constexpr,
+    n: tl.constexpr,
+    USE_SR: tl.constexpr = False,
     USE_ASM: tl.constexpr = False,
 ):
     scales_fp32 = (scales << 23).to(tl.float32, bitcast=True)
     if USE_ASM:
+        if USE_SR:
+            randval = _generate_randval(m, n)
+
         if x0.type.element_ty == tl.float32:
-            y = tl.inline_asm_elementwise(
-                asm="""
-                v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];
-                """,
-                constraints="=&v,v,v,v",
-                args=[x0, x1, scales_fp32],
-                dtype=tl.uint16,
-                is_pure=True,
-                pack=1,
-            )
+            if not USE_SR:
+                y = tl.inline_asm_elementwise(
+                    asm="""
+                    v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];
+                    """,
+                    constraints="=&v,v,v,v",
+                    args=[x0, x1, scales_fp32],
+                    dtype=tl.uint16,
+                    is_pure=True,
+                    pack=1,
+                )
+            else:
+                x0 = (x1.to(tl.uint32, bitcast=True).to(tl.uint64) <<
+                      32) | x0.to(tl.uint32, bitcast=True)
+                y = tl.inline_asm_elementwise(
+                    asm="""
+                    v_cvt_scalef32_sr_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];
+                    """,
+                    constraints="=&v,v,v,v",
+                    args=[x0, randval, scales_fp32],
+                    dtype=tl.uint16,
+                    is_pure=True,
+                    pack=1,
+                )
         else:
             x0 = (x1.to(tl.uint16, bitcast=True).to(tl.uint32) << 16) | x0.to(
                 tl.uint16, bitcast=True)
-            y = tl.inline_asm_elementwise(
-                asm="""
-                v_cvt_scalef32_pk_fp4_bf16 $0, $1, $2 op_sel:[0,0,0,0];
-                """,
-                constraints="=&v,v,v",
-                args=[x0, scales_fp32],
-                dtype=tl.uint16,
-                is_pure=True,
-                pack=1,
-            )
+            if not USE_SR:
+                y = tl.inline_asm_elementwise(
+                    asm="""
+                    v_cvt_scalef32_pk_fp4_bf16 $0, $1, $2 op_sel:[0,0,0,0];
+                    """,
+                    constraints="=&v,v,v",
+                    args=[x0, scales_fp32],
+                    dtype=tl.uint16,
+                    is_pure=True,
+                    pack=1,
+                )
+            else:
+                y = tl.inline_asm_elementwise(
+                    asm="""
+                    v_cvt_scalef32_sr_pk_fp4_bf16 $0, $1, $2, $3 op_sel:[0,0,0,0];
+                    """,
+                    constraints="=&v,v,v,v",
+                    args=[x0, randval, scales_fp32],
+                    dtype=tl.uint16,
+                    is_pure=True,
+                    pack=1,
+                )
         y = y & 0x00FF
     else:
+        tl.static_assert(not USE_SR)
         y0 = _quantize_fp4(x0, scales_fp32)
         y1 = _quantize_fp4(x1, scales_fp32)
         y = y0 | (y1 << 4)
@@ -274,6 +317,7 @@ def _convert_to_mxfp4_1dblock_kernel(
     stride_sm: tl.constexpr,
     stride_sn: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_SR: tl.constexpr,
     USE_ASM: tl.constexpr,
 ):
     """
@@ -305,9 +349,18 @@ def _convert_to_mxfp4_1dblock_kernel(
     scales = _calculate_scales(x)
     tl.store(s_ptr + offs_s, scales.to(s_ptr.type.element_ty))
 
-    x = x.reshape(HALF_BLOCK_SIZE, 2)
+    x = x.reshape(1, HALF_BLOCK_SIZE, 2)
     x0, x1 = tl.split(x)
-    y = _pack_fp4(x0, x1, scales, USE_ASM=USE_ASM)
+    y = _pack_fp4(
+        x0,
+        x1,
+        scales,
+        m=1,
+        n=HALF_BLOCK_SIZE,
+        USE_SR=USE_SR,
+        USE_ASM=USE_ASM,
+    )
+    y = y.reshape(HALF_BLOCK_SIZE)
     offs_y = pid_m * stride_ym + (start_yn + offs_yn) * stride_yn
     tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
 
@@ -324,6 +377,7 @@ def _convert_to_mxfp4_2dblock_kernel(
     stride_sm: tl.constexpr,
     stride_sn: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_SR: tl.constexpr,
     USE_ASM: tl.constexpr,
 ):
     """
@@ -360,7 +414,15 @@ def _convert_to_mxfp4_2dblock_kernel(
 
     x = x.reshape(BLOCK_SIZE, HALF_BLOCK_SIZE, 2)
     x0, x1 = tl.split(x)
-    y = _pack_fp4(x0, x1, scales, USE_ASM=USE_ASM)
+    y = _pack_fp4(
+        x0,
+        x1,
+        scales,
+        m=BLOCK_SIZE,
+        n=HALF_BLOCK_SIZE,
+        USE_SR=USE_SR,
+        USE_ASM=USE_ASM,
+    )
 
     offs_y = (start_m + offs_m[:, None]) * stride_ym + (
         start_yn + offs_yn[None, :]) * stride_yn
@@ -473,6 +535,7 @@ def convert_to_mxfp4_1dblock(
     data_hp: torch.Tensor,
     block_size: int = BLOCK_SIZE_DEFAULT,
     axis: int = -1,
+    use_sr: bool = False,
     use_asm: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     torch._check(
@@ -513,6 +576,7 @@ def convert_to_mxfp4_1dblock(
         stride_sm,
         stride_sn,
         BLOCK_SIZE=block_size,
+        USE_SR=use_sr,
         USE_ASM=use_asm,
     )
 
@@ -525,6 +589,7 @@ def convert_to_mxfp4_2dblock(
     data_hp: torch.Tensor,
     block_size: int = BLOCK_SIZE_DEFAULT,
     axis: int = -1,
+    use_sr: bool = False,
     use_asm: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert data_hp.size(-2) % block_size == 0 and data_hp.size(
@@ -566,6 +631,7 @@ def convert_to_mxfp4_2dblock(
         stride_sm,
         stride_sn,
         BLOCK_SIZE=block_size,
+        USE_SR=use_sr,
         USE_ASM=use_asm,
     )
 

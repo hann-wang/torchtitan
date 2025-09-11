@@ -137,6 +137,7 @@ def _run_experts_triton_grouped_gemm(
     use_mxfp4: bool = False,
     use_2dblock_x: bool = False,
     use_2dblock_w: bool = True,
+    use_sr_grad: bool = False,
 ) -> torch.Tensor:
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     # grouped mm between a 2D tensor and a 3D tensor
@@ -149,7 +150,8 @@ def _run_experts_triton_grouped_gemm(
         gmm = mxfp4_grouped_gemm
         extra_kwargs = {
             "use_2dblock_x": use_2dblock_x,
-            "use_2dblock_w": use_2dblock_w
+            "use_2dblock_w": use_2dblock_w,
+            "use_sr_grad": use_sr_grad
         }
 
     from torchtitan.experiments.deepseek_v3 import dsgemm_utils
@@ -198,6 +200,7 @@ class GroupedExperts(nn.Module):
         self.use_mxfp4 = False
         self.use_2dblock_x = False
         self.use_2dblock_w = True
+        self.use_sr_grad = False
 
     def __repr__(self):
         return f"{super().__repr__()} [use_fp8={self.use_fp8}, use_mxfp4={self.use_mxfp4}, use_2dblock_x={self.use_2dblock_x}, use_2dblock_w={self.use_2dblock_w}]"
@@ -222,6 +225,7 @@ class GroupedExperts(nn.Module):
             use_mxfp4=self.use_mxfp4,
             use_2dblock_x=self.use_2dblock_x,
             use_2dblock_w=self.use_2dblock_w,
+            use_sr_grad=self.use_sr_grad,
         )
 
         return expert_parallel(internal_function)(

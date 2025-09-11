@@ -634,6 +634,9 @@ class MX:
     enable_mxfp4_linear: bool = True
     """Whether to use MXFP4 Linear module"""
 
+    use_sr_grad: bool = False
+    """Whether to use Stochastic Rounding when quantifying gradients"""
+
     filter_fqns: list[str] = field(default_factory=lambda: ["output"])
     """
     Comma-separated list of fully qualified names of modules to skip applying mxfp8 training to.
