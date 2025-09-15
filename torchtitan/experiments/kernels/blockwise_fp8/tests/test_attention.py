@@ -257,8 +257,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
 
     q_fp8, q_descale = block_scaling_node(q)
     k_fp8, k_descale = block_scaling_node(k)
-    v_scale = torch.scalar_tensor(F8_FWD_MAX / v.abs().max(), device=device)
-    v_fp8 = check_and_convert(v, v_scale)
+    v_fp8, v_descale = block_scaling_node(v)
     p_scale = F8_FWD_MAX
 
     o, softmax_lse, _ = attention_block_forward_triton_impl(
@@ -267,7 +266,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         v_fp8,
         q_descale,
         k_descale,
-        v_scale=v_scale,
+        v_descale=v_descale,
         p_scale=p_scale,
         sm_scale=sm_scale,
         alibi_slopes=None,
@@ -316,7 +315,7 @@ def test_attention_fp8_with_sparse_do(batch, config, causal):
         softmax_lse,
         q_descale,
         k_descale,
-        v_scale,
+        v_descale,
         p_scale=p_scale,
         sm_scale=sm_scale,
         alibi_slopes=None,
