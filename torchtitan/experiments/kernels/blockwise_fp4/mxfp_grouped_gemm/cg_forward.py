@@ -66,7 +66,7 @@ def _kernel_mxfp4_grouped_gemm_forward(
         NUM_SMS: tl.constexpr,
         USE_2DBLOCK_A: tl.constexpr,
         USE_2DBLOCK_B: tl.constexpr,
-        QUANT_BLOCK_SIZE: tl.constexpr = BLOCK_SIZE_DEFAULT,
+        QUANT_BLOCK_SIZE: tl.constexpr,
         # Group size (for aligned loads)
         GROUP_SIZE_M: tl.constexpr = 128,
         SUPER_GROUP_M: tl.constexpr = 32,  # 32 works best
