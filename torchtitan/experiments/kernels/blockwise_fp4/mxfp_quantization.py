@@ -418,7 +418,7 @@ def _convert_to_mxfp4_kernel(
         QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
         IS_2D_BLOCK=IS_2D_BLOCK,
     )
-    #tl.device_print("scales", scales)
+
     tl.store(s_ptr + offs_s, scales.to(s_ptr.type.element_ty))
 
     y = _pack_fp4(
@@ -616,6 +616,7 @@ def _fake_convert_to_mxfp4(
     block_size: int = BLOCK_SIZE_DEFAULT,
     axis: int = -1,
     is_2d_block: bool = False,
+    use_sr: bool = False,
     use_asm: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     data_hp = data_hp.transpose(axis, -1)

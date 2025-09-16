@@ -311,10 +311,11 @@ def pack_uint4(uint8_data: torch.Tensor) -> torch.Tensor:
     return (uint8_data[1::2] << 4 | uint8_data[::2]).view(down_size(shape))
 
 
-def convert_to_mxfp4_1dblock_pytorch(
+def convert_to_mxfp4_pytorch(
     data_hp: torch.Tensor,
     block_size: int = BLOCK_SIZE_DEFAULT,
     axis: int = -1,
+    is_2d_block: bool = False,
 ):
     assert data_hp.dtype in [torch.float32, torch.bfloat16]
     if data_hp.dtype == torch.float32:
@@ -331,10 +332,22 @@ def convert_to_mxfp4_1dblock_pytorch(
 
     data_hp = data_hp.transpose(axis, -1)
     orig_shape = data_hp.shape
-    new_shape = (*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
-    data_hp = data_hp.reshape(new_shape)
+    if is_2d_block:
+        new_shape = (*orig_shape[:-2], orig_shape[-2] // block_size,
+                     block_size, orig_shape[-1] // block_size, block_size)
+        block_shape = (*orig_shape[:-2], orig_shape[-2] // block_size,
+                       orig_shape[-1] // block_size, block_size * block_size)
+        data_hp = data_hp.reshape(new_shape)
 
-    max_abs = torch.amax(torch.abs(data_hp), dim=-1)
+        max_abs = torch.amax(torch.abs(
+            data_hp.transpose(-2, -3).reshape(block_shape)),
+                             dim=-1)
+    else:
+        new_shape = (*orig_shape[:-1], orig_shape[-1] // block_size,
+                     block_size)
+        data_hp = data_hp.reshape(new_shape)
+
+        max_abs = torch.amax(torch.abs(data_hp), dim=-1)
 
     # round even (adaptive)
     max_abs = max_abs.view(hp_int_dtype)
@@ -354,122 +367,43 @@ def convert_to_mxfp4_1dblock_pytorch(
 
     scales_fp = (scales.to(hp_int_dtype) << hp_mbits).view(
         data_hp.dtype).unsqueeze(-1)
+    if is_2d_block:
+        scales_fp = scales_fp.unsqueeze(-3)
     data_lp = data_hp / scales_fp
 
     data_lp = data_lp.reshape(orig_shape)
     data_lp = f32_to_f4_unpacked(data_lp.float())
-    orig_shape = [*orig_shape[:-1], orig_shape[-1] // 2]
     data_lp = pack_uint4(data_lp)
 
     return data_lp.transpose(axis, -1), scales.transpose(axis, -1)
 
 
-def convert_to_mxfp4_2dblock_pytorch(
-    data_hp: torch.Tensor,
+def convert_from_mxfp4_pytorch(
+    data_lp: torch.Tensor,
+    scales: torch.Tensor,
+    output_dtype: torch.dtype = torch.float32,
     block_size: int = BLOCK_SIZE_DEFAULT,
     axis: int = -1,
-):
-    assert data_hp.dtype in [torch.float32, torch.bfloat16]
-    if data_hp.dtype == torch.float32:
-        hp_int_dtype = torch.int32
-        hp_mbits = 23
-        hp_ebits = 8
+    is_2d_block: bool = False,
+) -> torch.Tensor:
+    data_lp = data_lp.transpose(axis, -1)
+    scales = scales.transpose(axis, -1)
+
+    orig_shape = data_lp.shape
+    f4_unpacked = unpack_uint4(data_lp)
+    f32 = f4_unpacked_to_f32(f4_unpacked)
+    data_hp = f32.to(output_dtype)
+    orig_shape = (*orig_shape[:-1], orig_shape[-1] * 2)
+
+    if is_2d_block:
+        new_shape = (*orig_shape[:-2], orig_shape[-2] // block_size,
+                     block_size, orig_shape[-1] // block_size, block_size)
+        scale_shape = (*orig_shape[:-2], orig_shape[-2] // block_size, 1,
+                       orig_shape[-1] // block_size, 1)
     else:
-        hp_int_dtype = torch.int16
-        hp_mbits = 7
-        hp_ebits = 8
-    sbits = 1
-    mbits = 1
-    target_max_pow2 = 2
-
-    data_hp = data_hp.transpose(axis, -1)
-    orig_shape = data_hp.shape
-    new_shape = (*orig_shape[:-2], orig_shape[-2] // block_size, block_size,
-                 orig_shape[-1] // block_size, block_size)
-    block_shape = (*orig_shape[:-2], orig_shape[-2] // block_size,
-                   orig_shape[-1] // block_size, block_size * block_size)
-    data_hp = data_hp.reshape(new_shape)
-
-    max_abs = torch.amax(torch.abs(
-        data_hp.transpose(-2, -3).reshape(block_shape)),
-                         dim=-1)
-
-    # round even (adaptive)
-    max_abs = max_abs.view(hp_int_dtype)
-    val_to_add = 1 << (hp_mbits - mbits - 1)
-    mask = ((1 << (hp_ebits + sbits)) - 1) << hp_mbits
-    max_abs = ((max_abs + val_to_add) & mask) >> hp_mbits
-    scales = max_abs - target_max_pow2
-
-    # Today, 2**-127 returns 0 in compile+inductor+triton because it is in the
-    # float32 denormal range. For now, manually adjust the fp scale. This is
-    # relevant if all of the incoming block values are zeroes.
-    # See https://github.com/pytorch/pytorch/issues/125557 for details.
-    # Note: it would be more correct to set the minimum to 2**-127, but this
-    # does not work in triton either as it looks like subnormal value handling
-    # has some gaps.  So, for now just set to the minimum normal value.
-    scales = torch.clamp(scales, min=1).to(torch.uint8)
-
-    scales_fp = (scales.to(hp_int_dtype) << hp_mbits).view(
-        data_hp.dtype).unsqueeze(-1).unsqueeze(-3)
-    data_lp = data_hp / scales_fp
-
-    data_lp = data_lp.reshape(orig_shape)
-    data_lp = f32_to_f4_unpacked(data_lp.float())
-    orig_shape = [*orig_shape[:-1], orig_shape[-1] // 2]
-    data_lp = pack_uint4(data_lp)
-
-    return data_lp.transpose(axis, -1), scales.transpose(axis, -1)
-
-
-def convert_from_mxfp4_1dblock_pytorch(
-    data_lp: torch.Tensor,
-    scales: torch.Tensor,
-    output_dtype: torch.dtype = torch.float32,
-    block_size: int = BLOCK_SIZE_DEFAULT,
-    axis: int = -1,
-) -> torch.Tensor:
-    data_lp = data_lp.transpose(axis, -1)
-    scales = scales.transpose(axis, -1)
-
-    orig_shape = data_lp.shape
-    f4_unpacked = unpack_uint4(data_lp)
-    f32 = f4_unpacked_to_f32(f4_unpacked)
-    data_hp = f32.to(output_dtype)
-    orig_shape = (*orig_shape[:-1], orig_shape[-1] * 2)
-
-    new_shape = (*orig_shape[:-1], orig_shape[-1] // block_size, block_size)
-    scale_shape = (*orig_shape[:-1], orig_shape[-1] // block_size, 1)
-
-    data_hp = data_hp.reshape(new_shape)
-    s_fp = (scales.to(torch.int32) << 23).view(
-        torch.float32).reshape(scale_shape).to(output_dtype)
-    data_hp = data_hp * s_fp
-    data_hp = data_hp.reshape(orig_shape)
-
-    return data_hp.transpose(axis, -1)
-
-
-def convert_from_mxfp4_2dblock_pytorch(
-    data_lp: torch.Tensor,
-    scales: torch.Tensor,
-    output_dtype: torch.dtype = torch.float32,
-    block_size: int = BLOCK_SIZE_DEFAULT,
-    axis: int = -1,
-) -> torch.Tensor:
-    data_lp = data_lp.transpose(axis, -1)
-    scales = scales.transpose(axis, -1)
-
-    orig_shape = data_lp.shape
-    f4_unpacked = unpack_uint4(data_lp)
-    f32 = f4_unpacked_to_f32(f4_unpacked)
-    data_hp = f32.to(output_dtype)
-    orig_shape = (*orig_shape[:-1], orig_shape[-1] * 2)
-
-    new_shape = (*orig_shape[:-2], orig_shape[-2] // block_size, block_size,
-                 orig_shape[-1] // block_size, block_size)
-    scale_shape = (*orig_shape[:-2], orig_shape[-2] // block_size, 1,
-                   orig_shape[-1] // block_size, 1)
+        new_shape = (*orig_shape[:-1], orig_shape[-1] // block_size,
+                     block_size)
+        scale_shape = (*orig_shape[:-1], orig_shape[-1] // block_size, 1)
 
     data_hp = data_hp.reshape(new_shape)
     s_fp = (scales.to(torch.int32) << 23).view(
