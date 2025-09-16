@@ -21,9 +21,6 @@ from torchtitan.experiments.kernels.blockwise_fp4.mxfp_grouped_gemm.autotune imp
 )
 from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import (
     BLOCK_SIZE_DEFAULT,
-    convert_from_mxfp4_1dblock,
-    convert_to_mxfp4_1dblock,
-    convert_to_mxfp4_2dblock,
 )
 
 # ============ Triton kernel for contiguous grouped GEMM backward inputs ============
@@ -652,28 +649,19 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
         """Forward pass for contiguous grouped GEMM."""
         original_dtype = inputs.dtype
 
-        if use_2dblock_x:
-            inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
-                inputs,
-                axis=-1,
-            )
-        else:
-            inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
-                inputs,
-                axis=-1,
-            )
+        inputs_mxfp4, input_scales = torch.ops.torchtitan.convert_to_mxfp4(
+            inputs,
+            axis=-1,
+            is_2d_block=use_2dblock_x,
+        )
 
         quant_axis_w = -1 if trans_weights else -2
-        if use_2dblock_w:
-            expert_weights_mxfp4, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
-                expert_weights,
-                axis=quant_axis_w,
-            )
-        else:
-            expert_weights_mxfp4, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
-                expert_weights,
-                axis=quant_axis_w,
-            )
+        expert_weights_mxfp4, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4(
+            expert_weights,
+            axis=quant_axis_w,
+            is_2d_block=use_2dblock_w,
+        )
+
         # Save for backward
         ctx.save_for_backward(inputs_mxfp4, input_scales, expert_weights_mxfp4,
                               expert_weight_scales, expert_indices)
@@ -711,45 +699,52 @@ class MXFP4GroupedGEMM(torch.autograd.Function):
             requant_axis_w = -1
 
         if not ctx.use_2dblock_w:
-            weight_dequant = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
+            weight_dequant = torch.ops.torchtitan.convert_from_mxfp4(
                 expert_weights,
                 expert_weight_scales,
                 axis=quant_axis_w,
+                is_2d_block=False,
             )
-            expert_weights, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
+            expert_weights, expert_weight_scales = torch.ops.torchtitan.convert_to_mxfp4(
                 weight_dequant,
                 axis=requant_axis_w,
+                is_2d_block=False,
             )
 
         if ctx.use_2dblock_x:
-            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_2dblock(
+            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4(
                 grad_output,
                 axis=-1,
                 use_sr=ctx.use_sr_grad,
+                is_2d_block=True,
             )
             grad_output_mxfp4_m = grad_output_mxfp4
             grad_output_scales_m = grad_output_scales
         else:
-            inputs_dequant = torch.ops.torchtitan.convert_from_mxfp4_1dblock(
+            inputs_dequant = torch.ops.torchtitan.convert_from_mxfp4(
                 inputs,
                 input_scales,
                 output_dtype=ctx.original_dtype,
                 axis=-1,
+                is_2d_block=False,
             )
-            inputs, input_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
+            inputs, input_scales = torch.ops.torchtitan.convert_to_mxfp4(
                 inputs_dequant,
                 axis=0,
+                is_2d_block=False,
             )
 
-            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
+            grad_output_mxfp4, grad_output_scales = torch.ops.torchtitan.convert_to_mxfp4(
                 grad_output,
                 axis=-1,
                 use_sr=ctx.use_sr_grad,
+                is_2d_block=False,
             )
-            grad_output_mxfp4_m, grad_output_scales_m = torch.ops.torchtitan.convert_to_mxfp4_1dblock(
+            grad_output_mxfp4_m, grad_output_scales_m = torch.ops.torchtitan.convert_to_mxfp4(
                 grad_output,
                 axis=0,
                 use_sr=ctx.use_sr_grad,
+                is_2d_block=False,
             )
 
         # Compute gradients

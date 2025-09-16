@@ -2,7 +2,10 @@ import pytest
 from tabulate import tabulate
 import torch
 
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_grouped_gemm import (ALIGN_SIZE_M, mxfp4_grouped_gemm,)
+from torchtitan.experiments.kernels.blockwise_fp4.mxfp_grouped_gemm import (
+    ALIGN_SIZE_M,
+    mxfp4_grouped_gemm,
+)
 
 from .utils import prepare_data, calc_cossim, calc_snr
 

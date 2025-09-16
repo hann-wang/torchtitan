@@ -1,10 +1,8 @@
 import pytest
 import torch
 from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import (
-    convert_to_mxfp4_1dblock,
-    convert_from_mxfp4_1dblock,
-    convert_to_mxfp4_2dblock,
-    convert_from_mxfp4_2dblock,
+    convert_to_mxfp4,
+    convert_from_mxfp4,
 )
 
 from .utils import (
@@ -32,12 +30,12 @@ def test_mxfp_1d_quantization(tensor_shape, axis, data_type, use_sr, use_asm,
 
     if compile:
         quant_func = torch.compile(
-            torch.ops.torchtitan.convert_to_mxfp4_1dblock, fullgraph=True)
+            torch.ops.torchtitan.convert_to_mxfp4, fullgraph=True)
         dequant_func = torch.compile(
-            torch.ops.torchtitan.convert_from_mxfp4_1dblock, fullgraph=True)
+            torch.ops.torchtitan.convert_from_mxfp4, fullgraph=True)
     else:
-        quant_func = torch.ops.torchtitan.convert_to_mxfp4_1dblock
-        dequant_func = torch.ops.torchtitan.convert_from_mxfp4_1dblock
+        quant_func = torch.ops.torchtitan.convert_to_mxfp4
+        dequant_func = torch.ops.torchtitan.convert_from_mxfp4
 
     x = prepare_data(tensor_shape, data_type)
     data_lp_ref, scales_ref = convert_to_mxfp4_1dblock_pytorch(x, axis=axis)
@@ -91,12 +89,12 @@ def test_mxfp_2d_quantization(tensor_shape, axis, data_type, use_sr, use_asm,
 
     if compile:
         quant_func = torch.compile(
-            torch.ops.torchtitan.convert_to_mxfp4_2dblock, fullgraph=True)
+            torch.ops.torchtitan.convert_to_mxfp4, fullgraph=True)
         dequant_func = torch.compile(
-            torch.ops.torchtitan.convert_from_mxfp4_2dblock, fullgraph=True)
+            torch.ops.torchtitan.convert_from_mxfp4, fullgraph=True)
     else:
-        quant_func = torch.ops.torchtitan.convert_to_mxfp4_2dblock
-        dequant_func = torch.ops.torchtitan.convert_from_mxfp4_2dblock
+        quant_func = torch.ops.torchtitan.convert_to_mxfp4
+        dequant_func = torch.ops.torchtitan.convert_from_mxfp4
 
     x = prepare_data(tensor_shape, data_type)
     data_lp_ref, scales_ref = convert_to_mxfp4_2dblock_pytorch(x, axis=axis)
@@ -107,6 +105,7 @@ def test_mxfp_2d_quantization(tensor_shape, axis, data_type, use_sr, use_asm,
     data_lp, scales = quant_func(
         x,
         axis=axis,
+        is_2d_block=True,
         use_sr=use_sr,
         use_asm=use_asm,
     )
@@ -128,6 +127,7 @@ def test_mxfp_2d_quantization(tensor_shape, axis, data_type, use_sr, use_asm,
                         scales,
                         output_dtype=data_type,
                         axis=axis,
+                        is_2d_block=True,
                         use_asm=use_asm)
     if not use_sr:
         assert torch.allclose(x_dq_ref, x_dq)
