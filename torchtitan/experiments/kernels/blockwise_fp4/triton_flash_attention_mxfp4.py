@@ -18,9 +18,6 @@ from torch._library import triton_op, wrap_triton
 
 from .mxfp_quantization import (
     BLOCK_SIZE_DEFAULT,
-    convert_to_mxfp4_1dblock,
-    convert_to_mxfp4_2dblock,
-    convert_from_mxfp4_1dblock,
 )
 
 
@@ -62,6 +59,11 @@ def get_shape_from_layout(q,
             cu_seqlens_k) - 1, max_seqlen_k, v.shape[1], v.shape[2]
     else:
         assert False, "Got unsupported layout."
+
+    # Assume FP4 is packed along the head_dim
+    head_size_q *= 2
+    head_size_k *= 2
+    # head_size_v *= 2
 
     # assert
     assert batch_q == batch_k
@@ -123,17 +125,17 @@ def dropout_mask(philox_seed, philox_offset, dropout_p, m, n, stride):
 # "First" is the major dim, "second" is the minor dim.
 @triton.jit
 def load_fn(ptrs, offset_first, offset_second, boundary_first,
-            boundary_second):
+            boundary_second, other=0):
     if offset_first is not None and offset_second is not None:
         mask = (offset_first[:, None] < boundary_first) & \
                (offset_second[None, :] < boundary_second)
-        tensor = tl.load(ptrs, mask=mask, other=0)
+        tensor = tl.load(ptrs, mask=mask, other=other)
     elif offset_first is not None:
         mask = offset_first[:, None] < boundary_first
-        tensor = tl.load(ptrs, mask=mask, other=0)
+        tensor = tl.load(ptrs, mask=mask, other=other)
     elif offset_second is not None:
         mask = offset_second[None, :] < boundary_second
-        tensor = tl.load(ptrs, mask=mask, other=0)
+        tensor = tl.load(ptrs, mask=mask, other=other)
     else:
         tensor = tl.load(ptrs)
     return tensor
@@ -246,26 +248,39 @@ def _attn_fwd_inner(
             k_offs_n = None
         if PADDED_HEAD_QK:
             k_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_QK)
+            # k_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_QK * 2)
             ks_offs_k = tl.arange(0, SCALE_BLOCK_DMODEL_QK)
         else:
             k_offs_k = None
             ks_offs_k = None
         k = load_fn(k_ptrs, k_offs_k, k_offs_n, HALF_ACTUAL_BLOCK_DMODEL_QK,
                     actual_seqlen_k)
-        ks = load_fn(ks_ptrs, k_offs_n, ks_offs_k, actual_seqlen_k,
-                     SCALE_ACTUAL_BLOCK_DMODEL_QK)
+        ks = load_fn(ks_ptrs,
+                     k_offs_n,
+                     ks_offs_k,
+                     actual_seqlen_k,
+                     SCALE_ACTUAL_BLOCK_DMODEL_QK,
+                     other=1)
+
         if PADDED_HEAD_V:
-            v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V)
+            # v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V)
+            v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V * 2)
             vs_offs_k = tl.arange(0, SCALE_BLOCK_DMODEL_V)
         else:
             v_offs_k = None
             vs_offs_k = None
         if PRE_LOAD_V:
             # We can use the same offsets as k, just with dims transposed.
+            # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
+            #             HALF_ACTUAL_BLOCK_DMODEL_V)
             v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
-                        HALF_ACTUAL_BLOCK_DMODEL_V)
-            vs = load_fn(vs_ptrs, vs_offs_k, k_offs_n,
-                         SCALE_ACTUAL_BLOCK_DMODEL_V, actual_seqlen_k)
+                        HALF_ACTUAL_BLOCK_DMODEL_V * 2)
+            vs = load_fn(vs_ptrs,
+                         vs_offs_k,
+                         k_offs_n,
+                         SCALE_ACTUAL_BLOCK_DMODEL_V,
+                         actual_seqlen_k,
+                         other=1)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
@@ -294,6 +309,7 @@ def _attn_fwd_inner(
                             lhs_k_pack=True,
                             rhs_k_pack=True,
                             out_dtype=tl.float32)
+        # qk += tl.dot(q, k, out_dtype=tl.float32)
 
         qk_scaled = qk * SM_SCALE
 
@@ -374,10 +390,16 @@ def _attn_fwd_inner(
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
+            # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
+            #             HALF_ACTUAL_BLOCK_DMODEL_V)
             v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
-                        HALF_ACTUAL_BLOCK_DMODEL_V)
-            vs = load_fn(vs_ptrs, vs_offs_k, k_offs_n,
-                         SCALE_ACTUAL_BLOCK_DMODEL_V, actual_seqlen_k)
+                        HALF_ACTUAL_BLOCK_DMODEL_V * 2)
+            vs = load_fn(vs_ptrs,
+                         vs_offs_k,
+                         k_offs_n,
+                         SCALE_ACTUAL_BLOCK_DMODEL_V,
+                         actual_seqlen_k,
+                         other=1)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
@@ -516,6 +538,7 @@ def attn_fwd(
     HALF_ACTUAL_BLOCK_DMODEL_V: tl.constexpr = ACTUAL_BLOCK_DMODEL_V // 2
     SCALE_ACTUAL_BLOCK_DMODEL_QK: tl.constexpr = ACTUAL_BLOCK_DMODEL_QK // QUANT_BLOCK_SIZE
     SCALE_ACTUAL_BLOCK_DMODEL_V: tl.constexpr = ACTUAL_BLOCK_DMODEL_V // QUANT_BLOCK_SIZE
+    offs_d_qk = tl.arange(0, BLOCK_DMODEL_QK)
     offs_d_qk_pack = tl.arange(0, HALF_BLOCK_DMODEL_QK)
     offs_d_qk_scale = tl.arange(0, SCALE_BLOCK_DMODEL_QK)
     offs_d_v_pack = tl.arange(0, HALF_BLOCK_DMODEL_V)
@@ -612,11 +635,17 @@ def attn_fwd(
     q_offset = Q + off_z * stride_qz + off_h_q * stride_qh + cu_seqlens_q_start * stride_qm
     q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk_pack[
         None, :] * stride_qk
+    # q_ptrs = q_offset + offs_m[:, None] * stride_qm + offs_d_qk[
+    #     None, :] * stride_qk
     k_offset = K + off_z * stride_kz + off_h_k * stride_kh + cu_seqlens_k_start * stride_kn
     k_ptrs = k_offset + offs_d_qk_pack[:, None] * stride_kk + offs_n[
         None, :] * stride_kn
+    # k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[
+    #     None, :] * stride_kn
     v_offset = V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
-    v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v_pack[
+    # v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v_pack[
+    #     None, :] * stride_vn
+    v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[
         None, :] * stride_vn
     qs_offset = (q_scale_ptr + off_z * stride_qscale_z +
                  off_h_q * stride_qscale_h +
@@ -679,14 +708,20 @@ def attn_fwd(
     l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_DMODEL_V], dtype=tl.float32)
     # Q is loaded once at the beginning and shared by all N blocks.
-    q_ptrs_mask = qs_ptrs_mask = offs_m[:, None] < seqlen_q
+    q_ptrs_mask = offs_m[:, None] < seqlen_q
+    qs_ptrs_mask = q_ptrs_mask
     if PADDED_HEAD_QK:
         q_ptrs_mask = q_ptrs_mask & (offs_d_qk_pack[None, :]
                                      < HALF_ACTUAL_BLOCK_DMODEL_QK)
+        # q_ptrs_mask = q_ptrs_mask & (offs_d_qk[None, :]
+        #                              < ACTUAL_BLOCK_DMODEL_QK)
         qs_ptrs_mask = qs_ptrs_mask & (offs_d_qk_scale[None, :] < SCALE_ACTUAL_BLOCK_DMODEL_QK)
 
     q = tl.load(q_ptrs, mask=q_ptrs_mask, other=0)
     qs = tl.load(qs_ptrs, mask=qs_ptrs_mask, other=1)
+
+    # tl.device_print("q.shape", q.type.get_block_shapes())
+    # tl.device_print("qs.shape", qs.type.get_block_shapes())
 
     # Here we compute how many full and masked blocks we have.
     padded_block_k = n_extra_tokens != 0
@@ -968,6 +1003,7 @@ def attention_mxfp4_forward_triton_impl(
     assert v.is_contiguous()
     assert q_scale.is_contiguous()
     assert k_scale.is_contiguous()
+    assert v_scale.is_contiguous()
 
     o_shape = list(q.shape)
     o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
@@ -988,6 +1024,7 @@ def attention_mxfp4_forward_triton_impl(
     batch, nheads_q, nheads_k, head_size_qk, head_size_v, seqlen_q, seqlen_k = get_shape_from_layout(
         q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q,
         max_seqlens_k)
+    print(f"head_size_qk={head_size_qk}, head_size_v={head_size_v}")
     q_strides = get_strides_from_layout(q, layout)
     k_strides = get_strides_from_layout(k, layout)
     v_strides = get_strides_from_layout(v, layout)
@@ -1103,8 +1140,9 @@ def attention_mxfp4_forward_triton_impl(
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
-        BLOCK_M=64,
-        BLOCK_N=64,
+        BLOCK_M=128,
+        BLOCK_N=32,
+        QUANT_BLOCK_SIZE=BLOCK_SIZE_DEFAULT,
     )
     return o, softmax_lse, exp_scores
 
@@ -1131,15 +1169,23 @@ class _triton_attention_mxfp4(torch.autograd.Function):
         use_exp2: bool,
         layout: str,
     ):
-
-        q, q_scale = torch.ops.torchtitan.convert_to_mxfp4_2dblock(q, axis=-1)
-        k, k_scale = torch.ops.torchtitan.convert_to_mxfp4_2dblock(k, axis=-1)
-        v, v_scale = torch.ops.torchtitan.convert_to_mxfp4_2dblock(v, axis=-1)
+        q_hp = q
+        k_hp = k
+        v_hp = v
+        q, q_scale = torch.ops.torchtitan.convert_to_mxfp4(q,
+                                                           axis=-1,
+                                                           is_2d_block=True)
+        k, k_scale = torch.ops.torchtitan.convert_to_mxfp4(k,
+                                                           axis=-1,
+                                                           is_2d_block=True)
+        v, v_scale = torch.ops.torchtitan.convert_to_mxfp4(v,
+                                                           axis=-1,
+                                                           is_2d_block=True)
 
         output, softmax_lse, exp_scores = torch.ops.torchtitan.attention_mxfp4_forward_triton_impl(
             q,
             k,
-            v,
+            v_hp,
             q_scale,
             k_scale,
             v_scale,
