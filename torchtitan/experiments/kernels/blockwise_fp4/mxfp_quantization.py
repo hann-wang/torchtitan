@@ -418,9 +418,6 @@ def _convert_to_mxfp4_kernel(
         QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
         IS_2D_BLOCK=IS_2D_BLOCK,
     )
-
-    tl.store(s_ptr + offs_s, scales.to(s_ptr.type.element_ty))
-
     y = _pack_fp4(
         x,
         scales,
@@ -434,6 +431,7 @@ def _convert_to_mxfp4_kernel(
 
     offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
     tl.store(y_ptr + offs_y, y.to(y_ptr.type.element_ty))
+    tl.store(s_ptr + offs_s, scales)
 
 
 @triton.jit
@@ -530,7 +528,7 @@ def convert_to_mxfp4(
                         ori_shape[-1] // block_size)
     else:
         scales_shape = (*ori_shape[:-1], ori_shape[-1] // block_size)
-    scales = torch.zeros(scales_shape,
+    scales = torch.ones(scales_shape,
                          dtype=torch.uint8,
                          device=data_hp.device).reshape(-1, scales_shape[-1])
     stride_xm, stride_xn = data_hp.stride()
