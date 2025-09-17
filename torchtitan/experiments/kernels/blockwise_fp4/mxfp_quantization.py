@@ -309,7 +309,7 @@ def _unpack_fp4(
     SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
 
-    scales_fp32 = (scales << 23).to(tl.float32, bitcast=True)
+    scales_fp32 = (scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
     if IS_2D_BLOCK:
         # scales_fp32: [SCALE_BLOCK_M, SCALE_BLOCK_N]
         scales_fp32 = scales_fp32.expand_dims(axis=(1, 3)).broadcast_to(
@@ -483,7 +483,7 @@ def _convert_from_mxfp4_kernel(
     offs_s = offs_sm[:, None] * stride_sm + offs_sn[None, :] * stride_sn
 
     x = tl.load(x_ptr + offs_x)
-    s = tl.load(s_ptr + offs_s).to(tl.uint32)
+    s = tl.load(s_ptr + offs_s)
 
     tl.static_assert(y_ptr.type.element_ty == tl.float32
                      or y_ptr.type.element_ty == tl.bfloat16)
