@@ -163,9 +163,9 @@ def test_attention(batch, config, causal):
     loss_ref = o_ref.mean()
     loss_ref.backward()
     o = triton_attention_mxfp4(
-        query,
-        key,
-        value,
+        query.transpose(1, 2).contiguous(),
+        key.transpose(1, 2).contiguous(),
+        value.transpose(1, 2).contiguous(),
         bias=None,
         alibi_slopes=None,
         sm_scale=sm_scale,
@@ -177,8 +177,8 @@ def test_attention(batch, config, causal):
         causal=causal,
         return_scores=False,
         use_exp2=True,
-        layout="bshd",
-    )[0]
+        layout="bhsd",
+    )[0].transpose(1, 2)
 
     # loss = o.mean()
     # loss.backward()
