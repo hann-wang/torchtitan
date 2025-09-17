@@ -59,7 +59,7 @@ def _calculate_scales(
     # does not work in triton either as it looks like subnormal value handling
     # has some gaps.  So, for now just set to the minimum normal value.
     scales = tl.where(scales == 0, 1, scales)
-    return scales
+    return scales.to(tl.uint8)
 
 
 @triton.jit
@@ -218,7 +218,7 @@ def _pack_fp4(
     SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
     x0, x1 = tl.split(x.reshape(BLOCK_M, HALF_BLOCK_N, 2))
 
-    scales_fp32 = (scales << 23).to(tl.float32, bitcast=True)
+    scales_fp32 = (scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
     if IS_2D_BLOCK:
         # scales_fp32: [SCALE_BLOCK_M, SCALE_BLOCK_N]
         scales_fp32 = scales_fp32.expand_dims(axis=(1, 3)).broadcast_to(
@@ -290,7 +290,7 @@ def _pack_fp4(
         y1 = _quantize_fp4(x1, scales_fp32)
         y = y0 | (y1 << 4)
 
-    return y
+    return y.to(tl.uint8)
 
 
 @triton.jit
