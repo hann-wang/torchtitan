@@ -18,6 +18,9 @@ from torch._library import triton_op, wrap_triton
 
 from .mxfp_quantization import (
     BLOCK_SIZE_DEFAULT,
+    _calculate_scales,
+    _pack_fp4,
+    _unpack_fp4,
 )
 
 
@@ -63,7 +66,7 @@ def get_shape_from_layout(q,
     # Assume FP4 is packed along the head_dim
     head_size_q *= 2
     head_size_k *= 2
-    # head_size_v *= 2
+    head_size_v *= 2
 
     # assert
     assert batch_q == batch_k
@@ -263,23 +266,23 @@ def _attn_fwd_inner(
                      other=1)
 
         if PADDED_HEAD_V:
-            # v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V)
-            v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V * 2)
+            v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V)
+            # v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V * 2)
             vs_offs_k = tl.arange(0, SCALE_BLOCK_DMODEL_V)
         else:
             v_offs_k = None
             vs_offs_k = None
         if PRE_LOAD_V:
             # We can use the same offsets as k, just with dims transposed.
-            # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
-            #             HALF_ACTUAL_BLOCK_DMODEL_V)
             v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
-                        HALF_ACTUAL_BLOCK_DMODEL_V * 2)
+                        HALF_ACTUAL_BLOCK_DMODEL_V)
+            # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
+            #             HALF_ACTUAL_BLOCK_DMODEL_V * 2)
             vs = load_fn(vs_ptrs,
-                         vs_offs_k,
                          k_offs_n,
-                         SCALE_ACTUAL_BLOCK_DMODEL_V,
+                         vs_offs_k,
                          actual_seqlen_k,
+                         SCALE_ACTUAL_BLOCK_DMODEL_V,
                          other=1)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
@@ -309,7 +312,6 @@ def _attn_fwd_inner(
                             lhs_k_pack=True,
                             rhs_k_pack=True,
                             out_dtype=tl.float32)
-        # qk += tl.dot(q, k, out_dtype=tl.float32)
 
         qk_scaled = qk * SM_SCALE
 
@@ -390,22 +392,33 @@ def _attn_fwd_inner(
             alpha = tl.math.exp(m_diff)
         acc = acc * alpha[:, None]
         if not PRE_LOAD_V:
-            # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
-            #             HALF_ACTUAL_BLOCK_DMODEL_V)
             v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
-                        HALF_ACTUAL_BLOCK_DMODEL_V * 2)
+                        HALF_ACTUAL_BLOCK_DMODEL_V)
+            # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
+            #             HALF_ACTUAL_BLOCK_DMODEL_V * 2)
             vs = load_fn(vs_ptrs,
-                         vs_offs_k,
                          k_offs_n,
-                         SCALE_ACTUAL_BLOCK_DMODEL_V,
+                         vs_offs_k,
                          actual_seqlen_k,
+                         SCALE_ACTUAL_BLOCK_DMODEL_V,
                          other=1)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
 
-        acc += tl.dot(p.to(v.dtype), v, allow_tf32=False, out_dtype=tl.float32)
+        v_dq = _unpack_fp4(
+            v,
+            vs,
+            output_dtype=tl.float32,
+            BLOCK_M=BLOCK_N,
+            BLOCK_N=HALF_BLOCK_DMODEL_V * 2,
+            QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+            IS_2D_BLOCK=False,
+            USE_ASM=True,
+        )
+
+        acc += tl.dot(p, v_dq, allow_tf32=False, out_dtype=tl.float32)
 
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vk
@@ -643,10 +656,10 @@ def attn_fwd(
     # k_ptrs = k_offset + offs_d_qk[:, None] * stride_kk + offs_n[
     #     None, :] * stride_kn
     v_offset = V + off_z * stride_vz + off_h_k * stride_vh + cu_seqlens_k_start * stride_vk
-    # v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v_pack[
-    #     None, :] * stride_vn
-    v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[
+    v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v_pack[
         None, :] * stride_vn
+    # v_ptrs = v_offset + offs_n[:, None] * stride_vk + offs_d_v[
+    #     None, :] * stride_vn
     qs_offset = (q_scale_ptr + off_z * stride_qscale_z +
                  off_h_q * stride_qscale_h +
                  (cu_seqlens_q_start // QUANT_BLOCK_SIZE) * stride_qscale_m)
@@ -664,8 +677,8 @@ def attn_fwd(
                  off_h_k * stride_vscale_h +
                  (cu_seqlens_k_start // QUANT_BLOCK_SIZE) * stride_vscale_k)
     vs_ptrs = (vs_offset +
-               (offs_n[None, :] // QUANT_BLOCK_SIZE) * stride_vscale_k +
-               offs_d_v_scale[:, None] * stride_vscale_n)
+               (offs_n[:, None] // QUANT_BLOCK_SIZE) * stride_vscale_k +
+               offs_d_v_scale[None, :] * stride_vscale_n)
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
         bias_offset = off_h_q * stride_bh
@@ -1007,15 +1020,6 @@ def attention_mxfp4_forward_triton_impl(
     assert k_scale.is_contiguous()
     assert v_scale.is_contiguous()
 
-    o_shape = list(q.shape)
-    o_shape[-1] = v.shape[-1]  # output shape should match v's head dim
-    o = torch.empty(
-        o_shape,
-        device=q.device,
-        dtype=fwd_torch_dtype,
-        requires_grad=True,
-    )
-
     # check if varlen
     is_varlen = layout == "thd"
 
@@ -1027,6 +1031,14 @@ def attention_mxfp4_forward_triton_impl(
         q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q,
         max_seqlens_k)
     print(f"head_size_qk={head_size_qk}, head_size_v={head_size_v}")
+    o_shape = (*q.shape[:-1], head_size_v)
+    o = torch.empty(
+        o_shape,
+        device=q.device,
+        dtype=fwd_torch_dtype,
+        requires_grad=True,
+    )
+
     q_strides = get_strides_from_layout(q, layout)
     k_strides = get_strides_from_layout(k, layout)
     v_strides = get_strides_from_layout(v, layout)
@@ -1171,9 +1183,6 @@ class _triton_attention_mxfp4(torch.autograd.Function):
         use_exp2: bool,
         layout: str,
     ):
-        q_hp = q
-        k_hp = k
-        v_hp = v
         q, q_scale = torch.ops.torchtitan.convert_to_mxfp4(q,
                                                            axis=-1,
                                                            is_2d_block=True)
@@ -1187,7 +1196,7 @@ class _triton_attention_mxfp4(torch.autograd.Function):
         output, softmax_lse, exp_scores = torch.ops.torchtitan.attention_mxfp4_forward_triton_impl(
             q,
             k,
-            v_hp,
+            v,
             q_scale,
             k_scale,
             v_scale,
