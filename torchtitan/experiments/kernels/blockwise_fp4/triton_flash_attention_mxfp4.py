@@ -813,6 +813,8 @@ def attn_fwd(
             offs_n_causal = 0
         k_ptrs += n_full_blocks * BLOCK_N * stride_kn
         v_ptrs += n_full_blocks * BLOCK_N * stride_vk
+        ks_ptrs += n_full_blocks * BLOCK_N * stride_kscale_n // QUANT_BLOCK_SIZE
+        vs_ptrs += n_full_blocks * BLOCK_N * stride_vscale_k // QUANT_BLOCK_SIZE
         if USE_BIAS:
             bias_ptrs += n_full_blocks * BLOCK_N * stride_bn
         if RETURN_SCORES:
