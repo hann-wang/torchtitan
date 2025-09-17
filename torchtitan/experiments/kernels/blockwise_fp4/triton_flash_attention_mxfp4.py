@@ -649,22 +649,22 @@ def attn_fwd(
         None, :] * stride_vn
     qs_offset = (q_scale_ptr + off_z * stride_qscale_z +
                  off_h_q * stride_qscale_h +
-                 cu_seqlens_q_start * stride_qscale_m // QUANT_BLOCK_SIZE)
-    qs_ptrs = (qs_offset +
-               offs_m[:, None] * stride_qscale_m // QUANT_BLOCK_SIZE +
+                 (cu_seqlens_q_start // QUANT_BLOCK_SIZE) * stride_qscale_m)
+    qs_ptrs = (qs_offset + (offs_m[:, None] // QUANT_BLOCK_SIZE) *
+               stride_qscale_m +
                offs_d_qk_scale[None, :] * stride_qscale_k)
     ks_offset = (k_scale_ptr + off_z * stride_kscale_z +
                  off_h_k * stride_kscale_h +
-                 cu_seqlens_k_start * stride_kscale_n // QUANT_BLOCK_SIZE)
+                 (cu_seqlens_k_start // QUANT_BLOCK_SIZE) * stride_kscale_n)
     # k scale is N*K even though k is K*N, this is required by tl.dot_scaled
     ks_ptrs = (ks_offset +
-               offs_n[:, None] * stride_kscale_n // QUANT_BLOCK_SIZE +
+               (offs_n[:, None] // QUANT_BLOCK_SIZE) * stride_kscale_n +
                offs_d_qk_scale[None, :] * stride_kscale_k)
     vs_offset = (v_scale_ptr + off_z * stride_vscale_z +
                  off_h_k * stride_vscale_h +
-                 cu_seqlens_k_start * stride_vscale_k // QUANT_BLOCK_SIZE)
+                 (cu_seqlens_k_start // QUANT_BLOCK_SIZE) * stride_vscale_k)
     vs_ptrs = (vs_offset +
-               offs_n[None, :] * stride_vscale_k // QUANT_BLOCK_SIZE +
+               (offs_n[None, :] // QUANT_BLOCK_SIZE) * stride_vscale_k +
                offs_d_v_scale[:, None] * stride_vscale_n)
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
