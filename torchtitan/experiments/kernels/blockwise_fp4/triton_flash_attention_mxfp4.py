@@ -1088,9 +1088,9 @@ def attention_mxfp4_forward_triton_impl(
     else:
         alibi_strides = (0, 0)
 
-    qs_strides = q_scale.stride()
-    ks_strides = k_scale.stride()
-    vs_strides = v_scale.stride()
+    qs_strides = get_strides_from_layout(q_scale, layout)
+    ks_strides = get_strides_from_layout(k_scale, layout)
+    vs_strides = get_strides_from_layout(v_scale, layout)
 
     wrap_triton(attn_fwd)[grid](
         q,
