@@ -18,6 +18,7 @@ from torch._library import triton_op, wrap_triton
 
 from .mxfp_quantization import (
     BLOCK_SIZE_DEFAULT,
+    is_cdna4,
     _calculate_scales,
     _pack_fp4,
     _unpack_fp4,
@@ -239,6 +240,7 @@ def _attn_fwd_inner(
     USE_EXP2: tl.constexpr,
     RETURN_SCORES: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
+    USE_ASM: tl.constexpr,
 ):
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
@@ -422,7 +424,7 @@ def _attn_fwd_inner(
             QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
             IS_2D_BLOCK=False,
             USE_SR=False,
-            USE_ASM=True,
+            USE_ASM=USE_ASM,
         )
 
         acc += tl.dot_scaled(p_fp4,
@@ -551,6 +553,7 @@ def attn_fwd(
     USE_ALIBI: tl.constexpr,
     USE_EXP2: tl.constexpr,
     QUANT_BLOCK_SIZE: tl.constexpr,
+    USE_ASM: tl.constexpr,
 ):
     start_m = tl.program_id(0)
     off_h_q = tl.program_id(1)
@@ -818,6 +821,7 @@ def attn_fwd(
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES,
             QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+            USE_ASM=USE_ASM,
         )
         block_min = block_max
         block_max = n_blocks * BLOCK_N
@@ -895,6 +899,7 @@ def attn_fwd(
             USE_EXP2=USE_EXP2,
             RETURN_SCORES=RETURN_SCORES,
             QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+            USE_ASM=USE_ASM,
         )
 
     # epilogue
@@ -1162,6 +1167,7 @@ def attention_mxfp4_forward_triton_impl(
         BLOCK_M=64,
         BLOCK_N=64,
         QUANT_BLOCK_SIZE=BLOCK_SIZE_DEFAULT,
+        USE_ASM=is_cdna4(),
     )
     return o, softmax_lse, exp_scores
 
