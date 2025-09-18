@@ -247,8 +247,10 @@ def _attn_fwd_inner(
         # we load all BLOCK_N. For others, the blocks are all within range.
         if MASK_STEPS:
             k_offs_n = start_n + tl.arange(0, BLOCK_N)
+            vs_offs_n = start_n // QUANT_BLOCK_SIZE + tl.arange(0, BLOCK_N // QUANT_BLOCK_SIZE)
         else:
             k_offs_n = None
+            vs_offs_n = None
         if PADDED_HEAD_QK:
             k_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_QK)
             # k_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_QK * 2)
@@ -268,7 +270,7 @@ def _attn_fwd_inner(
         if PADDED_HEAD_V:
             v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V)
             # v_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V * 2)
-            vs_offs_k = tl.arange(0, SCALE_BLOCK_DMODEL_V)
+            vs_offs_k = tl.arange(0, HALF_BLOCK_DMODEL_V * 2)
         else:
             v_offs_k = None
             vs_offs_k = None
@@ -279,10 +281,10 @@ def _attn_fwd_inner(
             # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
             #             HALF_ACTUAL_BLOCK_DMODEL_V * 2)
             vs = load_fn(vs_ptrs,
-                         k_offs_n,
                          vs_offs_k,
-                         actual_seqlen_k,
-                         SCALE_ACTUAL_BLOCK_DMODEL_V,
+                         vs_offs_n,
+                         HALF_ACTUAL_BLOCK_DMODEL_V * 2,
+                         actual_seqlen_k // QUANT_BLOCK_SIZE,
                          other=1)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         # We start from end of seqlen_k so only the first iteration would need
@@ -397,28 +399,43 @@ def _attn_fwd_inner(
             # v = load_fn(v_ptrs, k_offs_n, v_offs_k, actual_seqlen_k,
             #             HALF_ACTUAL_BLOCK_DMODEL_V * 2)
             vs = load_fn(vs_ptrs,
-                         k_offs_n,
                          vs_offs_k,
-                         actual_seqlen_k,
-                         SCALE_ACTUAL_BLOCK_DMODEL_V,
+                         vs_offs_n,
+                         HALF_ACTUAL_BLOCK_DMODEL_V * 2,
+                         actual_seqlen_k // QUANT_BLOCK_SIZE,
                          other=1)
         # -- update m_i and l_i
         l_i = l_i * alpha + l_ij
         # update m_i and l_i
         m_i = m_ij
 
-        v_dq = _unpack_fp4(
-            v,
-            vs,
-            output_dtype=tl.float32,
-            BLOCK_M=BLOCK_N,
-            BLOCK_N=HALF_BLOCK_DMODEL_V * 2,
+        ps = _calculate_scales(
+            p,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
             QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
             IS_2D_BLOCK=False,
+        )
+        p_fp4 = _pack_fp4(
+            p,
+            ps,
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+            IS_2D_BLOCK=False,
+            USE_SR=False,
             USE_ASM=True,
         )
 
-        acc += tl.dot(p, v_dq, allow_tf32=False, out_dtype=tl.float32)
+        acc += tl.dot_scaled(p_fp4,
+                             ps,
+                             "e2m1",
+                             v,
+                             vs,
+                             "e2m1",
+                             lhs_k_pack=True,
+                             rhs_k_pack=False,
+                             out_dtype=tl.float32)
 
         k_ptrs += BLOCK_N * stride_kn
         v_ptrs += BLOCK_N * stride_vk
@@ -557,6 +574,7 @@ def attn_fwd(
     offs_d_v_pack = tl.arange(0, HALF_BLOCK_DMODEL_V)
     offs_d_v_scale = tl.arange(0, SCALE_BLOCK_DMODEL_V)
     offs_d_v = tl.arange(0, BLOCK_DMODEL_V)
+    offs_n_scale = tl.arange(0, BLOCK_N // QUANT_BLOCK_SIZE)
 
     # If MQA / GQA, set the K and V head offsets appropriately.
     GROUP_SIZE: tl.constexpr = HQ // HK
@@ -677,8 +695,8 @@ def attn_fwd(
                  off_h_k * stride_vscale_h +
                  (cu_seqlens_k_start // QUANT_BLOCK_SIZE) * stride_vscale_k)
     vs_ptrs = (vs_offset +
-               (offs_n[:, None] // QUANT_BLOCK_SIZE) * stride_vscale_k +
-               offs_d_v_scale[None, :] * stride_vscale_n)
+               (offs_d_v[:, None] // QUANT_BLOCK_SIZE) * stride_vscale_n +
+               offs_n_scale[None, :] * stride_vscale_k)
     if USE_BIAS:
         # Note: this might get large enough to overflow on some configs
         bias_offset = off_h_q * stride_bh
@@ -1030,7 +1048,6 @@ def attention_mxfp4_forward_triton_impl(
     batch, nheads_q, nheads_k, head_size_qk, head_size_v, seqlen_q, seqlen_k = get_shape_from_layout(
         q, k, v, layout, cu_seqlens_q, cu_seqlens_k, max_seqlens_q,
         max_seqlens_k)
-    print(f"head_size_qk={head_size_qk}, head_size_v={head_size_v}")
     o_shape = (*q.shape[:-1], head_size_v)
     o = torch.empty(
         o_shape,
@@ -1154,8 +1171,8 @@ def attention_mxfp4_forward_triton_impl(
         ENABLE_DROPOUT=dropout_p > 0.0,
         USE_EXP2=use_exp2,
         RETURN_SCORES=return_scores,
-        BLOCK_M=128,
-        BLOCK_N=32,
+        BLOCK_M=64,
+        BLOCK_N=64,
         QUANT_BLOCK_SIZE=BLOCK_SIZE_DEFAULT,
     )
     return o, softmax_lse, exp_scores
