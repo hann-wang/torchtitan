@@ -861,9 +861,7 @@ def attn_fwd(
 
     # write back LSE(Log Sum Exponents), the log of the normalization constant
     l_offset = LSE + off_z * stride_lse_z + off_h_q * stride_lse_h + cu_seqlens_q_start * stride_lse_m
-    # leave an extra BLOCK_M for delta in backward
-    # so we can load them together
-    offs_l_m = start_m * BLOCK_M * 2 + tl.arange(0, BLOCK_M)
+    offs_l_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     l_ptrs = l_offset + offs_l_m * stride_lse_m
     if USE_EXP2:
         RCP_LN2: tl.constexpr = 1.4426950408889634
