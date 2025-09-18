@@ -1023,13 +1023,13 @@ def attention_block_forward_triton_impl(
 
     # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
     if is_varlen:
-        softmax_lse = torch.empty((q.shape[0] * 2, nheads_q),
+        softmax_lse = torch.empty((q.shape[0], nheads_q),
                                   device=q.device,
                                   dtype=torch.float32)
         stride_lse_m, stride_lse_h = softmax_lse.stride()
         stride_lse_z = 0
     else:
-        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q * 2),
+        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q),
                                   device=q.device,
                                   dtype=torch.float32)
         stride_lse_z, stride_lse_h, stride_lse_m = softmax_lse.stride()
@@ -1215,7 +1215,7 @@ def _bwd_preprocess_use_o(
     delta = tl.sum(o * do, axis=1)
 
     # write-back delta
-    off_d_m = pid_m * BLOCK_M * 2 + tl.arange(BLOCK_M, 2 * BLOCK_M)
+    off_d_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     delta_offset = Delta + off_z * stride_deltaz + off_h * stride_deltah + q_start * stride_deltam
     delta_ptrs = delta_offset + off_d_m * stride_deltam
     tl.store(delta_ptrs, delta, mask=mask_m)
@@ -1270,7 +1270,8 @@ def _bwd_kernel_dkdv(
     DQ,
     DK,
     DV,
-    LD,
+    LSE,
+    Delta,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -1357,7 +1358,9 @@ def _bwd_kernel_dkdv(
     k_offset = K + off_z * stride_kz + off_h_k * stride_kh + k_start * stride_kn
     v_offset = V + off_z * stride_vz + off_h_k * stride_vh + k_start * stride_vn
     do_offset = DO + off_z * stride_doz + off_h_q * stride_doh + q_start * stride_dom
-    ld_offset = LD + off_z * stride_ldz + off_h_q * stride_ldh + q_start * stride_ldm
+    adj_delta = off_z * stride_ldz + off_h_q * stride_ldh + q_start * stride_ldm
+    l_offset = LSE + adj_delta
+    d_offset = Delta + adj_delta
 
     # output tensor offsets
     # sume dk and dv
@@ -1438,7 +1441,8 @@ def _bwd_kernel_dkdv(
             stride_qk,
             stride_dom,
             stride_dok,
-            ld_offset,
+            l_offset,
+            d_offset,
             stride_ldm,
             BLOCK_M,
             BLOCK_N,
@@ -1462,7 +1466,8 @@ def _bwd_kernel_dkdv(
 
         q_offset += stride_qh
         do_offset += stride_qh
-        ld_offset += stride_ldh
+        l_offset += stride_ldh
+        d_offset += stride_ldh
         if USE_FP8:
             q_descale_offset += stride_qscaleh
             do_descale_offset += stride_doscaleh
@@ -1499,7 +1504,8 @@ def _attn_bwd_dkdv(
     stride_qk,
     stride_dom,
     stride_dok,
-    ld_offset,
+    l_offset,
+    d_offset,
     stride_ldm,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -1557,11 +1563,8 @@ def _attn_bwd_dkdv(
             causal_mask = offs_m[:, None] >= (col_offset + offs_n[None, :])
             qk = tl.where(causal_mask, qk, float("-inf"))
 
-        l_ptrs = ld_offset + (2 * start_m +
-                              tl.arange(0, 2 * BLOCK_M)) * stride_ldm
-        mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
-        lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
-        l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
+        l_ptrs = l_offset + offs_m * stride_ldm
+        l_i = tl.load(l_ptrs, mask=mask_m, other=0.0)
 
         # compute p
         if USE_EXP2:
@@ -1582,7 +1585,8 @@ def _attn_bwd_dkdv(
             dp_descale = blk_do_descale * v_descale
             dp = dp * dp_descale
 
-        Di = tl.gather(lds, index=tl.arange(BLOCK_M, 2 * BLOCK_M), axis=0)
+        d_ptrs = d_offset + offs_m * stride_ldm
+        Di = tl.load(d_ptrs, mask=mask_m, other=0.0)
         ds = p * (dp - Di[:, None])
 
         if USE_FP8:
@@ -1634,7 +1638,8 @@ def _bwd_kernel_dq(
     DQ,
     DK,
     DV,
-    LD,
+    LSE,
+    Delta,
     stride_qz,
     stride_qh,
     stride_qm,
@@ -1727,7 +1732,9 @@ def _bwd_kernel_dq(
     k_offset = K + off_z * stride_kz + off_h_k * stride_kh + k_start * stride_kn
     v_offset = V + off_z * stride_vz + off_h_k * stride_vh + k_start * stride_vn
     do_offset = DO + off_z * stride_doz + off_h_q * stride_doh + q_start * stride_dom
-    ld_offset = LD + off_z * stride_ldz + off_h_q * stride_ldh + q_start * stride_ldm
+    adj_delta = off_z * stride_ldz + off_h_q * stride_ldh + q_start * stride_ldm
+    l_offset = LSE + adj_delta
+    d_offset = Delta + adj_delta
 
     # output tensor offsets
     dq_offset = DQ + off_z * stride_qz + off_h_q * stride_qh + q_start * stride_qm
@@ -1797,10 +1804,10 @@ def _bwd_kernel_dq(
         blk_q_descale = 1.
         blk_do_descale = 1.
 
-    l_ptrs = ld_offset + (2 * start_m * BLOCK_M +
-                          tl.arange(0, 2 * BLOCK_M)) * stride_ldm
-    mask_ldm = tl.ravel(tl.join(mask_m, mask_m))
-    lds = tl.load(l_ptrs, mask=mask_ldm, other=0.0)
+    l_ptrs = l_offset + offs_m * stride_ldm
+    l_i = tl.load(l_ptrs, mask=mask_m, other=0.0)
+    d_ptrs = d_offset + offs_m * stride_ldm
+    Di = tl.load(d_ptrs, mask=mask_m, other=0.0)  # D stored in fp32
 
     dq = _attn_bwd_dq(
         dq,
@@ -1808,7 +1815,8 @@ def _bwd_kernel_dq(
         offs_d_qk,
         offs_d_v,
         offs_m,
-        lds,
+        l_i,
+        Di,
         do,
         mask_d_qk,
         mask_d_v,
@@ -1851,7 +1859,8 @@ def _attn_bwd_dq(
     offs_d_qk,
     offs_d_v,
     offs_m,
-    lds,
+    l_i,
+    Di,
     do,
     mask_d_qk,
     mask_d_v,
@@ -1881,8 +1890,6 @@ def _attn_bwd_dq(
     CAUSAL: tl.constexpr,
 ):
     idx_block_n = tl.full([1], -1, dtype=tl.int32)
-    l_i = tl.gather(lds, index=tl.arange(0, BLOCK_M), axis=0)
-    Di = tl.gather(lds, index=tl.arange(BLOCK_M, 2 * BLOCK_M), axis=0)
 
     RCP_LN2: tl.constexpr = 1.4426950408889634
     if USE_EXP2:
@@ -1963,7 +1970,7 @@ def attention_block_backward_triton_impl(
     k: torch.Tensor,
     v: torch.Tensor,
     o: torch.Tensor,
-    softmax_lse_delta: torch.Tensor,
+    softmax_lse: torch.Tensor,
     q_descale: torch.Tensor,
     k_descale: torch.Tensor,
     v_descale: torch.Tensor,
@@ -1987,7 +1994,7 @@ def attention_block_backward_triton_impl(
         print("k:", k, k.shape)
         print("v:", v, v.shape)
         print("o:", o, o.shape)
-        print("softmax_lse:", softmax_lse_delta, softmax_lse_delta.shape)
+        print("softmax_lse:", softmax_lse, softmax_lse.shape)
         print("sm_scale:", sm_scale)
         print("alibi_slopes:", alibi_slopes)
         print("causal:", causal)
@@ -2005,7 +2012,7 @@ def attention_block_backward_triton_impl(
     assert k.is_contiguous()
     assert v.is_contiguous()
     assert o.is_contiguous()
-    assert softmax_lse_delta.is_contiguous()
+    assert softmax_lse.is_contiguous()
     assert q_descale.is_contiguous()
     assert k_descale.is_contiguous()
 
@@ -2036,13 +2043,13 @@ def attention_block_backward_triton_impl(
     dk = torch.zeros_like(k, dtype=bwd_torch_dtype)
     dv = torch.zeros_like(v, dtype=bwd_torch_dtype)
 
-    # # init delta
-    # delta = torch.empty_like(softmax_lse)
+    # init delta
+    delta = torch.empty_like(softmax_lse)
     if is_varlen:
-        stride_lse_delta_m, stride_lse_delta_h = softmax_lse_delta.stride()
+        stride_lse_delta_m, stride_lse_delta_h = softmax_lse.stride()
         stride_lse_delta_z = 0
     else:
-        stride_lse_delta_z, stride_lse_delta_h, stride_lse_delta_m = softmax_lse_delta.stride(
+        stride_lse_delta_z, stride_lse_delta_h, stride_lse_delta_m = softmax_lse.stride(
         )
 
     if use_fp8:
@@ -2078,7 +2085,7 @@ def attention_block_backward_triton_impl(
         do,
         do_fp8,
         do_scale,
-        softmax_lse_delta,
+        delta,
         use_fp8,
         stride_oz,
         stride_oh,
@@ -2120,7 +2127,7 @@ def attention_block_backward_triton_impl(
         print("dq:", dq, dq.shape)
         print("dk:", dk, dk.shape)
         print("dv:", dv, dv.shape)
-        print("L:", softmax_lse_delta, softmax_lse_delta.shape)
+        print("L:", softmax_lse, softmax_lse.shape)
         # print("delta:", delta, delta.shape)
         print("stride_qz, stride_qh, stride_qm, stride_qk:", stride_qz,
               stride_qh, stride_qm, stride_qk)
@@ -2158,7 +2165,8 @@ def attention_block_backward_triton_impl(
         dq,
         dk,
         dv,
-        softmax_lse_delta,
+        softmax_lse,
+        delta,
         stride_qz,
         stride_qh,
         stride_qm,
@@ -2235,7 +2243,8 @@ def attention_block_backward_triton_impl(
         dq,
         dk,
         dv,
-        softmax_lse_delta,
+        softmax_lse,
+        delta,
         stride_qz,
         stride_qh,
         stride_qm,
@@ -2549,11 +2558,11 @@ def fake_attention_block_forward_triton_impl(
 
     # stores LSE the log of the normalization constant / sum of expoential score(unnormalzied probablities)
     if is_varlen:
-        softmax_lse = torch.empty((q.shape[0] * 2, nheads_q),
+        softmax_lse = torch.empty((q.shape[0], nheads_q),
                                   device=q.device,
                                   dtype=torch.float32)
     else:
-        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q * 2),
+        softmax_lse = torch.empty((batch, nheads_q, max_seqlens_q),
                                   device=q.device,
                                   dtype=torch.float32)
     return o, softmax_lse, exp_scores
