@@ -225,6 +225,9 @@ def blockwise_mxfp4_gemm(
         triton.cdiv(M, META["BLOCK_SIZE_M"]),
         triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
+    BLOCK_SIZE_M = 64 if M >= 64 else M
+    BLOCK_SIZE_N = 64 if N >= 64 else N
+    BLOCK_SIZE_K = 64 if K >= 64 else K
     wrap_triton(blockwise_mxfp4_gemm_kernel)[grid](
         a,
         b,
@@ -244,9 +247,9 @@ def blockwise_mxfp4_gemm(
         M,
         N,
         K,
-        BLOCK_SIZE_M=64,
-        BLOCK_SIZE_N=64,
-        BLOCK_SIZE_K=64,
+        BLOCK_SIZE_M=BLOCK_SIZE_M,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
         QUANT_BLOCK_SIZE=block_size,
         USE_2DBLOCK_A=use_2dblock_a,
         USE_2DBLOCK_B=use_2dblock_b,
