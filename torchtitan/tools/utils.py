@@ -96,7 +96,7 @@ def get_peak_flops(device_name: str) -> int:
     elif "B200" in device_name:
         # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
         return 2.25e15
-    elif "MI300X" in device_name or "MI325X" in device_name:
+    elif "MI300X" in device_name or "MI325X" in device_name or "Device 74a1" in device_name:
         # MI300X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi300x.html
         # MI325X data from https://www.amd.com/en/products/accelerators/instinct/mi300/mi325x.html
         return 1300e12

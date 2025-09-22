@@ -23,7 +23,7 @@ flavor = "debugmodel"
 # test tokenizer, for debug purpose only
 hf_assets_path = "./tests/assets/tokenizer"
 # converters = ["float8"]
-converters = ["mx"]
+# converters = ["mx"]
 
 [optimizer]
 name = "AdamW"
