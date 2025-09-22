@@ -537,6 +537,8 @@ def convert_to_mxfp4(
     M, N = data_hp.shape
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),
                          triton.cdiv(N, META["BLOCK_N"]))
+    BLOCK_M = 64 if M >= 64 else M
+    BLOCK_N = 64 if N >= 64 else N
     wrap_triton(_convert_to_mxfp4_kernel)[grid](
         data_hp,
         data_lp,
@@ -547,8 +549,8 @@ def convert_to_mxfp4(
         stride_yn,
         stride_sm,
         stride_sn,
-        BLOCK_M=64,
-        BLOCK_N=64,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
         QUANT_BLOCK_SIZE=block_size,
         IS_2D_BLOCK=is_2d_block,
         USE_SR=use_sr,
@@ -589,6 +591,8 @@ def convert_from_mxfp4(
     M, N = data_hp.shape
     grid = lambda META: (triton.cdiv(M, META["BLOCK_M"]),
                          triton.cdiv(N, META["BLOCK_N"]))
+    BLOCK_M = 64 if M >= 64 else M
+    BLOCK_N = 64 if N >= 64 else N
     wrap_triton(_convert_from_mxfp4_kernel)[grid](
         data_lp,
         data_hp,
@@ -599,8 +603,8 @@ def convert_from_mxfp4(
         stride_yn,
         stride_sm,
         stride_sn,
-        BLOCK_M=64,
-        BLOCK_N=64,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
         QUANT_BLOCK_SIZE=block_size,
         IS_2D_BLOCK=is_2d_block,
         USE_ASM=use_asm,
