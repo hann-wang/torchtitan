@@ -1,0 +1,11 @@
+*.egg-info
+__pycache__
+.idea
+.DS_Store
+*.pyc
+.vscode
+.vs
+.venv
+build
+*outputs/
+dist/*
