@@ -7,7 +7,7 @@
 
 import torch
 from torch import Tensor
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_quantization import (
     BLOCK_SIZE_DEFAULT)
 
 

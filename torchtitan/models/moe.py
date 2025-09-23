@@ -1,8 +1,12 @@
+# Modifications Copyright(C) Advanced Micro Devices, Inc.
+# All rights reserved.
+#
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+
 
 from dataclasses import dataclass
 from typing import Literal
@@ -14,7 +18,7 @@ from torch import nn
 
 from torchtitan.distributed.expert_parallel import expert_parallel
 from torchtitan.experiments.kernels.blockwise_fp8 import cg_grouped_gemm
-from torchtitan.experiments.kernels.blockwise_fp4 import mxfp4_grouped_gemm
+from torchtitan.experiments.kernels.mxfp4 import mxfp4_grouped_gemm
 
 
 @dataclass

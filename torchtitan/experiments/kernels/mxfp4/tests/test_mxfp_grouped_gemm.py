@@ -9,7 +9,7 @@ import pytest
 from tabulate import tabulate
 import torch
 
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_grouped_gemm import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_grouped_gemm import (
     ALIGN_SIZE_M,
     mxfp4_grouped_gemm,
 )

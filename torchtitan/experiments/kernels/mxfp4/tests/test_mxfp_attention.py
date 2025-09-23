@@ -9,7 +9,7 @@ import pytest
 from tabulate import tabulate
 import torch
 
-from torchtitan.experiments.kernels.blockwise_fp4.triton_flash_attention_mxfp4 import (
+from torchtitan.experiments.kernels.mxfp4.triton_flash_attention_mxfp4 import (
     triton_attention_mxfp4,
 )
 from .utils import calc_snr, calc_cossim

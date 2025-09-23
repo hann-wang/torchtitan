@@ -25,7 +25,7 @@ from torchtitan.protocols.model_converter import (
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
-from torchtitan.experiments.kernels.blockwise_fp4 import MXFP4Linear, ALIGN_SIZE_M
+from torchtitan.experiments.kernels.mxfp4 import MXFP4Linear, ALIGN_SIZE_M
 
 from .utils import module_filter_fn, swap_linear_layers
 

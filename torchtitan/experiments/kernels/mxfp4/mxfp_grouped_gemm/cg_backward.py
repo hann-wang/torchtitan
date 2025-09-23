@@ -17,12 +17,12 @@ import triton.language as tl
 
 # Import configs and utilities from cg_forward
 
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_grouped_gemm.cg_forward import mxfp4_grouped_gemm_forward
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_grouped_gemm.autotune import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_grouped_gemm.cg_forward import mxfp4_grouped_gemm_forward
+from torchtitan.experiments.kernels.mxfp4.mxfp_grouped_gemm.autotune import (
     STANDARD_CONFIGS,
     ALIGN_SIZE_M,
 )
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_quantization import (
     BLOCK_SIZE_DEFAULT,
 )
 

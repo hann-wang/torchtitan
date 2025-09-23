@@ -7,7 +7,7 @@
 
 import pytest
 import torch
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_quantization import (
     convert_to_mxfp4,
     convert_from_mxfp4,
 )

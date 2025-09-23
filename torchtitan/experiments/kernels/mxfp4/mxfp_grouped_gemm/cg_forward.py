@@ -13,8 +13,8 @@ from torch.library import triton_op, wrap_triton
 import triton
 import triton.language as tl
 
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import BLOCK_SIZE_DEFAULT
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_grouped_gemm.autotune import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_quantization import BLOCK_SIZE_DEFAULT
+from torchtitan.experiments.kernels.mxfp4.mxfp_grouped_gemm.autotune import (
     STANDARD_CONFIGS,
     ALIGN_SIZE_M,
 )

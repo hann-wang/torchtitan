@@ -83,7 +83,7 @@ We have implemented Blockwise FP8 / MXFP4 kernels in Triton and they are not ful
 
 You may find the relavant Triton kernels and autograd functions here:
 
-* torchtitan/experiments/kernels/blockwise_fp4
+* torchtitan/experiments/kernels/mxfp4
 * torchtitan/experiments/kernels/blockwise_fp8
 
 Note: The GroupedMM kernel is modified from `torchtitan/experiments/kernels/triton_contiguous_group_gemm` and expects `m_sizes` aligned to 128.

@@ -8,11 +8,11 @@
 import pytest
 from tabulate import tabulate
 import torch
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_quantization import (
     convert_to_mxfp4,
     convert_from_mxfp4,
 )
-from torchtitan.experiments.kernels.blockwise_fp4.mxfp_linear import (
+from torchtitan.experiments.kernels.mxfp4.mxfp_linear import (
     blockwise_mxfp4_gemm,
     MXFP4LinearFunction,
 )
