@@ -1,3 +1,88 @@
+# Low-Precision LLM Training on AMDGPU
+
+## Supported Features
+
+* Blockwise FP8 (proposed by DeepSeek-V3)
+  * `128x128` block for weights, `1x128` block for activations
+  * `64 x head_dim` block for Attention Q, K, V
+* MXFP4
+  * `1x32`, `32x32` for weights/activations
+  * `32x32` block for Attention Q, K, V
+
+## Configurations
+
+See `torchtitan/models/deepseek_v3/train_configs` for examples.
+
+### Model Converters
+
+Use `float8` converter for Blockwise FP8 training.
+
+```toml
+[model]
+converters = ["float8"]
+```
+
+Use `mx` converter for MXFP4 training.
+
+```toml
+[model]
+converters = ["mx"]
+```
+
+### Blockwise FP8 Options
+
+* `filter_fqns`: Skip quantization if the layer name matches `filter_fqns`.
+* `moe_fqns_prototype`: Ignored.
+* `recipe_name`: Must be set to `blockwise`.
+* `enable_fp8_fa`: Use FP8 Attention or not.
+* `enable_fp8_gmm`: Use FP8 GroupedMM or not.
+* `enable_fp8_linear`: Use FP8 Linear or not.
+
+```toml
+[float8]
+filter_fqns = ["output", "router.gate", "attention.wq", "attention.wq_a", "attention.wq_b", "attention.wkv_a", "attention.wkv_b", "attention.wo"]
+moe_fqns_prototype = ["experts"]
+recipe_name = "blockwise"
+enable_fp8_fa = true
+enable_fp8_gmm = true
+enable_fp8_linear = true
+```
+
+### MXFP4 Options
+
+* `filter_fqns`: Skip quantization if the layer name matches `filter_fqns`.
+* `recipe_name`: 
+  * `mxfp4_1d2d`: Use `1x32` block for activations, `32x32` block for weights.
+  * `mxfp4_1d1d`: Use `1x32` block for activations, `1x32` block for weights.
+  * `mxfp4_2d2d`: Use `32x32` block for activations, `32x32` block for weights.
+* `enable_mxfp4_fa`: Use MXFP4 Attention or not (Work-In-Progress).
+* `enable_mxfp4_gmm`: Use MXFP4 GroupedMM or not.
+* `enable_mxfp4_linear`: Use MXFP4 Linear or not.
+* `use_sr_grad`: Use Stochastic Rounding for gradients or not.
+
+```toml
+[mx]
+filter_fqns = ["output", "router.gate", "attention.wq", "attention.wq_a", "attention.wq_b", "attention.wkv_a", "attention.wkv_b", "attention.wo"]
+recipe_name = "mxfp4_1d2d"
+enable_mxfp4_fa = false
+enable_mxfp4_gmm = true
+enable_mxfp4_linear = true
+use_sr_grad = false
+```
+
+
+## Implementations
+
+We have implemented Blockwise FP8 / MXFP4 kernels in Triton and they are not fully optimized for wall-clock performance.
+
+You may find the relavant Triton kernels and autograd functions here:
+
+* torchtitan/experiments/kernels/blockwise_fp4
+* torchtitan/experiments/kernels/blockwise_fp8
+
+Note: The GroupedMM kernel is modified from `torchtitan/experiments/kernels/triton_contiguous_group_gemm` and expects `m_sizes` aligned to 128.
+
+
 <div align="center">
 
 # torchtitan
