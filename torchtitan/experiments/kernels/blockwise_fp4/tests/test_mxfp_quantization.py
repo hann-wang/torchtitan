@@ -1,3 +1,10 @@
+# Copyright (c) Advanced Micro Devices, Inc.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+
 import pytest
 import torch
 from torchtitan.experiments.kernels.blockwise_fp4.mxfp_quantization import (

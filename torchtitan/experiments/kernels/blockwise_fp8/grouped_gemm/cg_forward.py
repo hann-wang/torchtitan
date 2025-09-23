@@ -1,3 +1,6 @@
+# Modifications Copyright(C) Advanced Micro Devices, Inc.
+# All rights reserved.
+#
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #

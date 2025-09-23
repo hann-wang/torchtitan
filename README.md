@@ -1,4 +1,10 @@
-# Low-Precision LLM Training on AMDGPU
+# Low-Precision LLM Training
+
+Low-Precision training experiments with Blockwise FP8/MXFP4 Linear/GroupedMM/FlashAttention.
+
+Kernels are implemented in Triton and are not yet fully optimized for wall-clock performance. Experiments were run on AMD GPUs and should be compatible with NVIDIA GPUs.
+
+**This is not an officially supported AMD product.**
 
 ## Supported Features
 
