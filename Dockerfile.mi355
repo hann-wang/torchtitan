@@ -1,0 +1,45 @@
+FROM rocm/dev-ubuntu-24.04:7.0-complete AS build
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN apt-get update && \
+    apt-get install -y git-lfs python-is-python3 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN pip install "numpy>=1.26.0,<2" mkl-static mkl-include
+
+RUN mkdir /build && \
+    cd build && \
+    git clone https://github.com/pytorch/pytorch && \
+    cd pytorch && \
+    git submodule sync && \
+    git submodule update --init --recursive
+RUN cd /build/pytorch && \
+    pip install -r requirements.txt
+
+ENV PYTORCH_ROCM_ARCH="gfx950;gfx942;gfx90a"
+RUN cd /build/pytorch && \
+    python tools/amd_build/build_amd.py && \
+    python setup.py bdist_wheel
+
+RUN cd /build && \
+    git clone https://github.com/triton-lang/triton.git && \
+    cd triton && \
+    pip install pybind11 && \
+    python setup.py bdist_wheel
+
+FROM rocm/dev-ubuntu-24.04:7.0-complete
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+RUN apt-get update && \
+    apt-get install -y git-lfs python-is-python3 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN pip install "numpy>=1.26.0,<2"
+
+COPY --from=build /build/pytorch/dist/torch-*.whl /build/triton/dist/triton-*.whl ./
+RUN pip install torch-*.whl triton-*.whl && rm *.whl
+
+RUN pip install torchdata "tomli>=1.1.0" huggingface_hub datasets transformers tabulate \
+    wandb fsspec tyro "tokenizers>=0.15.0" safetensors tensorboard pre-commit yapf
+
+COPY . /usr/local/src/torchtitan
+
+RUN cd /usr/local/src/torchtitan && \
+    pip install -e .
