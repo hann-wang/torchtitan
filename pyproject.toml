@@ -42,21 +42,14 @@ dev = [
     "pyrefly==0.45.1",
 ]
 
-[tool.setuptools.dynamic]
-version = {file = "assets/version.txt"}
-
 [tool.codespell]
 skip = ["*.json"]
 ignore-words-list = ["assertin", "datas" ,"indx", "inpt", "nd", "socio-economic"]
 
 # ---- Explicit project build information ---- #
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-
-[tool.setuptools.packages.find]
-where = [""]
-include = ["torchtitan*"]
+requires = ["meson-python", "pybind11"]
+build-backend = "mesonpy"
 
 [tool.pytest.ini_options]
 addopts = ["--showlocals"]  # show local variables in tracebacks
