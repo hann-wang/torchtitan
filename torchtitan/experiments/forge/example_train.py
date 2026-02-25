@@ -341,6 +341,17 @@ class Trainer(ForgeEngine):
             grad_norm.item(),
         )
 
+    def post_training_tasks(self):
+        last_step = not self.should_continue_training()
+        if last_step:
+            self.model_converters.finalize(self.model_parts)
+
+        self.checkpointer.save(self.step, last_step=last_step)
+
+        # Run validation if validator is available
+        if self.config.validator.enable and self.validator.should_validate(self.step):
+            self.validator.validate(self.model_parts, self.step)
+
     @record
     def train(self):
         config = self.config
@@ -364,21 +375,16 @@ class Trainer(ForgeEngine):
             while self.should_continue_training():
                 self.step += 1
                 self.gc_handler.run(self.step)
+                self.model_converters.pre_step(self.model_parts)
                 try:
                     self.train_step(data_iterator)
                 except DataloaderExhaustedError:
                     logger.warning("Ran out of data; last step was canceled.")
                     break
 
+                # Save Checkpoint
                 # Run validation if validator is available
-                if config.validator.enable and self.validator.should_validate(
-                    self.step
-                ):
-                    self.validator.validate(self.model_parts, self.step)
-
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == config.training.steps)
-                )
+                self.post_training_tasks()
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:
@@ -394,11 +400,18 @@ class Trainer(ForgeEngine):
                         parallel_dims=self.parallel_dims,
                     )
 
+        if not self.training_enabled():
+            # just run validation
+            self.post_training_tasks()
+
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
             time.sleep(2)
 
         logger.info("Training completed")
+
+    def training_enabled(self) -> bool:
+        return self.step > 0
 
     def should_continue_training(self) -> bool:
         return self.step < self.config.training.steps

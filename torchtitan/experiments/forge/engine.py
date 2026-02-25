@@ -266,6 +266,8 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             self.model_parts = [model]
 
+        self.model_converters.post_initialization(self.model_parts)
+
         # build optimizer after applying parallelisms to the model
         self.optimizers = config.optimizer.build(
             model_parts=self.model_parts,
