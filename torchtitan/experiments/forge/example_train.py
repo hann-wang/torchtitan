@@ -99,6 +99,7 @@ class Trainer(ForgeEngine):
         )
 
         self.metrics_processor.optimizers = self.optimizers
+        self.metrics_processor.model_parts = self.model_parts
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
@@ -360,7 +361,7 @@ class Trainer(ForgeEngine):
             ) as memory_profiler,
         ):
             data_iterator = self.batch_generator(self.dataloader)
-            while self.step < config.training.steps:
+            while self.should_continue_training():
                 self.step += 1
                 self.gc_handler.run(self.step)
                 try:
@@ -398,6 +399,9 @@ class Trainer(ForgeEngine):
             time.sleep(2)
 
         logger.info("Training completed")
+
+    def should_continue_training(self) -> bool:
+        return self.step < self.config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
         return {"step": self.step}

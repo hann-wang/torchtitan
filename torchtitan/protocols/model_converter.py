@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 from dataclasses import dataclass, field
-from typing import Protocol, Union
+from typing import Protocol
 
 import torch.nn as nn
 
@@ -26,8 +26,17 @@ class ModelConverter(Protocol):
         """Inplace conversion of the model."""
         ...
 
-    def post_optimizer_hook(self, model: Union[nn.Module, list[nn.Module]]):
+    def pre_step(self, model_parts: list[nn.Module]):
+        ...
+
+    def post_optimizer_hook(self, model_parts: list[nn.Module], **kwargs):
         """Post-optimizer (optional) hook (e.g. compute weights statistics)."""
+        ...
+
+    def post_initialization(self, model_parts: list[nn.Module]):
+        ...
+
+    def finalize(self, model_parts: list[nn.Module]):
         ...
 
 
@@ -75,9 +84,21 @@ class ModelConvertersContainer(Configurable, ModelConverter):
         if self.print_after_conversion:
             logger.info(f"Model definition after conversion:\n\n{model}\n\n")
 
-    def post_optimizer_hook(self, model: Union[nn.Module, list[nn.Module]]):
+    def pre_step(self, model_parts: list[nn.Module]):
         for mh in self.converters:
-            mh.post_optimizer_hook(model)
+            mh.pre_step(model_parts)
+
+    def post_optimizer_hook(self, model_parts: list[nn.Module], **kwargs):
+        for mh in self.converters:
+            mh.post_optimizer_hook(model_parts, **kwargs)
+
+    def post_initialization(self, model_parts: list[nn.Module]):
+        for mh in self.converters:
+            mh.post_initialization(model_parts)
+
+    def finalize(self, model_parts: list[nn.Module]):
+        for mh in self.converters:
+            mh.finalize(model_parts)
 
 
 def _validate_quantization(converters: list[Configurable.Config]):

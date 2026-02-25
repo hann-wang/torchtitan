@@ -159,6 +159,16 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ):
             model = model_config.build()
 
+        # Build the collection of model converters. No-op if converters empty
+        model_compile_enabled = (
+            config.compile.enable and "model" in config.compile.components
+        )
+        self.model_converters = config.model_converters.build(
+            parallel_dims=parallel_dims,
+            model_compile_enabled=model_compile_enabled,
+        )
+        self.model_converters.convert(model)
+
         # calculate model size and flops per token
         (
             self.model_param_count,
@@ -174,7 +184,8 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             buffer_device = None
 
         self.loss_fn = self.train_spec.build_loss_fn(
-            config.compile, parallel_dims=parallel_dims)
+            config.compile, parallel_dims=parallel_dims
+        )
 
         # verify batch sizes
         global_batch_size = config.training.global_batch_size
@@ -266,6 +277,14 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.lr_schedulers = config.lr_scheduler.build(
             optimizers=self.optimizers,
             training_steps=config.training.steps,
+        )
+        # Post optimizer step model converters hook.
+        # e.g. calculate float8 dynamic amax/scale for all-parameter for FSDP2
+        # where it issues a single all-reduce for all parameters at once for better performance
+        self.optimizers.register_step_post_hook(
+            lambda *args, **kwargs: self.model_converters.post_optimizer_hook(
+                self.model_parts
+            )
         )
 
         self.checkpointer = config.checkpoint.build(
