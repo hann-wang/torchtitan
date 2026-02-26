@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from torch.nn.attention.flex_attention import and_masks
 
 from torchtitan.components.tokenizer import BaseTokenizer
@@ -71,12 +72,17 @@ class Decoder(BaseModel):
         # handling, see below.
         rope: RoPE.Config
         layer: TransformerBlock.Config  # required, no default
+        enable_weight_tying: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+
+        if config.enable_weight_tying:
+            self.output = lambda x: F.linear(x, self.tok_embeddings.weight)
+        else:
+            self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
         self.rope = config.rope.build()
         self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
@@ -88,7 +94,6 @@ class Decoder(BaseModel):
             )
 
         self.norm = nn.RMSNorm(config.dim, eps=config.norm_eps)
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
 
     def init_weights(
         self,
@@ -104,8 +109,6 @@ class Decoder(BaseModel):
             rope = self.config.rope.build()
             rope.init_weights(buffer_device=buffer_device)
             self.freqs_cis = rope.cache
-        if self.tok_embeddings is not None:
-            nn.init.normal_(self.tok_embeddings.weight)
         for layer in self.layers.values():
             # pyrefly: ignore [not-callable]
             layer.init_weights(buffer_device=buffer_device)
@@ -113,14 +116,27 @@ class Decoder(BaseModel):
             self.norm.reset_parameters()
         final_out_std = self.config.dim**-0.5
         cutoff_factor = 3
-        if self.output is not None:
-            trunc_normal_(
-                self.output.weight,
-                mean=0.0,
-                std=final_out_std,
-                a=-cutoff_factor * final_out_std,
-                b=cutoff_factor * final_out_std,
-            )
+        if self.config.enable_weight_tying:
+            if self.tok_embeddings is not None:
+                trunc_normal_(
+                    self.tok_embeddings.weight,
+                    mean=0.0,
+                    std=final_out_std,
+                    a=-cutoff_factor * final_out_std,
+                    b=cutoff_factor * final_out_std,
+                )
+        else:
+            if self.tok_embeddings is not None:
+                nn.init.normal_(self.tok_embeddings.weight)
+            if self.output is not None:
+                assert isinstance(self.output, nn.Linear)
+                trunc_normal_(
+                    self.output.weight,
+                    mean=0.0,
+                    std=final_out_std,
+                    a=-cutoff_factor * final_out_std,
+                    b=cutoff_factor * final_out_std,
+                )
 
     def forward(
         self,

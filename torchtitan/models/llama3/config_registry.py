@@ -108,6 +108,72 @@ def llama3_debugmodel_float8_emulate() -> Trainer.Config:
     return config
 
 
+def llama3_1b() -> Trainer.Config:
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/Llama-3.1-1B",
+        profiling=ProfilingConfig(
+            enable_profiling=True,
+            profile_freq=100,
+        ),
+        metrics=MetricsProcessor.Config(
+            enable_tensorboard=True,
+        ),
+        model_spec=model_registry("1B"),
+        optimizer=OptimizersContainer.Config(lr=4e-5),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=8192,
+            steps=1000,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(
+            mode="selective",
+            selective_ac_option="op",
+        ),
+        validator=Validator.Config(
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
+def instella_3b() -> Trainer.Config:
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/Instella-3B-Stage1",
+        model_spec=model_registry("3B_instella"),
+        optimizer=OptimizersContainer.Config(lr=4e-5),
+        training=TrainingConfig(
+            local_batch_size=8,
+            global_batch_size=1024,
+            seq_len=4096,
+            steps=13800,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="tulu,dolmino,openhermes,webinstructsub,codefeedback,ultrachat,pythonedu,mathematics,gsm8k",
+            probabilities=[
+                0.0116,
+                0.8510,
+                0.0069,
+                0.0249,
+                0.0016,
+                0.0125,
+                0.0516,
+                0.0343,
+                0.0056,
+            ],
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
+        validator=Validator.Config(
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
 def llama3_8b() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path="./assets/hf/Llama-3.1-8B",

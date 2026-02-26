@@ -406,7 +406,7 @@ class GQAttention(BaseAttention):
         n_heads: int
         n_kv_heads: int | None = None
         head_dim: int | None = None
-        qk_norm: bool = False
+        qk_norm: int = 0  # 0: no norm, 1: Qwen3-style norm, 2: Instella-3B-style norm
         norm_eps: float = 1e-5
         bias: bool = False
         use_rope: bool = True
@@ -430,13 +430,30 @@ class GQAttention(BaseAttention):
         # Optional QK normalization (Qwen3-style)
         self.q_norm: nn.RMSNorm | None = None
         self.k_norm: nn.RMSNorm | None = None
-        if config.qk_norm:
-            self.q_norm = nn.RMSNorm(
-                self.head_dim, eps=config.norm_eps, elementwise_affine=True
-            )
-            self.k_norm = nn.RMSNorm(
-                self.head_dim, eps=config.norm_eps, elementwise_affine=True
-            )
+        self.qk_norm_type: int = config.qk_norm
+        match self.qk_norm_type:
+            case 0:
+                pass
+            case 1:
+                self.q_norm = nn.RMSNorm(
+                    self.head_dim, eps=config.norm_eps, elementwise_affine=True
+                )
+                self.k_norm = nn.RMSNorm(
+                    self.head_dim, eps=config.norm_eps, elementwise_affine=True
+                )
+            case 2:
+                self.q_norm = nn.RMSNorm(
+                    self.n_heads * self.head_dim,
+                    eps=config.norm_eps,
+                    elementwise_affine=True,
+                )
+                self.k_norm = nn.RMSNorm(
+                    self.n_kv_heads * self.head_dim,
+                    eps=config.norm_eps,
+                    elementwise_affine=True,
+                )
+            case _:
+                raise ValueError(f"Unknown QK normalization type: {config.qk_norm}")
 
         # Scaling factor (needed when head_dim differs from dim // n_heads)
         self.scaling = self.head_dim**-0.5 if config.head_dim is not None else None
@@ -468,6 +485,11 @@ class GQAttention(BaseAttention):
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        if self.qk_norm_type == 2:
+            assert self.q_norm is not None and self.k_norm is not None
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+
         # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
         # local heads from sizes of xq, xk, and xv as TP may have sharded them
         # after the above linear ops.
@@ -476,9 +498,9 @@ class GQAttention(BaseAttention):
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
         # Optional QK normalization (before RoPE, per Qwen3)
-        if self.q_norm is not None:
+        if self.qk_norm_type == 1:
+            assert self.q_norm is not None and self.k_norm is not None
             xq = self.q_norm(xq)
-        if self.k_norm is not None:
             xk = self.k_norm(xk)
 
         # Apply rotary embeddings

@@ -100,6 +100,9 @@ class ModelConvertersContainer(Configurable, ModelConverter):
         for mh in self.converters:
             mh.finalize(model_parts)
 
+    def is_empty(self):
+        return len(self.converters) == 0
+
 
 def _validate_quantization(converters: list[Configurable.Config]):
     """Validates that all quantization converters use the same quantization type.

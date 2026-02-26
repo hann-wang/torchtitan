@@ -157,9 +157,17 @@ class Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
 
         # QK norm (Qwen3 specific) - use vLLM's RMSNorm
-        if model_args.qk_norm:
+        self.qk_norm_type: int = model_args.qk_norm
+        if model_args.qk_norm == 1:
             self.q_norm = VLLMRMSNorm(self.head_dim, eps=model_args.norm_eps)
             self.k_norm = VLLMRMSNorm(self.head_dim, eps=model_args.norm_eps)
+        elif model_args.qk_norm == 2:
+            self.q_norm = VLLMRMSNorm(
+                self.n_heads * self.head_dim, eps=model_args.norm_eps
+            )
+            self.k_norm = VLLMRMSNorm(
+                self.n_kv_heads * self.head_dim, eps=model_args.norm_eps
+            )
         else:
             self.q_norm = None
             self.k_norm = None
@@ -195,15 +203,19 @@ class Attention(nn.Module):
         bs, seqlen, _ = x.shape
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
+        if self.qk_norm_type == 2:
+            assert self.q_norm is not None and self.k_norm is not None
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
+
         # Reshape to heads
         xq = xq.view(bs, seqlen, -1, self.head_dim)
         xk = xk.view(bs, seqlen, -1, self.head_dim)
         xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        # Apply QK norm
-        if self.q_norm:
+        if self.qk_norm_type == 1:
+            assert self.q_norm is not None and self.k_norm is not None
             xq = self.q_norm(xq)
-        if self.k_norm:
             xk = self.k_norm(xk)
 
         # Apply rotary embedding

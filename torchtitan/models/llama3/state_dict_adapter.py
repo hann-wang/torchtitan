@@ -31,15 +31,32 @@ class Llama3StateDictAdapter(StateDictAdapter):
             "model.layers.{}.self_attn.k_proj.weight": "layers.{}.attention.wk.weight",
             "model.layers.{}.self_attn.v_proj.weight": "layers.{}.attention.wv.weight",
             "model.layers.{}.self_attn.o_proj.weight": "layers.{}.attention.wo.weight",
+            "model.layers.{}.self_attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
+            "model.layers.{}.self_attn.k_norm.weight": "layers.{}.attention.k_norm.weight",
             "model.layers.{}.self_attn.rotary_emb.inv_freq": None,
             "model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
             "model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
             "model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
-            "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
-            "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
             "model.norm.weight": "norm.weight",
             "lm_head.weight": "output.weight",
         }
+
+        if getattr(self.model_config.layer.attention, "qk_norm", 0) == 2:
+            # Instella-3B model
+            self.from_hf_map.update(
+                {
+                    "model.layers.{}.pre_attention_layernorm.weight": "layers.{}.attention_norm.weight",
+                    "model.layers.{}.pre_feedforward_layernorm.weight": "layers.{}.ffn_norm.weight",
+                }
+            )
+        else:
+            # Normal Llama model
+            self.from_hf_map.update(
+                {
+                    "model.layers.{}.input_layernorm.weight": "layers.{}.attention_norm.weight",
+                    "model.layers.{}.post_attention_layernorm.weight": "layers.{}.ffn_norm.weight",
+                }
+            )
 
     # HuggingFace permutation function (exact copy from their conversion script)
     def _permute(self, w, n_heads_arg, dim1=None, dim2=None):
