@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torch.nn as nn
-from torch.distributed.checkpoint import HuggingFaceStorageWriter
+from torch.distributed.checkpoint import DefaultLoadPlanner, HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import (
     consolidate_safetensors_files_on_every_rank,
 )
@@ -347,6 +347,7 @@ class CheckpointManager(Configurable):
     mp_queue_send: queue.Queue
     pg: dist.ProcessGroup
     purge_thread: threading.Thread | None
+    allow_partial_load: bool = False
 
     def __init__(
         self,
@@ -620,10 +621,16 @@ class CheckpointManager(Configurable):
             hf_storage_reader = self.sd_adapter.get_hf_storage_reader(
                 checkpoint_id, from_quantized
             )
+            planner = DefaultLoadPlanner(
+                flatten_state_dict=True,
+                flatten_sharded_tensors=True,
+                allow_partial_load=self.allow_partial_load,
+            )
 
             dcp.load(
                 hf_state_dict,
                 storage_reader=hf_storage_reader,
+                planner=planner,
             )
 
             state_dict = self.sd_adapter.from_hf(hf_state_dict)
