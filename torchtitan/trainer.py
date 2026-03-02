@@ -792,7 +792,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.checkpointer.save(self.step, last_step=last_step)
 
         # Run validation if validator is available
-        if self.config.validator.enable and self.validator.should_validate(self.step):
+        if self.config.validator.enable and (self.validator.should_validate(self.step) or last_step):
             self.validator.validate(self.model_parts, self.step)
 
     @record
