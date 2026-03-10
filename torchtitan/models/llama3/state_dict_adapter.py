@@ -41,7 +41,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
             "lm_head.weight": "output.weight",
         }
 
-        if getattr(self.model_config.layer.attention, "qk_norm", 0) == 2:
+        if getattr(self.model_config.layer.attention, "qk_norm_type", 0) == 2:
             # Instella-3B model
             self.from_hf_map.update(
                 {
