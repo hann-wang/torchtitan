@@ -189,9 +189,9 @@ class Attention(nn.Module):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
         if self.q_norm is not None:
-            self.q_norm.reset_parameters()
+            self.q_norm.init_weights()
         if self.k_norm is not None:
-            self.k_norm.reset_parameters()
+            self.k_norm.init_weights()
 
     def forward(
         self,
@@ -285,7 +285,7 @@ class TransformerBlock(nn.Module):
 
     def init_weights(self, buffer_device: torch.device):
         for norm in (self.attention_norm, self.ffn_norm):
-            norm.reset_parameters()
+            norm.init_weights()
         self.attention.init_weights(self.weight_init_std)
         self.feed_forward.init_weights(self.weight_init_std)
 

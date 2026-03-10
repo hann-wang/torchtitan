@@ -409,7 +409,9 @@ class GQAttention(BaseAttention):
         n_kv_heads: int | None = None
         head_dim: int | None = None
 
-        qk_norm_type: int = 0  # 0: no norm, 1: Qwen3-style norm, 2: Instella-3B-style norm
+        qk_norm_type: int = (
+            0  # 0: no norm, 1: Qwen3-style norm, 2: Instella-3B-style norm
+        )
         q_norm: RMSNorm.Config | None = None
         k_norm: RMSNorm.Config | None = None
         bias: bool = False
@@ -437,20 +439,28 @@ class GQAttention(BaseAttention):
         self.rope_backend = config.rope_backend
 
         # Optional QK normalization (Qwen3-style)
-        self.q_norm: nn.RMSNorm | None = None
-        self.k_norm: nn.RMSNorm | None = None
+        self.q_norm: RMSNorm | None = None
+        self.k_norm: RMSNorm | None = None
         self.qk_norm_type: int = config.qk_norm_type
         match self.qk_norm_type:
             case 0:
                 pass
             case 1:
+                assert config.q_norm is not None and config.k_norm is not None
                 self.q_norm = config.q_norm.build(normalized_shape=self.head_dim)
                 self.k_norm = config.k_norm.build(normalized_shape=self.head_dim)
             case 2:
-                self.q_norm = config.q_norm.build(normalized_shape=self.n_heads * self.head_dim)
-                self.k_norm = config.k_norm.build(normalized_shape=self.n_kv_heads * self.head_dim)
+                assert config.q_norm is not None and config.k_norm is not None
+                self.q_norm = config.q_norm.build(
+                    normalized_shape=self.n_heads * self.head_dim
+                )
+                self.k_norm = config.k_norm.build(
+                    normalized_shape=self.n_kv_heads * self.head_dim
+                )
             case _:
-                raise ValueError(f"Unknown QK normalization type: {config.qk_norm_type}")
+                raise ValueError(
+                    f"Unknown QK normalization type: {config.qk_norm_type}"
+                )
 
         # Scaling factor (needed when head_dim differs from dim // n_heads)
         self.scaling = self.head_dim**-0.5 if config.head_dim is not None else None

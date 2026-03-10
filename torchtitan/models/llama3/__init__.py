@@ -111,7 +111,11 @@ llama3_configs = {
         dim=2048,
         n_layers=16,
         enable_weight_tying=True,
+        tok_embeddings=Embedding.Config(),
+        norm=RMSNorm.Config(),
         layer=Llama3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(),
+            ffn_norm=RMSNorm.Config(),
             feed_forward=FeedForward.Config(
                 hidden_dim=compute_ffn_hidden_dim(
                     2048, multiple_of=1024, ffn_dim_multiplier=1.5
@@ -133,7 +137,11 @@ llama3_configs = {
         dim=2560,
         n_layers=36,
         vocab_size=50304,
+        tok_embeddings=Embedding.Config(),
+        norm=RMSNorm.Config(),
         layer=Llama3TransformerBlock.Config(
+            attention_norm=RMSNorm.Config(),
+            ffn_norm=RMSNorm.Config(),
             feed_forward=FeedForward.Config(
                 hidden_dim=compute_ffn_hidden_dim(
                     2560, multiple_of=256, ffn_dim_multiplier=1.0

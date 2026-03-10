@@ -67,9 +67,7 @@ class Trainer(ForgeEngine):
         )
 
         model_args = self.model_config
-        logger.info(
-            f"Built {config.model_spec.name} {config.model_spec.flavor} with {model_args}"
-        )
+        logger.info(f"Built {config.model_spec.name} {config.model_spec.flavor}")
 
         # metrics logging
         self.metrics_processor = config.metrics.build(
@@ -349,7 +347,9 @@ class Trainer(ForgeEngine):
         self.checkpointer.save(self.step, last_step=last_step)
 
         # Run validation if validator is available
-        if self.config.validator.enable and (self.validator.should_validate(self.step) or last_step):
+        if self.config.validator.enable and (
+            self.validator.should_validate(self.step) or last_step
+        ):
             self.validator.validate(self.model_parts, self.step)
 
     @record
