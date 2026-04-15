@@ -506,8 +506,7 @@ class IndexedDataset(torch.utils.data.Dataset):
         bin_path = get_bin_path(path_prefix)
         assert os.path.exists(idx_path) and os.path.exists(
             bin_path
-        ), "One or both of the .idx and .bin files cannot be found at the "
-        f"path prefix {path_prefix}"
+        ), f"One or both of the .idx and .bin files cannot be found at the path prefix {path_prefix}"
         self.path_prefix = path_prefix
         self.multimodal = multimodal
         self.mmap = mmap

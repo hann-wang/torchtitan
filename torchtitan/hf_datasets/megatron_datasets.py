@@ -45,7 +45,7 @@ class MegatronTextDataset(IterableDataset, Stateful):
     ) -> None:
         self.dataset_name = dataset_prefix
         ds = IndexedDataset(dataset_prefix)
-        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size)
+        self._data = split_dataset_by_node(ds, dp_rank, dp_world_size, contiguous=False)
 
         self.seq_len = seq_len
         self.infinite = infinite

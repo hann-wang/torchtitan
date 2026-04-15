@@ -199,6 +199,8 @@ class BlendedDataset(IterableDataset, Stateful):
 
 
 def get_prefixes(start_path: str):
+    if start_path.endswith(".idx"):
+        return [start_path[:-4]]
     idx_files = glob.glob(f"{start_path}/**/*.idx", recursive=True)
     prefixes = []
     for idx_file in idx_files:
@@ -225,7 +227,7 @@ def build_megatron_blended_datasets(
     logger.info(f"Using pre-tokenized datasets: {dataset_prefixes}")
     if len(dataset_prefixes) == 1:
         ds = MegatronTextDataset(
-            dataset_path,
+            dataset_prefixes[0],
             seq_len=seq_len,
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
