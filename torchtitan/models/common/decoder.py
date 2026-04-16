@@ -7,7 +7,6 @@
 from dataclasses import dataclass
 
 import torch
-from torch import nn
 from torch.nn import functional as F
 from torch.nn.attention.flex_attention import and_masks
 
@@ -17,34 +16,36 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     create_attention_mask,
     create_varlen_metadata_for_document,
+    FlexAttention,
     get_causal_mask_mod,
     get_document_mask_mod,
+    VarlenAttention,
 )
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.moe.moe import MoE
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.model import BaseModel
-from torchtitan.protocols.module import Module
+from torchtitan.protocols.module import Module, ModuleDict
 
 __all__ = ["Decoder", "TransformerBlock"]
 
 
 # TODO: we can unify the TransformerBlock impl across all models when
 # there is no special logic for each model, including
-# init_weights, ffn vs. moe naming and creation, rope vs. nope, etc.
+# ffn vs. moe naming and creation, rope vs. nope, etc.
 class TransformerBlock(Module):
     """Base class for all language model transformer blocks.
 
     All language model TransformerBlocks share:
-    - Attention module (from ``attention.build(dim=dim)``)
+    - Attention module (from ``attention.build()``)
     - FFN or MoE (from ``feed_forward.build()`` / ``moe.build()``)
     - Two RMSNorms (``attention_norm``, ``ffn_norm``)
-    - ``weight_init_std`` computed from ``layer_id``
     - Forward: ``x + attn(norm(x), ...); x + ffn(norm(x))``
 
-    Children implement ``__init__``, ``forward``, and ``init_weights``.
+    Children implement ``__init__`` and ``forward``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -59,15 +60,15 @@ class TransformerBlock(Module):
 class Decoder(BaseModel):
     """Base class for autoregressive decoder-only language models.
 
-    Provides shared ``__init__``, ``forward``, ``init_weights``, and
+    Provides shared ``__init__``, ``forward``, ``init_states``, and
     ``get_attention_masks`` (flex/varlen dispatch) used by most models.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseModel.Config):
         dim: int
-        n_layers: int
         vocab_size: int
+        output: Linear.Config
         tok_embeddings: Embedding.Config
         norm: RMSNorm.Config
         # TODO: Right now RoPE config is not in each TransformerBlock / Attention,
@@ -76,75 +77,56 @@ class Decoder(BaseModel):
         # and Attention. Also RoPE itself as a standalone module requires PP special
         # handling, see below.
         rope: RoPE.Config
-        layer: TransformerBlock.Config  # required, no default
+        # TODO(fegin): revisit
+        # https://github.com/pytorch/torchtitan/pull/2785#discussion_r3033849265
+        # and fix the typing here
+        layers: list  # list[TransformerBlock.Config] or subclass configs
         enable_weight_tying: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
 
-        self.tok_embeddings = config.tok_embeddings.build(
-            num_embeddings=config.vocab_size, embedding_dim=config.dim
-        )
+        self.tok_embeddings = config.tok_embeddings.build()
 
         if config.enable_weight_tying:
             self.output = lambda x: F.linear(x, self.tok_embeddings.weight)
         else:
-            self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+            self.output = config.output.build()
 
         self.rope = config.rope.build()
         self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
 
-        self.layers = torch.nn.ModuleDict()
-        for layer_id in range(config.n_layers):
-            self.layers[str(layer_id)] = config.layer.build(
-                layer_id=layer_id, dim=config.dim, n_layers=config.n_layers
-            )
+        self.layers = ModuleDict()
+        for i, layer_config in enumerate(config.layers):
+            self.layers[str(i)] = layer_config.build()
 
         self.norm = config.norm.build(normalized_shape=config.dim)
 
-    def init_weights(
+    def init_states(
         self,
-        **kwargs,
-    ):
-        buffer_device: torch.device | None = kwargs.get("buffer_device")
-        buffer_device = buffer_device or self.freqs_cis.device
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        # Compute buffer_device before recursion so children (RoPE) get
+        # the correct device when buffer_device is not explicitly provided.
+        if buffer_device is None:
+            buffer_device = self.freqs_cis.device
+        super().init_states(buffer_device=buffer_device)
+
+    def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
+        assert buffer_device is None or buffer_device.type != "meta", (
+            f"buffer_device must not be meta, got {buffer_device}. "
+            f"Buffers should be initialized on a real device after to_empty()."
+        )
         if self.rope is not None:
-            self.rope.init_weights(buffer_device=buffer_device)
+            # RoPE's _init_self_buffers was already called by auto-recursion
             self.freqs_cis = self.rope.cache
         else:
             # PP case: rope module was pruned, rebuild to get freqs_cis
             rope = self.config.rope.build()
-            rope.init_weights(buffer_device=buffer_device)
+            rope._init_self_buffers(buffer_device=buffer_device)
             self.freqs_cis = rope.cache
-        for layer in self.layers.values():
-            # pyrefly: ignore [not-callable]
-            layer.init_weights(buffer_device=buffer_device)
-        if self.norm is not None:
-            self.norm.init_weights()
-        final_out_std = self.config.dim**-0.5
-        cutoff_factor = 3
-        if self.config.enable_weight_tying:
-            if self.tok_embeddings is not None:
-                nn.init.trunc_normal_(
-                    self.tok_embeddings.weight,
-                    mean=0.0,
-                    std=final_out_std,
-                    a=-cutoff_factor * final_out_std,
-                    b=cutoff_factor * final_out_std,
-                )
-        else:
-            if self.tok_embeddings is not None:
-                nn.init.normal_(self.tok_embeddings.weight)
-            if self.output is not None:
-                assert isinstance(self.output, nn.Linear)
-                nn.init.trunc_normal_(
-                    self.output.weight,
-                    mean=0.0,
-                    std=final_out_std,
-                    a=-cutoff_factor * final_out_std,
-                    b=cutoff_factor * final_out_std,
-                )
 
     def forward(
         self,
@@ -166,11 +148,11 @@ class Decoder(BaseModel):
         self,
         input_batch: torch.Tensor,
         tokenizer: BaseTokenizer,
-        extra_inputs: dict[str, torch.Tensor] | None = None,
+        attn_config: BaseAttention.Config,
     ) -> AttentionMasksType:
         mask_mods = [get_causal_mask_mod()]
 
-        match self.attn_config.attn_mask_type:
+        match attn_config.mask_type:
             case "causal":
                 B = 1
             case "block_causal":
@@ -179,11 +161,17 @@ class Decoder(BaseModel):
                 mask_mods.append(get_document_mask_mod(input_batch, tokenizer.eos_id))
             case _:
                 raise ValueError(
-                    f"Unknown attention mask type: {self.attn_config.attn_mask_type}"
+                    f"Unknown attention mask type: {attn_config.mask_type}"
                 )
 
+        assert isinstance(attn_config.inner_attention, FlexAttention.Config)
         return create_attention_mask(
-            and_masks(*mask_mods), B, None, input_batch.shape[1], input_batch.shape[1]
+            and_masks(*mask_mods),
+            B,
+            None,
+            input_batch.shape[1],
+            input_batch.shape[1],
+            BLOCK_SIZE=attn_config.inner_attention.block_size,
         )
 
     def get_attention_masks(
@@ -192,25 +180,20 @@ class Decoder(BaseModel):
         tokenizer: BaseTokenizer,
         extra_inputs: dict[str, torch.Tensor] | None = None,
     ) -> AttentionMasksType:
-        match self.attn_config.attn_backend:
-            case "flex":
-                return self._get_flex_attention_masks(
-                    input_batch, tokenizer, extra_inputs
+        attn_config = self.config.layers[0].attention
+        inner_attn = attn_config.inner_attention
+        if isinstance(inner_attn, FlexAttention.Config):
+            return self._get_flex_attention_masks(input_batch, tokenizer, attn_config)
+        elif isinstance(inner_attn, VarlenAttention.Config):
+            if attn_config.mask_type != "block_causal":
+                raise ValueError(
+                    f"varlen attention is only supported with block_causal "
+                    f"attention mask type, got {attn_config.mask_type}"
                 )
-            case "varlen":
-                if self.attn_config.attn_mask_type != "block_causal":
-                    raise ValueError(
-                        f"varlen attention is only supported with block_causal "
-                        f"attention mask type, got {self.attn_config.attn_mask_type}"
-                    )
-                assert tokenizer.eos_id is not None
-                return create_varlen_metadata_for_document(
-                    input_batch, tokenizer.eos_id
-                )
-            case _:
-                raise TypeError("Only varlen and flex attn masks are supported")
-
-    @property
-    def attn_config(self):
-        """Convenience accessor for the attention config from layer."""
-        return self.config.layer.attention
+            assert tokenizer.eos_id is not None
+            return create_varlen_metadata_for_document(input_batch, tokenizer.eos_id)
+        else:
+            raise TypeError(
+                f"Only VarlenAttention and FlexAttention support attention masks, "
+                f"got {type(inner_attn).__name__}"
+            )

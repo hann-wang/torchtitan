@@ -7,19 +7,21 @@
 from .attention import (
     create_attention_mask,
     create_varlen_metadata_for_document,
-    FlexAttentionWrapper,
+    FlexAttention,
     get_causal_mask_mod,
     get_document_mask_mod,
     get_fixed_block_mask_mod,
     get_sliding_window_mask_mod,
     GQAttention,
-    ScaledDotProductAttentionWrapper,
-    VarlenAttentionWrapper,
+    LocalMapInnerAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
     VarlenMetadata,
 )
 from .decoder import Decoder, TransformerBlock
 from .embedding import Embedding
 from .feed_forward import compute_ffn_hidden_dim, FeedForward
+from .linear import Linear
 from .moe import MoE
 from .rmsnorm import RMSNorm
 from .rope import (
@@ -35,18 +37,20 @@ __all__ = [
     "Decoder",
     "Embedding",
     "FeedForward",
-    "FlexAttentionWrapper",
+    "FlexAttention",
     "get_causal_mask_mod",
     "get_document_mask_mod",
     "get_fixed_block_mask_mod",
     "get_sliding_window_mask_mod",
     "GQAttention",
+    "Linear",
+    "LocalMapInnerAttention",
     "MoE",
     "RMSNorm",
     "RoPE",
-    "ScaledDotProductAttentionWrapper",
+    "ScaledDotProductAttention",
     "TransformerBlock",
-    "VarlenAttentionWrapper",
+    "VarlenAttention",
     "VarlenMetadata",
     "apply_rotary_emb_complex",
     "apply_rotary_emb_cos_sin",

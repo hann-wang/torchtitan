@@ -9,6 +9,7 @@ on:
       - 'torchtitan/experiments/vlm/**'
       - '.github/workflows/integration_test_8gpu_vlm.yaml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - 'torchtitan/experiments/vlm/**'
       - '.github/workflows/integration_test_8gpu_vlm.yaml'
@@ -74,6 +75,7 @@ jobs:
         fi
 
         USE_CPP=0 python -m pip install --pre torchao --index-url ${{ matrix.index-url }}
+        python -m pip install torchdata==0.12.0.dev20260327 --extra-index-url https://download.pytorch.org/whl/nightly/cpu
 
         sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"
         sudo chown -R $(id -u):$(id -g) "$RUNNER_TEMP/artifacts-to-be-uploaded"
