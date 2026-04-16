@@ -86,13 +86,9 @@ class Decoder(BaseModel):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        self.enable_weight_tying = config.enable_weight_tying
 
         self.tok_embeddings = config.tok_embeddings.build()
-
-        if config.enable_weight_tying:
-            self.output = lambda x: F.linear(x, self.tok_embeddings.weight)
-        else:
-            self.output = config.output.build()
 
         self.rope = config.rope.build()
         self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
@@ -101,13 +97,23 @@ class Decoder(BaseModel):
         for i, layer_config in enumerate(config.layers):
             self.layers[str(i)] = layer_config.build()
 
-        self.norm = config.norm.build(normalized_shape=config.dim)
+        self.norm = config.norm.build()
+        self.output = config.output.build()
+
+        if self.enable_weight_tying:
+            self.tok_embeddings.weight = self.output.weight
 
     def init_states(
         self,
         *,
         buffer_device: torch.device | None = None,
     ) -> None:
+        if self.enable_weight_tying:
+            # Re-tie before init: on meta device the __init__ tying may
+            # not have worked correctly.
+            assert self.tok_embeddings is not None and self.output is not None
+            self.tok_embeddings.weight = self.output.weight
+
         # Compute buffer_device before recursion so children (RoPE) get
         # the correct device when buffer_device is not explicitly provided.
         if buffer_device is None:

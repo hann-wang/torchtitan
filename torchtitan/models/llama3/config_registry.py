@@ -134,7 +134,6 @@ def llama3_1b() -> Trainer.Config:
         checkpoint=CheckpointManager.Config(interval=500),
         activation_checkpoint=ActivationCheckpointConfig(
             mode="selective",
-            selective_ac_option="op",
         ),
         validator=Validator.Config(
             freq=500,

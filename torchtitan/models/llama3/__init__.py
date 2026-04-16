@@ -73,7 +73,7 @@ def _build_llama3_layers(
     n_kv_heads: int | None = None,
     inner_attention=None,
     mask_type: str = "causal",
-    qk_norm: bool = False,
+    qk_norm: RMSNorm.Config | None = None,
 ) -> list[TransformerBlock.Config]:
     """Build a list of per-layer TransformerBlock configs with depth-scaled inits."""
     layers = []
@@ -97,7 +97,7 @@ def _build_llama3_layers(
                     ),
                     mask_type=mask_type,
                     rope_backend="complex",
-                    qk_norm=RMSNorm.Config(normalized_shape=n_heads * head_dim, param_init=_NORM_INIT) if qk_norm else None,
+                    qk_norm=qk_norm,
                 ),
                 feed_forward=make_ffn_config(
                     dim=dim,
@@ -282,7 +282,7 @@ def _3b_instella() -> Llama3Model.Config:
             hidden_dim=compute_ffn_hidden_dim(
                 dim, multiple_of=256, ffn_dim_multiplier=1.0
             ),
-            qk_norm=True,
+            qk_norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
         ),
     )
 
@@ -430,6 +430,7 @@ llama3_configs = {
     "debugmodel_varlen_attn": _debugmodel_varlen_attn,
     "1B": _1b,
     "3B": _3b,
+    "3B_instella": _3b_instella,
     "8B": _8b,
     "8B_flex": _8b_flex,
     "8B_varlen": _8b_varlen,
