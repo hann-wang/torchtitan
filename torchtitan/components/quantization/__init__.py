@@ -37,6 +37,7 @@ class QuantizationConverter(Configurable):
 PAD_MULTIPLE_MAP: dict[str, int] = {
     "float8": 16,
     "mxfp8": 32,
+    "custom": 128,
 }
 
 
@@ -54,4 +55,5 @@ def find_pad_multiple(converters: list) -> int | None:
             return PAD_MULTIPLE_MAP["float8"]
         if isinstance(c, MXFP8Converter.Config):
             return PAD_MULTIPLE_MAP["mxfp8"]
+        return PAD_MULTIPLE_MAP["custom"]
     return None
