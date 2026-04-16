@@ -255,7 +255,6 @@ def _3b_instella() -> Llama3Model.Config:
     return Llama3Model.Config(
         dim=dim,
         vocab_size=vocab_size,
-        enable_weight_tying=True,
         tok_embeddings=Embedding.Config(
             num_embeddings=vocab_size,
             embedding_dim=dim,
