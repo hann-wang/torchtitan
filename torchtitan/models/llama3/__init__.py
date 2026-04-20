@@ -153,6 +153,8 @@ llama3_configs = {
                 attn_backend="sdpa",
                 rope_backend="complex",
                 qk_norm_type=2,
+                q_norm=RMSNorm.Config(),
+                k_norm=RMSNorm.Config(),
             ),
         ),
         rope=RoPE.Config(
