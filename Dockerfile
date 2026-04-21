@@ -68,5 +68,5 @@ RUN cd /var/lib/jenkins && \
 # RUN cd /usr/local/src/torchtitan && \
 #     pip install --no-build-isolation --no-deps -e .
 
-RUN sed -i 's/self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))/self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param), requires_grad=sharded_param.requires_grad)/' /opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_param.py && \
+RUN sed -i 's/self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param))/self.sharded_param = nn.Parameter(self.to_sharded_dtensor(sharded_param), requires_grad=param.requires_grad)/' /opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_param.py && \
     sed -i 's/        self.sharded_param.requires_grad_(param.requires_grad)//' /opt/conda/envs/py_3.10/lib/python3.10/site-packages/torch/distributed/fsdp/_fully_shard/_fsdp_param.py
