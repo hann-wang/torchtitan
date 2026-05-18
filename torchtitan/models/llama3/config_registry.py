@@ -119,7 +119,7 @@ def llama3_debugmodel_float8_emulate() -> Trainer.Config:
 def llama3_1b() -> Trainer.Config:
     return Trainer.Config(
         hf_assets_path="./assets/hf/Llama-3.1-1B",
-        profiling=Profiler.Config(
+        profiler=Profiler.Config(
             enable_profiling=True,
             profile_freq=100,
         ),
