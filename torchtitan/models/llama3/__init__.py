@@ -9,7 +9,6 @@ from functools import partial
 
 import torch.nn as nn
 
-from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
     compute_ffn_hidden_dim,
@@ -25,6 +24,9 @@ from torchtitan.models.common.config_utils import (
     make_gqa_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std, skip_param_init
+from torchtitan.models.utils import validate_converter_order
+
+from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import Llama3Model, Llama3TransformerBlock
@@ -70,7 +72,7 @@ def _build_llama3_layers(
     hidden_dim: int,
     n_kv_heads: int | None = None,
     fuse_qkv: bool = False,
-    attn_backend: str = "sdpa",
+    attn_backend: str,
     qk_norm: RMSNorm.Config | None = None,
 ) -> list[TransformerBlock.Config]:
     """Build a list of per-layer TransformerBlock configs with depth-scaled inits."""
@@ -106,7 +108,7 @@ def _build_llama3_layers(
     return layers
 
 
-def _debugmodel(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _debugmodel(attn_backend: str) -> Llama3Model.Config:
     dim = 256
     n_heads = 16
     n_layers = 6
@@ -117,7 +119,7 @@ def _debugmodel(attn_backend: str = "sdpa") -> Llama3Model.Config:
             num_embeddings=2048, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim, out_features=2048, param_init=_output_linear_init(dim)
         ),
         rope=RoPE.Config(
@@ -137,7 +139,7 @@ def _debugmodel(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _debugmodel_fused_qkv(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _debugmodel_fused_qkv(attn_backend: str) -> Llama3Model.Config:
     dim = 256
     n_heads = 16
     n_layers = 6
@@ -148,7 +150,7 @@ def _debugmodel_fused_qkv(attn_backend: str = "sdpa") -> Llama3Model.Config:
             num_embeddings=2048, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim, out_features=2048, param_init=_output_linear_init(dim)
         ),
         rope=RoPE.Config(
@@ -169,7 +171,7 @@ def _debugmodel_fused_qkv(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _1b(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _1b(attn_backend: str) -> Llama3Model.Config:
     dim = 2048
     n_heads = 32
     n_kv_heads = 8
@@ -185,7 +187,7 @@ def _1b(attn_backend: str = "sdpa") -> Llama3Model.Config:
             param_init=_EMBEDDING_SKIP_INIT,
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -210,7 +212,7 @@ def _1b(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _3b(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _3b(attn_backend: str) -> Llama3Model.Config:
     dim = 3072
     n_heads = 24
     n_kv_heads = 8
@@ -226,7 +228,7 @@ def _3b(attn_backend: str = "sdpa") -> Llama3Model.Config:
             param_init=_EMBEDDING_SKIP_INIT,
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -251,7 +253,7 @@ def _3b(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _3b_instella(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _3b_instella(attn_backend: str) -> Llama3Model.Config:
     dim = 2560
     n_heads = 32
     n_kv_heads = 32
@@ -292,7 +294,7 @@ def _3b_instella(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _8b(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _8b(attn_backend: str) -> Llama3Model.Config:
     dim = 4096
     n_heads = 32
     n_kv_heads = 8
@@ -305,7 +307,7 @@ def _8b(attn_backend: str = "sdpa") -> Llama3Model.Config:
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -330,7 +332,7 @@ def _8b(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _70b(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _70b(attn_backend: str) -> Llama3Model.Config:
     dim = 8192
     n_heads = 64
     n_kv_heads = 8
@@ -343,7 +345,7 @@ def _70b(attn_backend: str = "sdpa") -> Llama3Model.Config:
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -368,7 +370,7 @@ def _70b(attn_backend: str = "sdpa") -> Llama3Model.Config:
     )
 
 
-def _405b(attn_backend: str = "sdpa") -> Llama3Model.Config:
+def _405b(attn_backend: str) -> Llama3Model.Config:
     dim = 16384
     n_heads = 128
     n_kv_heads = 8
@@ -381,7 +383,7 @@ def _405b(attn_backend: str = "sdpa") -> Llama3Model.Config:
             num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
         ),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
-        output=Linear.Config(
+        lm_head=Linear.Config(
             in_features=dim,
             out_features=vocab_size,
             param_init=_output_linear_init(dim),
@@ -421,15 +423,19 @@ llama3_configs = {
 def model_registry(
     flavor: str,
     attn_backend: str = "sdpa",
+    converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     config = llama3_configs[flavor](attn_backend=attn_backend)
+    if converters is not None:
+        validate_converter_order(converters)
+        for c in converters:
+            c.build().convert(config)
     return ModelSpec(
         name="llama3",
         flavor=flavor,
         model=config,
         parallelize_fn=parallelize_llama,
         pipelining_fn=pipeline_llm,
-        build_loss_fn=build_cross_entropy_loss,
         post_optimizer_build_fn=None,
         state_dict_adapter=Llama3StateDictAdapter,
     )
