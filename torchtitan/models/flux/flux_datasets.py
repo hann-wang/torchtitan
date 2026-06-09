@@ -27,6 +27,58 @@ from torchtitan.tools.logging import logger
 from .configs import Encoder
 
 
+def _apply_pil_exif_safe_patches() -> None:
+    """Prevent bad image metadata from crashing PIL/HF dataset decoding."""
+
+    try:
+        import PIL.ImageFile
+        import PIL.ImageOps
+    except Exception:
+        return
+
+    try:
+        PIL.ImageFile.LOAD_TRUNCATED_IMAGES = True
+    except Exception:
+        pass
+
+    image_cls = getattr(PIL.Image, "Image", None)
+    if image_cls is not None:
+        orig_getexif = getattr(image_cls, "getexif", None)
+        if callable(orig_getexif) and not getattr(orig_getexif, "_tt_exif_safe", False):
+
+            def _safe_getexif(self: Any) -> Any:
+                try:
+                    return orig_getexif(self)
+                except Exception:
+                    try:
+                        exif_cls = getattr(PIL.Image, "Exif", None)
+                        if exif_cls is not None:
+                            return exif_cls()
+                    except Exception:
+                        pass
+                    return {}
+
+            setattr(_safe_getexif, "_tt_exif_safe", True)
+            image_cls.getexif = _safe_getexif
+
+    orig_exif_transpose = getattr(PIL.ImageOps, "exif_transpose", None)
+    if callable(orig_exif_transpose) and not getattr(
+        orig_exif_transpose, "_tt_exif_safe", False
+    ):
+
+        def _safe_exif_transpose(image: Any, *args: Any, **kwargs: Any) -> Any:
+            try:
+                return orig_exif_transpose(image, *args, **kwargs)
+            except Exception:
+                return image
+
+        setattr(_safe_exif_transpose, "_tt_exif_safe", True)
+        PIL.ImageOps.exif_transpose = _safe_exif_transpose
+
+
+_apply_pil_exif_safe_patches()
+
+
 def _process_cc12m_image(
     img: PIL.Image.Image,
     output_size: int = 256,
