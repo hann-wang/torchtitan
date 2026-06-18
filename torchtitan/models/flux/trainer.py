@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import hashlib
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
@@ -21,6 +23,42 @@ from torchtitan.models.flux.utils import (
     preprocess_data,
 )
 from torchtitan.trainer import Trainer
+
+
+def _make_last_batch_run_key(dump_folder: str) -> str:
+    normalized_dump_folder = os.path.abspath(dump_folder)
+    folder_name = os.path.basename(normalized_dump_folder) or "flux"
+    slug = "".join(c if c.isalnum() else "_" for c in folder_name).strip("_")
+    digest = hashlib.sha1(normalized_dump_folder.encode()).hexdigest()[:8]
+    return f"{slug or 'flux'}_{digest}"
+
+
+def _write_last_batch_keys(
+    step: int, input_dict: dict[str, object], dump_folder: str
+) -> None:
+    sample_keys = input_dict.get("sample_key")
+    if sample_keys is None:
+        return
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    run_key = _make_last_batch_run_key(dump_folder)
+    path = f"/tmp/flux_last_batch_{run_key}_rank{rank}.txt"
+    tmp_path = f"{path}.tmp"
+
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(f"step={step}\n")
+            f.write(f"rank={rank}\n")
+            f.write(f"dump_folder={dump_folder}\n")
+            if isinstance(sample_keys, (list, tuple)):
+                for key in sample_keys:
+                    f.write(f"{key}\n")
+            else:
+                f.write(f"{sample_keys}\n")
+        os.replace(tmp_path, path)
+    except OSError:
+        # Do not let crash breadcrumbs interfere with training.
+        pass
 
 
 class FluxTrainer(Trainer):
@@ -124,6 +162,8 @@ class FluxTrainer(Trainer):
         assert (
             global_valid_tokens is None
         ), "FLUX model don't need to rescale loss by number of global valid tokens"
+
+        _write_last_batch_keys(self.step, input_dict, self.config.dump_folder)
 
         # generate t5 and clip embeddings
         input_dict["image"] = labels
@@ -241,7 +281,7 @@ class FluxTrainer(Trainer):
         grad_norm = dist_utils.clip_grad_norm_(
             [p for m in self.model_parts for p in m.parameters()],
             self.config.training.max_norm,
-            foreach=True,
+            foreach=False,
             pp_mesh=parallel_dims.get_optional_mesh("pp"),
             ep_enabled=parallel_dims.ep_enabled,
         )

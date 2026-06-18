@@ -6,6 +6,7 @@
 
 import itertools
 import math
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -79,42 +80,72 @@ def _apply_pil_exif_safe_patches() -> None:
 _apply_pil_exif_safe_patches()
 
 
+_BAD_IMAGE_WARNING_SUBSTRINGS = (
+    "Truncated File Read",
+    "Corrupt EXIF data",
+    "image file is truncated",
+)
+
+
+def _has_bad_image_warning(captured_warnings: list[warnings.WarningMessage]) -> bool:
+    return any(
+        any(substr in str(warning.message) for substr in _BAD_IMAGE_WARNING_SUBSTRINGS)
+        for warning in captured_warnings
+    )
+
+
 def _process_cc12m_image(
     img: PIL.Image.Image,
     output_size: int = 256,
 ) -> torch.Tensor | None:
     """Process CC12M image to the desired size."""
 
-    width, height = img.size
-    # Skip low resolution images
-    if width < output_size or height < output_size:
-        return None
+    with warnings.catch_warnings(record=True) as captured_warnings:
+        warnings.simplefilter("always")
 
-    if width >= height:
-        # resize height to be equal to output_size, then crop
-        new_width, new_height = math.ceil(output_size / height * width), output_size
-        img = img.resize((new_width, new_height))
-        left = torch.randint(0, new_width - output_size + 1, (1,)).item()
-        resized_img = img.crop((left, 0, left + output_size, output_size))
-    else:
-        # resize width to be equal to output_size, the crop
-        new_width, new_height = (
-            output_size,
-            math.ceil(output_size / width * height),
-        )
-        img = img.resize((new_width, new_height))
-        lower = torch.randint(0, new_height - output_size + 1, (1,)).item()
-        resized_img = img.crop((0, lower, output_size, lower + output_size))
+        try:
+            width, height = img.size
+            # Skip low resolution images
+            if width < output_size or height < output_size:
+                return None
 
-    assert resized_img.size[0] == resized_img.size[1] == output_size
+            if width >= height:
+                # resize height to be equal to output_size, then crop
+                new_width, new_height = (
+                    math.ceil(output_size / height * width),
+                    output_size,
+                )
+                img = img.resize((new_width, new_height))
+                left = torch.randint(0, new_width - output_size + 1, (1,)).item()
+                resized_img = img.crop((left, 0, left + output_size, output_size))
+            else:
+                # resize width to be equal to output_size, the crop
+                new_width, new_height = (
+                    output_size,
+                    math.ceil(output_size / width * height),
+                )
+                img = img.resize((new_width, new_height))
+                lower = torch.randint(0, new_height - output_size + 1, (1,)).item()
+                resized_img = img.crop((0, lower, output_size, lower + output_size))
 
-    # Convert grayscale images, and RGBA, CMYK images
-    if resized_img.mode != "RGB":
-        resized_img = resized_img.convert("RGB")
+            assert resized_img.size[0] == resized_img.size[1] == output_size
 
-    # Normalize the image to [-1, 1]
-    np_img = np.array(resized_img).transpose((2, 0, 1))
-    tensor_img = torch.tensor(np_img).float() / 255.0 * 2.0 - 1.0
+            # Convert grayscale images, and RGBA, CMYK images
+            if resized_img.mode != "RGB":
+                resized_img = resized_img.convert("RGB")
+
+            # Force PIL to read image payload on CPU, so truncated/corrupt images
+            # are rejected before the batch reaches GPU preprocessing.
+            resized_img.load()
+
+            # Normalize the image to [-1, 1]
+            np_img = np.array(resized_img).transpose((2, 0, 1))
+            tensor_img = torch.tensor(np_img).float() / 255.0 * 2.0 - 1.0
+        except (OSError, ValueError, SyntaxError):
+            return None
+
+        if _has_bad_image_warning(captured_warnings):
+            return None
 
     # NOTE: The following commented code is an alternative way
     # img_transform = transforms.Compose(
@@ -154,6 +185,7 @@ def _cc12m_wds_data_processor(
         "clip_tokens": clip_tokens,  # type: List[int]
         "t5_tokens": t5_tokens,  # type: List[int]
         "prompt": sample["txt"],  # type: str
+        "sample_key": sample.get("__key__", "unknown"),  # type: str
     }
 
 
@@ -185,6 +217,7 @@ def _coco_data_processor(
         "clip_tokens": clip_tokens,  # type: List[int]
         "t5_tokens": t5_tokens,  # type: List[int]
         "prompt": prompt,  # type: str
+        "sample_key": str(sample.get("__key__", sample.get("id", "unknown"))),
     }
 
 
