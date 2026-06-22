@@ -12,6 +12,7 @@ from compressed_tensors.utils import match_named_modules
 from torch import nn
 
 from alto.config import Recipe
+from alto.kernels.fp4.mxfp4.mxfp_linear import _to_mxfp4_then_scaled_mm
 from alto.kernels.dispatch.tensor import MXFP4TrainingWeightWrapperTensor
 from torchtitan.models.flux.flux_datasets import FluxDataLoader
 from torchtitan.models.flux.config_registry import flux_dev
@@ -80,7 +81,7 @@ def _make_dataset_inputs(
     dataset_path: str | None,
     batch_size: int,
     seed: int,
-) -> tuple[dict[str, torch.Tensor], dict[str, object]]:
+) -> tuple[dict[str, torch.Tensor], torch.Tensor, dict[str, object]]:
     trainer_config.dataloader.dataset = dataset
     trainer_config.dataloader.dataset_path = dataset_path
     trainer_config.dataloader.infinite = False
@@ -120,7 +121,7 @@ def _make_dataset_inputs(
     ).to(device=device, dtype=dtype)
 
     input_dict["image"] = labels
-    with torch.inference_mode():
+    with torch.no_grad():
         processed = preprocess_data(
             device=device,
             dtype=dtype,
@@ -161,10 +162,11 @@ def _make_dataset_inputs(
             "timesteps": timesteps,
             "y": processed["clip_encodings"],
         }
+        target = pack_latents(noise - img_encodings)
 
     del autoencoder, clip_encoder, t5_encoder
     torch.cuda.empty_cache()
-    return transformer_inputs, metadata
+    return transformer_inputs, target, metadata
 
 
 def _metrics(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
@@ -198,18 +200,7 @@ def _format_float(value: float) -> str:
     return f"{value:.6f}"
 
 
-def _write_markdown(path: Path, rows: list[dict[str, object]]) -> None:
-    headers = [
-        "layer",
-        "input_shape",
-        "output_shape",
-        "snr_db",
-        "cos_sim",
-        "mse",
-        "mae",
-        "ref_rms",
-        "max_abs_err",
-    ]
+def _write_markdown(path: Path, rows: list[dict[str, object]], headers: list[str]) -> None:
     with path.open("w", encoding="utf-8") as f:
         f.write("| " + " | ".join(headers) + " |\n")
         f.write("| " + " | ".join(["---"] * len(headers)) + " |\n")
@@ -224,9 +215,43 @@ def _write_markdown(path: Path, rows: list[dict[str, object]]) -> None:
             f.write("| " + " | ".join(values) + " |\n")
 
 
+def _prefixed_metrics(
+    prefix: str,
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+) -> dict[str, float]:
+    return {
+        f"{prefix}_{key}": value
+        for key, value in _metrics(reference, candidate).items()
+    }
+
+
+def _local_mxfp4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    config,
+) -> torch.Tensor:
+    y = _to_mxfp4_then_scaled_mm(
+        x,
+        weight,
+        use_2dblock_x=config.use_2dblock_x,
+        use_2dblock_w=config.use_2dblock_w,
+        use_sr_grad=config.use_sr_grad,
+        use_dge=config.use_dge,
+        clip_mode=config.clip_mode,
+        use_hadamard=config.use_hadamard,
+        use_macro_block_scaling=config.two_level_scaling == "blockwise",
+    )
+    if bias is not None:
+        y = y + bias
+    return y
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="outputs/flux_layer_error")
+    parser.add_argument("--analysis", choices=("forward", "backward"), default="forward")
     parser.add_argument("--input-source", choices=("random", "dataset"), default="random")
     parser.add_argument("--dataset", default="cc12m-test")
     parser.add_argument("--dataset-path", default=None)
@@ -277,30 +302,39 @@ def main() -> None:
         target_layers[name] = module
 
     rows: list[dict[str, object]] = []
+    backward_records: dict[str, dict[str, object]] = {}
     hooks = []
 
     def make_hook(name: str):
         def hook(module: nn.Linear, inputs: tuple[torch.Tensor, ...], output: torch.Tensor):
             x = inputs[0].detach()
             bf16_out = output.detach()
-            wrapped_weight = MXFP4TrainingWeightWrapperTensor(module.weight.detach(), config)
-            mxfp4_out = F.linear(x, wrapped_weight, module.bias.detach() if module.bias is not None else None)
-            metric_values = _metrics(bf16_out, mxfp4_out)
-            rows.append(
-                {
-                    "layer": name,
+            if args.analysis == "forward":
+                wrapped_weight = MXFP4TrainingWeightWrapperTensor(module.weight.detach(), config)
+                mxfp4_out = F.linear(x, wrapped_weight, module.bias.detach() if module.bias is not None else None)
+                metric_values = _metrics(bf16_out, mxfp4_out)
+                rows.append(
+                    {
+                        "layer": name,
+                        "input_shape": tuple(x.shape),
+                        "output_shape": tuple(bf16_out.shape),
+                        **metric_values,
+                    }
+                )
+            if args.analysis == "backward":
+                backward_records[name] = {
+                    "module": module,
+                    "input": x.cpu(),
                     "input_shape": tuple(x.shape),
                     "output_shape": tuple(bf16_out.shape),
-                    **metric_values,
                 }
-            )
         return hook
 
     for name, module in target_layers.items():
         hooks.append(module.register_forward_hook(make_hook(name)))
 
     if args.input_source == "dataset":
-        inputs, metadata = _make_dataset_inputs(
+        inputs, target, metadata = _make_dataset_inputs(
             trainer_config=trainer_config,
             device=device,
             dtype=dtype,
@@ -323,38 +357,149 @@ def main() -> None:
             "sample_key": None,
             "prompt": None,
         }
+        target = torch.zeros(
+            args.batch_size,
+            args.img_tokens,
+            64,
+            device=device,
+            dtype=dtype,
+        )
 
-    with torch.inference_mode():
-        _ = model(**inputs)
+    if args.analysis == "backward":
+        # Flux initializes several modulation/final-layer paths to zero, so
+        # loss-based full-model gradients can be exactly zero for many early
+        # transformer layers in an untrained model. Use the real dataset
+        # activations, but inject a deterministic synthetic upstream gradient
+        # per layer to isolate the local BF16-vs-MXFP4 backward operator error.
+        with torch.no_grad():
+            _ = model(**inputs)
+        grad_generator = torch.Generator(device=device).manual_seed(args.seed + 2)
+        backward_rows: list[dict[str, object]] = []
+        for name, record in backward_records.items():
+            module = record["module"]
+            assert isinstance(module, nn.Linear)
+
+            x_ref = record["input"].to(device=device, dtype=dtype).detach().requires_grad_(True)
+            w_ref = module.weight.detach().clone().requires_grad_(True)
+            b_ref = (
+                module.bias.detach().clone().requires_grad_(True)
+                if module.bias is not None
+                else None
+            )
+            grad_output = torch.randn(
+                tuple(record["output_shape"]),
+                device=device,
+                dtype=dtype,
+                generator=grad_generator,
+            )
+
+            bf16_out = F.linear(x_ref, w_ref, b_ref)
+            bf16_grads = torch.autograd.grad(
+                bf16_out,
+                tuple(t for t in (x_ref, w_ref, b_ref) if t is not None),
+                grad_outputs=grad_output,
+                retain_graph=False,
+            )
+            bf16_grad_input = bf16_grads[0]
+            bf16_grad_weight = bf16_grads[1]
+
+            x_mx = record["input"].to(device=device, dtype=dtype).detach().requires_grad_(True)
+            w_mx = module.weight.detach().clone().requires_grad_(True)
+            b_mx = (
+                module.bias.detach().clone().requires_grad_(True)
+                if module.bias is not None
+                else None
+            )
+            mxfp4_out = _local_mxfp4_linear(x_mx, w_mx, b_mx, config)
+            mxfp4_grads = torch.autograd.grad(
+                mxfp4_out,
+                tuple(t for t in (x_mx, w_mx, b_mx) if t is not None),
+                grad_outputs=grad_output,
+                retain_graph=False,
+            )
+            mxfp4_grad_input = mxfp4_grads[0]
+            mxfp4_grad_weight = mxfp4_grads[1]
+
+            backward_rows.append(
+                {
+                    "layer": name,
+                    "input_shape": record["input_shape"],
+                    "output_shape": record["output_shape"],
+                    **_prefixed_metrics("grad_input", bf16_grad_input, mxfp4_grad_input),
+                    **_prefixed_metrics("grad_weight", bf16_grad_weight, mxfp4_grad_weight),
+                }
+            )
+
+            del (
+                x_ref,
+                w_ref,
+                b_ref,
+                bf16_out,
+                bf16_grads,
+                x_mx,
+                w_mx,
+                b_mx,
+                mxfp4_out,
+                mxfp4_grads,
+                grad_output,
+            )
+        rows = backward_rows if args.analysis == "backward" else rows
+    else:
+        with torch.inference_mode():
+            _ = model(**inputs)
 
     for hook in hooks:
         hook.remove()
 
-    rows.sort(key=lambda row: float(row["snr_db"]))
+    sort_key = "snr_db" if args.analysis == "forward" else "grad_weight_snr_db"
+    rows.sort(key=lambda row: float(row[sort_key]))
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = output_dir / "flux_dev_mxfp4_layer_error.csv"
-    md_path = output_dir / "flux_dev_mxfp4_layer_error.md"
-    metadata_path = output_dir / "flux_dev_mxfp4_layer_error_metadata.txt"
+    suffix = "backward" if args.analysis == "backward" else "forward"
+    csv_path = output_dir / f"flux_dev_mxfp4_layer_error_{suffix}.csv"
+    md_path = output_dir / f"flux_dev_mxfp4_layer_error_{suffix}.md"
+    metadata_path = output_dir / f"flux_dev_mxfp4_layer_error_{suffix}_metadata.txt"
 
-    fieldnames = [
-        "layer",
-        "input_shape",
-        "output_shape",
-        "snr_db",
-        "cos_sim",
-        "mse",
-        "mae",
-        "ref_rms",
-        "max_abs_err",
-    ]
+    if args.analysis == "backward":
+        fieldnames = [
+            "layer",
+            "input_shape",
+            "output_shape",
+            "grad_input_snr_db",
+            "grad_input_cos_sim",
+            "grad_input_mse",
+            "grad_input_mae",
+            "grad_input_ref_rms",
+            "grad_input_max_abs_err",
+            "grad_weight_snr_db",
+            "grad_weight_cos_sim",
+            "grad_weight_mse",
+            "grad_weight_mae",
+            "grad_weight_ref_rms",
+            "grad_weight_max_abs_err",
+        ]
+    else:
+        fieldnames = [
+            "layer",
+            "input_shape",
+            "output_shape",
+            "snr_db",
+            "cos_sim",
+            "mse",
+            "mae",
+            "ref_rms",
+            "max_abs_err",
+        ]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    _write_markdown(md_path, rows)
+    _write_markdown(md_path, rows, fieldnames)
     with metadata_path.open("w", encoding="utf-8") as f:
+        f.write(f"analysis={args.analysis}\n")
+        if args.analysis == "backward":
+            f.write("backward_grad_source=synthetic_random_upstream_grad\n")
         f.write(f"input_source={args.input_source}\n")
         f.write(f"dataset={metadata['dataset']}\n")
         f.write(f"sample_key={metadata['sample_key']}\n")
@@ -364,6 +509,7 @@ def main() -> None:
 
     print(f"recipe={RECIPE_PATH}")
     print(f"use_hadamard={config.use_hadamard} use_sr_grad={config.use_sr_grad}")
+    print(f"analysis={args.analysis}")
     print(f"input_source={args.input_source}")
     print(f"dataset={metadata['dataset']}")
     print(f"sample_key={metadata['sample_key']}")
@@ -371,15 +517,24 @@ def main() -> None:
     print(f"csv={csv_path}")
     print(f"markdown={md_path}")
     print(f"metadata={metadata_path}")
-    print("worst_layers_by_snr:")
+    print(f"worst_layers_by_{sort_key}:")
     for row in rows[:20]:
-        print(
-            f"{row['layer']}\t"
-            f"snr_db={_format_float(float(row['snr_db']))}\t"
-            f"cos={_format_float(float(row['cos_sim']))}\t"
-            f"mse={_format_float(float(row['mse']))}\t"
-            f"mae={_format_float(float(row['mae']))}"
-        )
+        if args.analysis == "backward":
+            print(
+                f"{row['layer']}\t"
+                f"dW_snr={_format_float(float(row['grad_weight_snr_db']))}\t"
+                f"dW_cos={_format_float(float(row['grad_weight_cos_sim']))}\t"
+                f"dX_snr={_format_float(float(row['grad_input_snr_db']))}\t"
+                f"dX_cos={_format_float(float(row['grad_input_cos_sim']))}"
+            )
+        else:
+            print(
+                f"{row['layer']}\t"
+                f"snr_db={_format_float(float(row['snr_db']))}\t"
+                f"cos={_format_float(float(row['cos_sim']))}\t"
+                f"mse={_format_float(float(row['mse']))}\t"
+                f"mae={_format_float(float(row['mae']))}"
+            )
 
 
 if __name__ == "__main__":
