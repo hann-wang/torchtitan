@@ -27,7 +27,7 @@ class ModelConverter(Protocol):
         """Inplace conversion of the model."""
         ...
 
-    def pre_step(self, model_parts: list[nn.Module]):
+    def pre_step(self, model_parts: list[nn.Module], **kwargs):
         ...
 
     def post_optimizer_hook(self, model_parts: list[nn.Module], **kwargs):
@@ -85,9 +85,9 @@ class ModelConvertersContainer(Configurable, ModelConverter):
         if self.print_after_conversion:
             logger.info(f"Model definition after conversion:\n\n{model}\n\n")
 
-    def pre_step(self, model_parts: list[nn.Module]):
+    def pre_step(self, model_parts: list[nn.Module], **kwargs):
         for mh in self.converters:
-            mh.pre_step(model_parts)
+            mh.pre_step(model_parts, **kwargs)
 
     def post_optimizer_hook(self, model_parts: list[nn.Module], **kwargs):
         for mh in self.converters:
