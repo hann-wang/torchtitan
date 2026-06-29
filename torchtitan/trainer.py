@@ -828,7 +828,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             while self.should_continue_training():
                 self.step += 1
                 self.gc_handler.run(self.step)
-                self.model_converters.pre_step(self.model_parts)
+                self.model_converters.pre_step(self.model_parts, step=self.step)
                 try:
                     self.train_step(data_iterator)
                 except DataloaderExhaustedError:
