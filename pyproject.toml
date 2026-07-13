@@ -19,12 +19,12 @@ dependencies = [
     "safetensors",
 
     # Miscellaneous
-    "fsspec",
     "tyro",
     "tensorboard",
     "wandb",
     "einops",
     "pillow",
+    "spmd_types==0.2.1",
 ]
 dynamic = ["version"]
 
@@ -57,5 +57,5 @@ testpaths = ["tests"]
 
 [tool.pyrefly]
 project-excludes = ["torchtitan/experiments", "**/tests/**"]
-ignore-missing-imports = ["torchao.*", "torchft"]  # optional dependencies
+replace-imports-with-any = ["torchao.*", "torchft", "torchvision.*", "deep_ep.*", "jinja2.*", "fla.*", "helion", "helion.*", "batch_invariant_ops", "torchcomms"]  # optional dependencies
 search-path = ["../pytorch"]  # local built pytorch

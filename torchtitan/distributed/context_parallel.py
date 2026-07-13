@@ -8,82 +8,107 @@ from collections.abc import Sequence
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.experimental._attention import (
     _context_parallel_shard,
-    _ContextParallel,
     _enable_context_parallel_dispatcher,
     _HeadTailLoadBalancer,
     _PTRRLoadBalancer,
 )
-from torch.distributed.tensor.parallel import parallelize_module
+from torch.distributed.tensor.experimental._context_parallel._attention import (
+    flex_cp_allgather,
+)
 from torch.nn.attention.flex_attention import BlockMask
 
-from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    FlexAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
+)
 from torchtitan.tools.logging import logger
 
 
-def apply_cp_to_attention_module(
+def apply_cp_to_forward(
     attention_modules: Sequence[nn.Module],
     cp_mesh: DeviceMesh,
-    attention_type: str,
 ) -> None:
-    """
-    Apply context parallelism to attention modules.
+    """Wrap inner attention ``forward`` with CP logic.
 
-    CP splits the sequence dimension across devices to enable training with
-    longer sequences. This function applies CP to the provided attention
-    modules.
+    Must be called **before** ``Module.parallelize()`` so the CP wrapper
+    is captured inside parallelize's ``local_map`` wrapping.
+
+    The attention type is inferred via isinstance on the first module.
+
+    TODO: This is a temporary workaround that manually allgathers K/V
+    (FlexAttention) or wraps inputs as CP-sharded DTensors (SDPA).
+    Once all models adopt config-based sharding with full DTensor,
+    CP redistribution should be expressed declaratively via
+    ShardingConfig and this function should be removed.
 
     Args:
-        attention_modules: Sequence of attention modules to apply CP to
-        cp_mesh: Device mesh for context parallel dimension
-        attention_type: Type of attention mechanism. Must be one of:
-            - "sdpa": scaled_dot_product_attention()
-            - "flex": flex_attention()
-            - "varlen": varlen_attn() (not yet implemented)
-
-    Raises:
-        NotImplementedError: If attention_type is "varlen"
+        attention_modules: Sequence of inner attention modules to apply CP to.
+        cp_mesh: Device mesh for context parallel dimension.
     """
-    # Apply context parallelism to every attention module
-    # TODO: make seq_dim configurable once the implementation doesn't assume 2
-    # internally.
-    match attention_type:
-        case "flex":
-            cp_plan = _ContextParallel(
-                seq_dim=2, attention_type=_ContextParallel.AttentionType.FLEX
-            )
-        case "sdpa":
-            # Enable the DTensor dispatcher to route SDPA operations to the
-            # Context Parallel implementation. This is required for CP to work
-            # with SDPA (but not FlexAttention).
-            # Note: Use _disable_context_parallel_dispatcher() if you need to
-            # turn this off. In TorchTitan, we currently don't disable the CP
-            # dispatcher.
-            _enable_context_parallel_dispatcher()
-            cp_plan = _ContextParallel(
-                seq_dim=2, attention_type=_ContextParallel.AttentionType.SDPA
-            )
-        case "varlen":
-            raise NotImplementedError(
-                "Variable-length attention CP is not yet supported"
-            )
-        case _:
-            raise ValueError(
-                f"Invalid attention_type '{attention_type}'. "
-                f"Must be one of: 'sdpa', 'flex', 'varlen'"
-            )
+    first = attention_modules[0]
+    if isinstance(first, FlexAttention):
+        for mod in attention_modules:
+            original_forward = mod.forward
 
-    for attention_module in attention_modules:
-        parallelize_module(
-            module=attention_module,
-            device_mesh=cp_mesh,
-            parallelize_plan=cp_plan,
+            def _make_cp_forward(orig_fn, mesh):
+                pg_name = dist._get_process_group_name(mesh.get_group())
+
+                def cp_forward(q, k, v, **kwargs):
+                    if kwargs.get("score_mod") is not None:
+                        raise NotImplementedError(
+                            "FlexAttention score_mod is not supported with "
+                            "Context Parallel yet. It must be sharded before "
+                            "use with CP."
+                        )
+                    k = k.contiguous()
+                    v = v.contiguous()
+                    global_k, global_v = flex_cp_allgather(k, v, 1, pg_name)
+                    return orig_fn(q, global_k, global_v, **kwargs)
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
+    elif isinstance(first, ScaledDotProductAttention):
+        _enable_context_parallel_dispatcher()
+
+        for mod in attention_modules:
+            original_forward = mod.forward
+
+            def _make_cp_forward(orig_fn, mesh):
+                placement = [Shard(1)]
+
+                def cp_forward(q, k, v, **kwargs):
+                    if not isinstance(q, DTensor):
+                        q = DTensor.from_local(q, mesh, placement, run_check=False)
+                    if not isinstance(k, DTensor):
+                        k = DTensor.from_local(k, mesh, placement, run_check=False)
+                    if not isinstance(v, DTensor):
+                        v = DTensor.from_local(v, mesh, placement, run_check=False)
+                    output = orig_fn(q, k, v, **kwargs)
+                    return output.to_local() if isinstance(output, DTensor) else output
+
+                return cp_forward
+
+            mod.forward = _make_cp_forward(original_forward, cp_mesh)
+
+    elif isinstance(first, VarlenAttention):
+        raise NotImplementedError("Variable-length attention CP is not yet supported")
+    else:
+        raise NotImplementedError(
+            f"Context Parallel forward wrapping is not supported for "
+            f"{type(first).__name__}"
         )
 
-    logger.info("Applied Context Parallel to the model")
+    logger.info("Applied Context Parallel (forward wrapping) to the model")
 
 
 def prepare_context_parallel_input(
@@ -95,19 +120,19 @@ def prepare_context_parallel_input(
     load_balancer_type: str | None = "headtail",
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
     """
-    Prepare inputs, labels, and attention masks for Context Parallel forward pass.
+    Shard inputs, labels, positions, and attention masks for Context Parallel.
 
-    This function prepares tensors for context parallel by:
-    1. Creating position indices based on input sequence length
-    2. Sharding inputs, labels, and positions across the CP mesh
-    3. Sharding attention masks if present
+    The caller must provide ``extra_kwargs["positions"]`` before calling this
+    function.  Position resolution (per-document vs sequential) is handled
+    upstream in ``post_dataloading_process``.
 
     Args:
         inputs: Input tensor of shape [batch_size, seq_len]
         labels: Label tensor of shape [batch_size, seq_len]
-        extra_kwargs: Dictionary that may contain 'attention_masks' to be sharded
+        extra_kwargs: Dictionary containing 'positions' (required) and
+            optionally 'attention_masks' to be sharded.
         cp_mesh: Device mesh for context parallel dimension
-        device: Device to create position tensor on
+        device: Device for the tensors
         load_balancer_type: Type of load balancer to use for sharding.
             Options: "headtail", "ptrr", or None. Defaults to "headtail".
 
@@ -119,9 +144,7 @@ def prepare_context_parallel_input(
               sharded 'attention_masks'
     """
     attention_masks = extra_kwargs.get("attention_masks", None)
-    positions = torch.arange(
-        0, inputs.shape[1], dtype=torch.int32, device=device
-    ).expand(inputs.shape)
+    positions = extra_kwargs["positions"]
     (inputs, labels, positions), attention_masks = cp_shard(
         cp_mesh,
         (inputs, labels, positions),
@@ -224,7 +247,7 @@ def cp_shard(
     # on the Q seq dimension, not KV.
     MASK_Q_SEQ_DIM = 2
     if attention_masks is not None:
-        assert isinstance(attention_masks, (BlockMask, dict[str, BlockMask]))
+        assert isinstance(attention_masks, (BlockMask, dict))
         masks = (
             [attention_masks]
             if isinstance(attention_masks, BlockMask)
@@ -238,9 +261,11 @@ def cp_shard(
         )
         attention_masks = cast(
             (BlockMask | dict[str, BlockMask]),
-            masks[0]
-            if isinstance(attention_masks, BlockMask)
-            else {k: v for k, v in zip(attention_masks.keys(), masks)},
+            (
+                masks[0]
+                if isinstance(attention_masks, BlockMask)
+                else {k: v for k, v in zip(attention_masks.keys(), masks)}
+            ),
         )
 
     return inputs, attention_masks

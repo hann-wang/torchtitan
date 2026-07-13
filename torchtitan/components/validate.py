@@ -12,15 +12,18 @@ from typing import Any, cast, TypeAlias
 import torch
 import torch.nn as nn
 from torch.distributed.pipelining.schedules import _PipelineSchedule
+
 from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.loss import IGNORE_INDEX, LossFunction
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.config import Configurable, ParallelismConfig
-from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.distributed import full_dtensor, ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.protocols import BaseModel
+from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+from torchtitan.models.common.decoder import Decoder
+from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import utils
 from torchtitan.tools.logging import logger
 
@@ -60,7 +63,6 @@ class Validator(BaseValidator):
         parallel_dims: Parallel dimensions
         loss_fn: Loss function to use for validation
         validation_context: Context manager for validation
-        maybe_enable_amp: Context manager for AMP
         metrics_processor: Metrics processor
         pp_schedule: Pipeline schedule (optional)
         pp_has_first_stage: Whether this rank has the first PP stage (optional)
@@ -92,8 +94,6 @@ class Validator(BaseValidator):
                 self.steps > 0 or self.steps == -1
             ), "validation steps must be positive or -1"
 
-    validation_dataloader: BaseDataLoader
-
     # TODO: improve the constructor signature
     def __init__(
         self,
@@ -106,7 +106,6 @@ class Validator(BaseValidator):
         parallel_dims: ParallelDims,
         loss_fn: LossFunction,
         validation_context: ValidationContext,
-        maybe_enable_amp: AbstractContextManager[None],
         metrics_processor: MetricsProcessor,
         seq_len: int,
         local_batch_size: int,
@@ -120,17 +119,12 @@ class Validator(BaseValidator):
         self.tokenizer = tokenizer
         self.parallel_dims = parallel_dims
         self.loss_fn = loss_fn
-        # pyrefly: ignore [unexpected-keyword]
-        dl_config = replace(config.dataloader, infinite=config.steps != -1)
-        self.validation_dataloader = dl_config.build(
-            dp_world_size=dp_world_size,
-            dp_rank=dp_rank,
-            tokenizer=tokenizer,
-            seq_len=seq_len,
-            local_batch_size=local_batch_size,
-        )
+        self.dl_config = replace(config.dataloader, infinite=config.steps != -1)
+        self.dp_world_size = dp_world_size
+        self.dp_rank = dp_rank
+        self.seq_len = seq_len
+        self.local_batch_size = local_batch_size
         self.validation_context = validation_context
-        self.maybe_enable_amp = maybe_enable_amp
         self.metrics_processor = metrics_processor
         self.pp_schedule = pp_schedule
         self.pp_has_first_stage = pp_has_first_stage
@@ -147,7 +141,7 @@ class Validator(BaseValidator):
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
         model_parts: list[nn.Module],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """
         Post-processing hook after data loading and before model forward pass.
 
@@ -163,39 +157,41 @@ class Validator(BaseValidator):
             model_parts: List of model parts for accessing model methods.
 
         Returns:
-            A tuple of (inputs, labels, extra_inputs, extra_kwargs) where:
+            A tuple of (inputs, labels, extra_kwargs) where:
                 - inputs: Main input tensor extracted from input_dict["input"].
                 - labels: Target labels (potentially modified by CP sharding).
-                - extra_inputs: Dict of auxiliary input tensors (all keys except
-                    "input" from input_dict). These are passed to the model forward
-                    but are NOT forwarded across pipeline parallel stages.
-                - extra_kwargs: Dict of additional keyword arguments for model forward.
-                    These ARE forwarded across pipeline parallel stages. Contains
-                    attention_masks if flex attention is enabled.
-
-        Note:
-            The distinction between extra_inputs and extra_kwargs is important for
-            pipeline parallelism: extra_kwargs are forwarded to all pipeline stages,
-            while extra_inputs are only available to the first stage.
+                - extra_kwargs: Additional keyword arguments for the model forward
+                    (e.g. positions, attention_masks), forwarded to every
+                    pipeline-parallel stage.
         """
         inputs = input_dict["input"]
-        extra_inputs = {k: v for k, v in input_dict.items() if k != "input"}
-        # For arguments, like attention_masks, we have to put them in a separate
-        # dict as extra_inputs are not forwarded to other stages in PP, but
-        # extra_kwargs are.
-        extra_kwargs: dict[str, Any] = {}
+        extra_kwargs: dict[str, Any] = {
+            k: v for k, v in input_dict.items() if k != "input"
+        }
 
-        try:
-            # pyrefly: ignore [not-callable]
-            extra_kwargs["attention_masks"] = cast(
-                BaseModel, model_parts[0]
-            ).get_attention_masks(
-                input_batch=inputs,
-                tokenizer=self.tokenizer,
-                extra_inputs=extra_inputs,
+        # TODO: deduplicate with Trainer.post_dataloading_process which has
+        # the same logic; extract a shared function to prevent further drift.
+        # The dataloader always provides per-document positions, which drive
+        # both RoPE and block_causal attention masking.
+        model_config = getattr(model_parts[0], "config", None)
+
+        positions = extra_kwargs.get("positions", None)
+        # positions and attention_masks are optional (Decoder.forward defaults
+        # both to None). Build masks only for the masked backends (Flex/Varlen),
+        # which is where get_attention_masks is defined. A maskless backend (the
+        # SDPA config used by the graph_trainer tests) still receives positions
+        # for RoPE but no masks — it relies on is_causal instead.
+        if isinstance(model_config, Decoder.Config) and positions is not None:
+            inner_attention = getattr(
+                model_config.first_attention, "inner_attention", None
             )
-        except TypeError:
-            pass
+            if isinstance(
+                inner_attention, (FlexAttention.Config, VarlenAttention.Config)
+            ):
+                model = cast(Decoder, model_parts[0])
+                extra_kwargs["attention_masks"] = model.get_attention_masks(
+                    positions=positions,
+                )
 
         if self.parallel_dims.cp_enabled:
             inputs, labels, extra_kwargs = prepare_context_parallel_input(
@@ -207,14 +203,21 @@ class Validator(BaseValidator):
                 self.parallelism.context_parallel_load_balancer,
             )
 
-        return inputs, labels, extra_inputs, extra_kwargs
+        if self.parallelism.spmd_backend == "full_dtensor":
+            inputs, labels, extra_kwargs = full_dtensor.parallelize_inputs(
+                self.parallel_dims, inputs, labels, extra_kwargs
+            )
 
+        return inputs, labels, extra_kwargs
+
+    @sl.log_trace_span("eval")
     @torch.no_grad()
     def validate(
         self,
         model_parts: list[nn.Module],
         step: int,
     ) -> None:
+        sl.add_step_tag("eval")
         # Set model to eval mode
         for model in model_parts:
             model.eval()
@@ -225,7 +228,15 @@ class Validator(BaseValidator):
         device_type = utils.device_type
         num_steps = 0
 
-        for input_dict, labels in self.validation_dataloader:
+        validation_dataloader = self.dl_config.build(
+            dp_world_size=self.dp_world_size,
+            dp_rank=self.dp_rank,
+            tokenizer=self.tokenizer,
+            seq_len=self.seq_len,
+            local_batch_size=self.local_batch_size,
+        )
+
+        for input_dict, labels in validation_dataloader:
             # pyrefly: ignore [missing-attribute, unsupported-operation]
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
@@ -234,11 +245,6 @@ class Validator(BaseValidator):
             for k, v in input_dict.items():
                 input_dict[k] = v.to(device_type)
             labels = labels.to(device_type)
-
-            # Process data (extract inputs, handle attention masks, CP sharding)
-            inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
-                input_dict, labels, model_parts
-            )
 
             # Count valid tokens for this batch
             local_valid_tokens = torch.tensor(0, dtype=torch.int64, device=device_type)
@@ -251,7 +257,12 @@ class Validator(BaseValidator):
                     local_valid_tokens, batch_mesh, None
                 )
             else:
-                global_valid_tokens = local_valid_tokens.float()
+                global_valid_tokens = float(local_valid_tokens.item())
+
+            # Process data (extract inputs, handle attention masks, CP sharding)
+            inputs, labels, extra_kwargs = self.post_dataloading_process(
+                input_dict, labels, model_parts
+            )
 
             if parallel_dims.pp_enabled:
                 assert self.pp_schedule is not None
@@ -265,7 +276,6 @@ class Validator(BaseValidator):
                     if self.pp_has_first_stage:
                         self.pp_schedule.eval(
                             inputs,
-                            **extra_inputs,
                             **extra_kwargs,
                             target=targets,
                             losses=losses,
@@ -279,20 +289,17 @@ class Validator(BaseValidator):
 
                 # accumulate losses across pipeline microbatches
                 # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
-                loss_sum = (
+                if self.pp_has_last_stage:
+                    assert losses is not None
                     # using sum because loss_fn already uses reduction='sum'
-                    torch.sum(torch.stack(losses)).to(device_type)
-                    if self.pp_has_last_stage
-                    else torch.tensor([-1.0], device=device_type)
-                )
+                    loss_sum = torch.sum(torch.stack(losses)).to(device_type)
+                else:
+                    loss_sum = torch.tensor([-1.0], device=device_type)
             else:
                 with self.validation_context():
                     assert len(model_parts) == 1
-                    with self.maybe_enable_amp:
-                        predictions = model_parts[0](
-                            inputs, **extra_inputs, **extra_kwargs
-                        )
-                        loss_sum = self.loss_fn(predictions, labels)
+                    predictions = model_parts[0](inputs, **extra_kwargs)
+                    loss_sum, _ = self.loss_fn(predictions, labels)
 
             accumulated_losses.append(loss_sum.detach() / global_valid_tokens)
             num_steps += 1
@@ -305,7 +312,7 @@ class Validator(BaseValidator):
                 loss, parallel_dims.get_optional_mesh("loss")
             )
         else:
-            global_avg_loss = loss.item()
+            global_avg_loss = float(loss.item())
 
         self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
 

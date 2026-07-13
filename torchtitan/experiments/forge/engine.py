@@ -18,7 +18,6 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
 from torchtitan.config.configs import (
-    ActivationCheckpointConfig,
     CommConfig,
     CompileConfig,
     DebugConfig,
@@ -26,8 +25,12 @@ from torchtitan.config.configs import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims, utils as dist_utils
+from torchtitan.distributed.activation_checkpoint import (
+    ActivationCheckpointingConfig,
+    MemoryBudgetAC,
+    SelectiveAC,
+)
 from torchtitan.protocols import BaseModel
-from torchtitan.protocols.model_converter import ModelConvertersContainer
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
 
@@ -49,15 +52,22 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         checkpoint: CheckpointManager.Config = field(
             default_factory=CheckpointManager.Config
         )
-        activation_checkpoint: ActivationCheckpointConfig = field(
-            default_factory=ActivationCheckpointConfig
+        activation_checkpoint: ActivationCheckpointingConfig = field(
+            default_factory=SelectiveAC.Config
         )
         compile: CompileConfig = field(default_factory=CompileConfig)
-        model_converters: ModelConvertersContainer.Config = field(
-            default_factory=ModelConvertersContainer.Config
-        )
         comm: CommConfig = field(default_factory=CommConfig)
         debug: DebugConfig = field(default_factory=DebugConfig)
+
+        def __post_init__(self):
+            if isinstance(self.activation_checkpoint, MemoryBudgetAC.Config) and not (
+                self.compile.enable and "model" in self.compile.components
+            ):
+                raise ValueError(
+                    "Memory budget activation checkpointing requires the model to be "
+                    "compiled: set --compile.enable and include 'model' in "
+                    "--compile.components."
+                )
 
         def to_dict(self) -> dict[str, Any]:
             return asdict(self)
@@ -112,16 +122,8 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             enable_cpu_backend=config.training.enable_cpu_offload,
         )
         world_size = int(os.environ["WORLD_SIZE"])
-        parallelism_config = config.parallelism
-        self.parallel_dims = parallel_dims = ParallelDims(
-            dp_shard=parallelism_config.data_parallel_shard_degree,
-            dp_replicate=parallelism_config.data_parallel_replicate_degree,
-            cp=parallelism_config.context_parallel_degree,
-            tp=parallelism_config.tensor_parallel_degree,
-            pp=parallelism_config.pipeline_parallel_degree,
-            ep=parallelism_config.expert_parallel_degree,
-            etp=parallelism_config.expert_tensor_parallel_degree,
-            world_size=world_size,
+        self.parallel_dims = parallel_dims = ParallelDims.from_config(
+            config.parallelism, world_size
         )
 
         if parallel_dims.dp_enabled:
@@ -150,7 +152,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self.model_config = model_config = self.train_spec.model
         # set the model args from training configs
         model_config.update_from_config(
-            trainer_config=config,
+            config=config,
         )
 
         with (
@@ -183,7 +185,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             init_device = device_type
             buffer_device = None
 
-        self.loss_fn = self.train_spec.build_loss_fn(
+        self.loss_fn = self.train_spec.loss.build(
             config.compile, parallel_dims=parallel_dims
         )
 
@@ -227,7 +229,6 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 model,
                 parallel_dims=parallel_dims,
                 training=config.training,
-                model_converters=config.model_converters,
                 parallelism=config.parallelism,
                 compile_config=config.compile,
                 ac_config=config.activation_checkpoint,
@@ -244,7 +245,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             for m in self.model_parts:
                 m.to_empty(device=init_device)
                 with torch.no_grad():
-                    m.init_weights(buffer_device=buffer_device)
+                    m.init_states(buffer_device=buffer_device)
                 m.train()
         else:
             # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
@@ -252,7 +253,6 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 model,
                 parallel_dims=parallel_dims,
                 training=config.training,
-                model_converters=config.model_converters,
                 parallelism=config.parallelism,
                 compile_config=config.compile,
                 ac_config=config.activation_checkpoint,
@@ -261,7 +261,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
             model.to_empty(device=init_device)
             with torch.no_grad():
-                model.init_weights(buffer_device=buffer_device)
+                model.init_states(buffer_device=buffer_device)
             model.train()
 
             self.model_parts = [model]
@@ -303,14 +303,8 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             base_folder=config.dump_folder,
         )
 
-        loss_parallel_enabled = (
-            parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
-        )
-        self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
-        self.maybe_enable_amp = dist_utils.maybe_enable_amp(
-            parallel_dims,
-            config.training.mixed_precision_param,
-            device_type,
+        self.train_context = dist_utils.get_spmd_context(
+            parallel_dims=parallel_dims,
         )
 
     def close(self) -> None:

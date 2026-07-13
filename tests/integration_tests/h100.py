@@ -19,7 +19,6 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
     same root config file.
     """
     integration_tests_flavors = [
-        # TODO: re-enable this test once the async TP issue is fixed
         OverrideDefinitions(
             [
                 [
@@ -30,7 +29,6 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
             ],
             "2D async TP compile",
             "2d_asynctp_compile",
-            disabled=True,
         ),
         OverrideDefinitions(
             [
@@ -41,7 +39,18 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
             "Float8 test",
             "float8",
         ),
-        # TODO: re-enable this test once the async TP issue is fixed
+        OverrideDefinitions(
+            [
+                [
+                    "--parallelism.spmd_backend full_dtensor",
+                    "--parallelism.enable-fsdp-symm-mem",
+                ],
+            ],
+            "FSDP symmetric memory",
+            "fsdp_symm_mem",
+            ngpu=2,
+            skip_rocm_test=True,
+        ),
         OverrideDefinitions(
             [
                 [
@@ -56,7 +65,6 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
             "FSDP+async TP+PP+torch.compile+Float8",
             "fsdp+tp+cp+compile+float8",
             ngpu=8,
-            disabled=True,
         ),
         OverrideDefinitions(
             [
@@ -72,20 +80,21 @@ def build_h100_tests_list() -> list[OverrideDefinitions]:
             "hsdp+cp+compile+float8",
             ngpu=8,
         ),
-        # Experimental, non-blocking: PRs can land if only this test fails
-        # Reason: grouped mm in deepseek v3 only works on H100
         OverrideDefinitions(
             [
                 [
-                    "--module simple_fsdp.deepseek_v3 --config simple_fsdp_deepseek_v3_debugmodel",
-                    "--parallelism.tensor_parallel_degree 1",
-                    "--parallelism.expert_parallel_degree 8",
-                    "--compile.graph_passes auto_bucketing",
-                ]
+                    "--module deepseek_v3 --config deepseek_v3_debugmodel_hybridep",
+                    "--parallelism.data_parallel_shard_degree 4",
+                    "--parallelism.expert_parallel_degree 2",
+                    "--compile.enable",
+                    "--compile.components model,loss",
+                ],
             ],
-            "[Experimental, non-blocking landing if fails] SimpleFSDP DeepSeekV3 auto_bucketing",
-            "simplefsdp_deepseekv3_auto_bucketing",
-            ngpu=8,
+            "DeepSeek V3 FSDP+HybridEP+compile",
+            "deepseek_v3_fsdp+hybridep+compile",
+            ngpu=4,
+            # deep_ep/NVSHMEM is CUDA-only, so skip on ROCm.
+            skip_rocm_test=True,
         ),
     ]
     return integration_tests_flavors

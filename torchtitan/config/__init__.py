@@ -13,7 +13,6 @@ TORCH_DTYPE_MAP = {
 }
 
 from .configs import (
-    ActivationCheckpointConfig,
     CommConfig,
     CompileConfig,
     DebugConfig,
@@ -21,17 +20,33 @@ from .configs import (
     TrainingConfig,
 )
 from .configurable import Configurable
+from .function import Function
 from .manager import ConfigManager
+from .override import (
+    apply_overrides,
+    clear_overrides,
+    derive,
+    Override,
+    override,
+    OverrideConfig,
+)
 
 __all__ = [
     "ConfigManager",
     "Configurable",
+    "Function",
     "TORCH_DTYPE_MAP",
     # Config dataclasses
-    "ActivationCheckpointConfig",
     "CompileConfig",
     "ParallelismConfig",
     "CommConfig",
     "TrainingConfig",
     "DebugConfig",
+    # Override mechanism
+    "OverrideConfig",
+    "Override",
+    "override",
+    "derive",
+    "apply_overrides",
+    "clear_overrides",
 ]

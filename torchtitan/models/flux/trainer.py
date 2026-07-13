@@ -4,20 +4,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Iterable
-from dataclasses import dataclass, field
+import time
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field, replace
 
+import spmd_types as spmd
 import torch
 
+from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import utils as dist_utils
-from torchtitan.models.flux.configs import Encoder, Inference, Validation
+from torchtitan.models.flux.configs import FluxEncoderConfig, Inference
 from torchtitan.models.flux.model.autoencoder import load_ae
-from torchtitan.models.flux.model.hf_embedder import FluxEmbedder
+from torchtitan.models.flux.model.model import FluxModel
 from torchtitan.models.flux.parallelize import parallelize_encoders
+from torchtitan.models.flux.sharding import annotate_flux_forward_inputs
+from torchtitan.models.flux.tokenizer import FluxTokenizerContainer
 from torchtitan.models.flux.utils import (
     create_position_encoding_for_latents,
+    IMAGE_LATENT_SIZE_RATIO,
     pack_latents,
+    PATCH_HEIGHT,
+    PATCH_WIDTH,
     preprocess_data,
 )
 from torchtitan.trainer import Trainer
@@ -26,21 +34,42 @@ from torchtitan.trainer import Trainer
 class FluxTrainer(Trainer):
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
-        encoder: Encoder = field(default_factory=Encoder)
-        validation: Validation = field(default_factory=Validation)
+        # Overwrite parent class tokenizer
+        tokenizer: FluxTokenizerContainer.Config = (  # pyrefly: ignore [bad-override]
+            field(default_factory=FluxTokenizerContainer.Config)
+        )
+        encoder: FluxEncoderConfig = field(default_factory=FluxEncoderConfig)
+        """Configuration for Flux encoders (T5 text encoder, CLIP text encoder, and autoencoder)."""
         inference: Inference = field(default_factory=Inference)
 
     def __init__(self, config: Config):
+        # Compute image token count: autoencoder downscales the image,
+        # then pack_latents tiles the latent into 2×2 patches.
+        # pyrefly: ignore [missing-attribute]
+        img_size = config.dataloader.img_size
+        ae_downscale = IMAGE_LATENT_SIZE_RATIO
+        latent_side_width = img_size // ae_downscale // PATCH_WIDTH
+        latent_side_height = img_size // ae_downscale // PATCH_HEIGHT
+        seq_len_img = latent_side_width * latent_side_height
+
+        seq_len_txt = config.tokenizer.max_t5_encoding_len
+        config.training.seq_len = seq_len_img + seq_len_txt
+
         super().__init__(config)
 
         # Set random seed, and maybe enable deterministic mode
         # (mainly for debugging, expect perf loss).
         # For Flux model, we need distinct seed across FSDP ranks to ensure we randomly dropout prompts info in dataloader
+        distinct_seed_mesh_dims = (
+            ["cp", "dp_shard", "dp_replicate"]
+            if config.parallelism.spmd_backend in ("full_dtensor", "spmd_types")
+            else ["fsdp", "dp_replicate"]
+        )
         dist_utils.set_determinism(
             self.parallel_dims,
             self.device,
             config.debug,
-            distinct_seed_mesh_dims=["fsdp", "dp_replicate"],
+            distinct_seed_mesh_dims=distinct_seed_mesh_dims,
         )
 
         # NOTE: self._dtype is the data type used for encoders (image encoder, T5 text encoder, CLIP text encoder).
@@ -56,38 +85,47 @@ class FluxTrainer(Trainer):
         # load components
         assert config.model_spec is not None
         model_args = config.model_spec.model
+        assert isinstance(model_args, FluxModel.Config)
 
         self.autoencoder = load_ae(
-            # pyrefly: ignore [missing-attribute]
             config.encoder.autoencoder_path,
-            # pyrefly: ignore [missing-attribute]
-            model_args.autoencoder_params,
+            model_args.autoencoder,
             device=self.device,
             dtype=self._dtype,
-            # pyrefly: ignore [missing-attribute]
-            random_init=config.encoder.test_mode,
+            random_init=config.encoder.random_init,
         )
 
-        self.clip_encoder = FluxEmbedder(
-            # pyrefly: ignore [missing-attribute]
-            version=config.encoder.clip_encoder,
-            # pyrefly: ignore [missing-attribute]
-            random_init=config.encoder.test_mode,
-        ).to(device=self.device, dtype=self._dtype)
-        self.t5_encoder = FluxEmbedder(
-            # pyrefly: ignore [missing-attribute]
-            version=config.encoder.t5_encoder,
-            # pyrefly: ignore [missing-attribute]
-            random_init=config.encoder.test_mode,
-        ).to(device=self.device, dtype=self._dtype)
+        # Use the encoder configs from the model registry, overriding version
+        # and random_init from the trainer encoder config if set.
+        clip_encoder_config = model_args.clip_encoder
+        t5_encoder_config = model_args.t5_encoder
+        self.clip_encoder = (
+            replace(
+                clip_encoder_config,
+                version=config.encoder.clip_encoder or clip_encoder_config.version,
+                random_init=config.encoder.random_init,
+            )
+            .build()
+            .to(device=self.device, dtype=self._dtype)
+        )
+
+        self.t5_encoder = (
+            replace(
+                t5_encoder_config,
+                version=config.encoder.t5_encoder or t5_encoder_config.version,
+                random_init=config.encoder.random_init,
+            )
+            .build()
+            .to(device=self.device, dtype=self._dtype)
+        )
 
         # Apply FSDP to the T5 model / CLIP model
-        # pyrefly: ignore [bad-assignment]
         self.t5_encoder, self.clip_encoder = parallelize_encoders(
             t5_model=self.t5_encoder,
             clip_model=self.clip_encoder,
             parallel_dims=self.parallel_dims,
             training=config.training,
+            enable_symm_mem=config.parallelism.enable_fsdp_symm_mem,
         )
 
         if config.validator.enable:
@@ -98,15 +136,37 @@ class FluxTrainer(Trainer):
                 autoencoder=self.autoencoder,
                 t5_encoder=self.t5_encoder,
                 clip_encoder=self.clip_encoder,
-                trainer_config=config,
+                dump_folder=config.dump_folder,
             )
+
+    def batch_generator(
+        self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+    ) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        """Override to count transformer tokens (image patches + text tokens)
+        instead of raw pixel count from labels.numel().
+        """
+        data_iterator = iter(data_iterable)
+        while True:
+            data_load_start = time.perf_counter()
+            try:
+                batch = next(data_iterator)
+            except StopIteration as ex:
+                raise DataloaderExhaustedError() from ex
+            input_dict, labels = batch
+            bsz = labels.shape[0]
+            ntokens_batch = bsz * self.config.training.seq_len
+            self.metrics_processor.ntokens_since_last_log += ntokens_batch
+            self.metrics_processor.data_loading_times.append(
+                time.perf_counter() - data_load_start
+            )
+            yield input_dict, labels
 
     def forward_backward_step(
         self,
         *,
         input_dict: dict[str, torch.Tensor],
         labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor | None = None,
+        global_valid_tokens: float | None = None,
     ) -> torch.Tensor:
         """
         Perform a single forward and backward pass through the model.
@@ -114,7 +174,8 @@ class FluxTrainer(Trainer):
         Args:
             input_dict: Dictionary containing input data including prompts and other metadata
             labels: Target tensor containing the ground truth image data
-            global_valid_tokens: Optional tensor tracking the total number of valid tokens across all processes.
+            global_valid_tokens: Optional float tracking the total number of
+                valid tokens across all processes.
                 This field is a placeholder for now as we rescale the loss within forward_backward_step for FLUX.
 
         Returns:
@@ -144,10 +205,9 @@ class FluxTrainer(Trainer):
 
         if self.parallel_dims.dp_enabled:
             batch_mesh = self.parallel_dims.get_mesh("batch")
-            # pyrefly: ignore [bad-assignment]
             global_valid_tokens = dist_utils.dist_sum(local_valid_tokens, batch_mesh)
         else:
-            global_valid_tokens = local_valid_tokens.float()
+            global_valid_tokens = float(local_valid_tokens.item())
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
@@ -197,25 +257,37 @@ class FluxTrainer(Trainer):
                 load_balancer_type=None,
             )
 
-        with self.train_context():
-            with self.maybe_enable_amp:
-                latent_noise_pred = model(
-                    img=latents,
-                    img_ids=latent_pos_enc,
-                    txt=t5_encodings,
-                    txt_ids=text_pos_enc,
-                    y=clip_encodings,
-                    timesteps=timesteps,
-                )
+        # Accumulate after CP sharding so the count reflects the actual
+        # unique tokens this rank processes (not the full pre-split sequence).
+        self.ntokens_seen += bsz * self.config.training.seq_len // self.parallel_dims.cp
 
-                # Scale loss as we used SUM reduction for mse loss function
-                # pyrefly: ignore [unsupported-operation]
-                loss = self.loss_fn(latent_noise_pred, target) / global_valid_tokens
+        with self.train_context():
+            annotate_flux_forward_inputs(
+                latents=latents,
+                latent_pos_enc=latent_pos_enc,
+                t5_encodings=t5_encodings,
+                text_pos_enc=text_pos_enc,
+                target=target,
+                clip_encodings=clip_encodings,
+                timesteps=timesteps,
+            )
+            latent_noise_pred = model(
+                img=latents,
+                img_ids=latent_pos_enc,
+                txt=t5_encodings,
+                txt_ids=text_pos_enc,
+                y=clip_encodings,
+                timesteps=timesteps,
+            )
+
+            # Scale loss as we used SUM reduction for mse loss function
+            loss, _ = self.loss_fn(latent_noise_pred, target, global_valid_tokens)
             # latent_noise_pred.shape=(bs, seq_len, vocab_size)
             # need to free to before bwd to avoid peaking memory
             # pyrefly: ignore[unsupported-delete]
             del (latent_noise_pred, noise, target)
-            loss.backward()
+            with spmd.no_typecheck():
+                loss.backward()
 
         return loss
 
@@ -269,7 +341,7 @@ class FluxTrainer(Trainer):
                 ),
             )
         else:
-            global_avg_loss = global_max_loss = loss.detach().item()
+            global_avg_loss = global_max_loss = float(loss.detach().item())
             global_ntokens_seen = self.ntokens_seen
 
         extra_metrics = {
@@ -280,6 +352,6 @@ class FluxTrainer(Trainer):
             self.step,
             global_avg_loss,
             global_max_loss,
-            grad_norm.item(),
+            float(grad_norm.item()),
             extra_metrics=extra_metrics,
         )

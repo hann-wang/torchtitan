@@ -9,9 +9,9 @@ from functools import partial
 
 import torch
 import torch.nn as nn
-from torchtitan.components.loss import build_cross_entropy_loss
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
+from torchtitan.models.common.nn_modules import Linear
 from torchtitan.models.llama3 import model_registry, parallelize_llama
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
@@ -22,7 +22,7 @@ class FakeModel(BaseModel):
     class Config(BaseModel.Config):
         hidden: int = 8
 
-        def update_from_config(self, *, trainer_config, **kwargs):
+        def update_from_config(self, *, config, **kwargs):
             pass
 
         def get_nparams_and_flops(self, model, seq_len):
@@ -30,13 +30,16 @@ class FakeModel(BaseModel):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.linear = nn.Linear(config.hidden, config.hidden)
+        linear_cfg = Linear.Config(
+            in_features=config.hidden, out_features=config.hidden
+        )
+        self.linear = linear_cfg.build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x)
 
-    def init_weights(self, buffer_device: torch.device | None = None) -> None:
-        nn.init.normal_(self.linear.weight, mean=0.0, std=0.02)
+    def _init_self_parameters(self) -> None:
+        nn.init.trunc_normal_(self.linear.weight, std=0.02)
 
 
 def fake_post_optimizer_build_fn(
@@ -59,7 +62,6 @@ class TestModelSpec:
         assert spec.flavor == "debugmodel"
         assert spec.model is not None
         assert spec.parallelize_fn == parallelize_llama
-        assert spec.build_loss_fn == build_cross_entropy_loss
 
     def test_model_spec_creation(self):
         fake_config = FakeModel.Config()
@@ -69,7 +71,6 @@ class TestModelSpec:
             model=fake_config,
             parallelize_fn=parallelize_llama,
             pipelining_fn=None,
-            build_loss_fn=build_cross_entropy_loss,
             post_optimizer_build_fn=None,
             state_dict_adapter=None,
         )
@@ -86,7 +87,6 @@ class TestModelSpec:
             model=fake_config,
             parallelize_fn=parallelize_llama,
             pipelining_fn=None,
-            build_loss_fn=build_cross_entropy_loss,
             post_optimizer_build_fn=fake_post_optimizer_build_fn,
             state_dict_adapter=None,
         )
@@ -108,12 +108,18 @@ class TestModelSpec:
 
         # Build optimizers directly and apply post-build hook
         optimizers = OptimizersContainer.Config(
-            name="Adam",
-            lr=0.1,
-            beta1=0.9,
-            beta2=0.95,
-            weight_decay=0.1,
             implementation="fused",
+            param_groups=[
+                ParamGroupConfig(
+                    pattern=r".*",
+                    optimizer_name="Adam",
+                    optimizer_kwargs={
+                        "lr": 0.1,
+                        "betas": (0.9, 0.95),
+                        "weight_decay": 0.1,
+                    },
+                ),
+            ],
         ).build(model_parts=model_parts)
         spec.post_optimizer_build_fn(optimizers, model_parts, None, my_hook)
 

@@ -12,37 +12,38 @@ from einops import rearrange
 from safetensors.torch import load_file as load_sft
 from torch import nn, Tensor
 
-
-@dataclass
-class AutoEncoderParams:
-    resolution: int = 256
-    in_channels: int = 3
-    ch: int = 128
-    out_ch: int = 3
-    ch_mult: tuple[int, ...] = (1, 2, 4, 4)
-    num_res_blocks: int = 2
-    z_channels: int = 16
-    scale_factor: float = 0.3611
-    shift_factor: float = 0.1159
+from torchtitan.models.common.nn_modules import Conv2d, GroupNorm
+from torchtitan.protocols.module import Module, ModuleList
 
 
 def swish(x: Tensor) -> Tensor:
     return x * torch.sigmoid(x)
 
 
-class AttnBlock(nn.Module):
-    def __init__(self, in_channels: int):
+def _norm(num_channels: int) -> GroupNorm.Config:
+    return GroupNorm.Config(num_groups=32, num_channels=num_channels, eps=1e-6)
+
+
+class AttnBlock(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        in_channels: int
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.in_channels = in_channels
+        self.in_channels = config.in_channels
 
-        self.norm = nn.GroupNorm(
-            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
+        self.norm = _norm(config.in_channels).build()
+
+        conv1x1 = Conv2d.Config(
+            in_channels=config.in_channels,
+            out_channels=config.in_channels,
+            kernel_size=1,
         )
-
-        self.q = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.k = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.v = nn.Conv2d(in_channels, in_channels, kernel_size=1)
-        self.proj_out = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.q = conv1x1.build()
+        self.k = conv1x1.build()
+        self.v = conv1x1.build()
+        self.proj_out = conv1x1.build()
 
     def attention(self, h_: Tensor) -> Tensor:
         h_ = self.norm(h_)
@@ -62,29 +63,37 @@ class AttnBlock(nn.Module):
         return x + self.proj_out(self.attention(x))
 
 
-class ResnetBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.in_channels = in_channels
-        out_channels = in_channels if out_channels is None else out_channels
-        self.out_channels = out_channels
+class ResnetBlock(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        in_channels: int
+        out_channels: int
 
-        self.norm1 = nn.GroupNorm(
-            num_groups=32, num_channels=in_channels, eps=1e-6, affine=True
-        )
-        self.conv1 = nn.Conv2d(
-            in_channels, out_channels, kernel_size=3, stride=1, padding=1
-        )
-        self.norm2 = nn.GroupNorm(
-            num_groups=32, num_channels=out_channels, eps=1e-6, affine=True
-        )
-        self.conv2 = nn.Conv2d(
-            out_channels, out_channels, kernel_size=3, stride=1, padding=1
-        )
+    def __init__(self, config: Config):
+        super().__init__()
+        self.in_channels = config.in_channels
+        self.out_channels = config.out_channels
+
+        self.norm1 = _norm(config.in_channels).build()
+        self.conv1 = Conv2d.Config(
+            in_channels=config.in_channels,
+            out_channels=config.out_channels,
+            kernel_size=3,
+            padding=1,
+        ).build()
+        self.norm2 = _norm(config.out_channels).build()
+        self.conv2 = Conv2d.Config(
+            in_channels=config.out_channels,
+            out_channels=config.out_channels,
+            kernel_size=3,
+            padding=1,
+        ).build()
         if self.in_channels != self.out_channels:
-            self.nin_shortcut = nn.Conv2d(
-                in_channels, out_channels, kernel_size=1, stride=1, padding=0
-            )
+            self.nin_shortcut = Conv2d.Config(
+                in_channels=config.in_channels,
+                out_channels=config.out_channels,
+                kernel_size=1,
+            ).build()
 
     def forward(self, x):
         h = x
@@ -102,13 +111,20 @@ class ResnetBlock(nn.Module):
         return x + h
 
 
-class Downsample(nn.Module):
-    def __init__(self, in_channels: int):
+class Downsample(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        in_channels: int
+
+    def __init__(self, config: Config):
         super().__init__()
         # no asymmetric padding in torch conv, must do it ourselves
-        self.conv = nn.Conv2d(
-            in_channels, in_channels, kernel_size=3, stride=2, padding=0
-        )
+        self.conv = Conv2d.Config(
+            in_channels=config.in_channels,
+            out_channels=config.in_channels,
+            kernel_size=3,
+            stride=2,
+        ).build()
 
     def forward(self, x: Tensor):
         pad = (0, 1, 0, 1)
@@ -117,12 +133,19 @@ class Downsample(nn.Module):
         return x
 
 
-class Upsample(nn.Module):
-    def __init__(self, in_channels: int):
+class Upsample(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        in_channels: int
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.conv = nn.Conv2d(
-            in_channels, in_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.conv = Conv2d.Config(
+            in_channels=config.in_channels,
+            out_channels=config.in_channels,
+            kernel_size=3,
+            padding=1,
+        ).build()
 
     def forward(self, x: Tensor):
         x = nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
@@ -130,61 +153,73 @@ class Upsample(nn.Module):
         return x
 
 
-class Encoder(nn.Module):
-    def __init__(
-        self,
-        resolution: int,
-        in_channels: int,
-        ch: int,
-        ch_mult: list[int],
-        num_res_blocks: int,
-        z_channels: int,
-    ):
-        super().__init__()
-        self.ch = ch
-        self.num_resolutions = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.resolution = resolution
-        self.in_channels = in_channels
-        # downsampling
-        self.conv_in = nn.Conv2d(
-            in_channels, self.ch, kernel_size=3, stride=1, padding=1
-        )
+class Encoder(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        resolution: int
+        in_channels: int
+        ch: int
+        ch_mult: tuple[int, ...]
+        num_res_blocks: int
+        z_channels: int
 
-        curr_res = resolution
-        in_ch_mult = (1,) + tuple(ch_mult)
-        self.in_ch_mult = in_ch_mult
-        self.down = nn.ModuleList()
+    def __init__(self, config: Config):
+        super().__init__()
+        self.ch = config.ch
+        self.num_resolutions = len(config.ch_mult)
+        self.num_res_blocks = config.num_res_blocks
+        self.resolution = config.resolution
+        self.in_channels = config.in_channels
+        # downsampling
+        self.conv_in = Conv2d.Config(
+            in_channels=config.in_channels,
+            out_channels=self.ch,
+            kernel_size=3,
+            padding=1,
+        ).build()
+
+        curr_res = config.resolution
+        in_ch_mult = (1,) + tuple(config.ch_mult)
+        self.down = ModuleList()
         block_in = self.ch
         for i_level in range(self.num_resolutions):
-            block = nn.ModuleList()
-            attn = nn.ModuleList()
-            block_in = ch * in_ch_mult[i_level]
-            block_out = ch * ch_mult[i_level]
+            block = ModuleList()
+            attn = ModuleList()
+            block_in = config.ch * in_ch_mult[i_level]
+            block_out = config.ch * config.ch_mult[i_level]
             for _ in range(self.num_res_blocks):
-                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
+                block.append(
+                    ResnetBlock.Config(
+                        in_channels=block_in, out_channels=block_out
+                    ).build()
+                )
                 block_in = block_out
-            down = nn.Module()
+            down = Module()
             down.block = block
             down.attn = attn
             if i_level != self.num_resolutions - 1:
-                down.downsample = Downsample(block_in)
+                down.downsample = Downsample.Config(in_channels=block_in).build()
                 curr_res = curr_res // 2
             self.down.append(down)
 
         # middle
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+        self.mid = Module()
+        self.mid.block_1 = ResnetBlock.Config(
+            in_channels=block_in, out_channels=block_in
+        ).build()
+        self.mid.attn_1 = AttnBlock.Config(in_channels=block_in).build()
+        self.mid.block_2 = ResnetBlock.Config(
+            in_channels=block_in, out_channels=block_in
+        ).build()
 
         # end
-        self.norm_out = nn.GroupNorm(
-            num_groups=32, num_channels=block_in, eps=1e-6, affine=True
-        )
-        self.conv_out = nn.Conv2d(
-            block_in, 2 * z_channels, kernel_size=3, stride=1, padding=1
-        )
+        self.norm_out = _norm(block_in).build()
+        self.conv_out = Conv2d.Config(
+            in_channels=block_in,
+            out_channels=2 * config.z_channels,
+            kernel_size=3,
+            padding=1,
+        ).build()
 
     def forward(self, x: Tensor) -> Tensor:
         # downsampling
@@ -217,63 +252,78 @@ class Encoder(nn.Module):
         return h
 
 
-class Decoder(nn.Module):
-    def __init__(
-        self,
-        ch: int,
-        out_ch: int,
-        ch_mult: list[int],
-        num_res_blocks: int,
-        in_channels: int,
-        resolution: int,
-        z_channels: int,
-    ):
+class Decoder(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        ch: int
+        out_ch: int
+        ch_mult: tuple[int, ...]
+        num_res_blocks: int
+        in_channels: int
+        resolution: int
+        z_channels: int
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.ch = ch
-        self.num_resolutions = len(ch_mult)
-        self.num_res_blocks = num_res_blocks
-        self.resolution = resolution
-        self.in_channels = in_channels
+        self.ch = config.ch
+        self.num_resolutions = len(config.ch_mult)
+        self.num_res_blocks = config.num_res_blocks
+        self.resolution = config.resolution
+        self.in_channels = config.in_channels
         self.ffactor = 2 ** (self.num_resolutions - 1)
 
         # compute in_ch_mult, block_in and curr_res at lowest res
-        block_in = ch * ch_mult[self.num_resolutions - 1]
-        curr_res = resolution // 2 ** (self.num_resolutions - 1)
-        self.z_shape = (1, z_channels, curr_res, curr_res)
+        block_in = config.ch * config.ch_mult[self.num_resolutions - 1]
+        curr_res = config.resolution // 2 ** (self.num_resolutions - 1)
+        self.z_shape = (1, config.z_channels, curr_res, curr_res)
 
         # z to block_in
-        self.conv_in = nn.Conv2d(
-            z_channels, block_in, kernel_size=3, stride=1, padding=1
-        )
+        self.conv_in = Conv2d.Config(
+            in_channels=config.z_channels,
+            out_channels=block_in,
+            kernel_size=3,
+            padding=1,
+        ).build()
 
         # middle
-        self.mid = nn.Module()
-        self.mid.block_1 = ResnetBlock(in_channels=block_in, out_channels=block_in)
-        self.mid.attn_1 = AttnBlock(block_in)
-        self.mid.block_2 = ResnetBlock(in_channels=block_in, out_channels=block_in)
+        self.mid = Module()
+        self.mid.block_1 = ResnetBlock.Config(
+            in_channels=block_in, out_channels=block_in
+        ).build()
+        self.mid.attn_1 = AttnBlock.Config(in_channels=block_in).build()
+        self.mid.block_2 = ResnetBlock.Config(
+            in_channels=block_in, out_channels=block_in
+        ).build()
 
         # upsampling
-        self.up = nn.ModuleList()
+        self.up = ModuleList()
         for i_level in reversed(range(self.num_resolutions)):
-            block = nn.ModuleList()
-            attn = nn.ModuleList()
-            block_out = ch * ch_mult[i_level]
+            block = ModuleList()
+            attn = ModuleList()
+            block_out = config.ch * config.ch_mult[i_level]
             for _ in range(self.num_res_blocks + 1):
-                block.append(ResnetBlock(in_channels=block_in, out_channels=block_out))
+                block.append(
+                    ResnetBlock.Config(
+                        in_channels=block_in, out_channels=block_out
+                    ).build()
+                )
                 block_in = block_out
-            up = nn.Module()
+            up = Module()
             up.block = block
             up.attn = attn
             if i_level != 0:
-                up.upsample = Upsample(block_in)
+                up.upsample = Upsample.Config(in_channels=block_in).build()
                 curr_res = curr_res * 2
             self.up.insert(0, up)  # prepend to get consistent order
 
         # end
-        self.norm_out = nn.GroupNorm(
-            num_groups=32, num_channels=block_in, eps=1e-6, affine=True
-        )
-        self.conv_out = nn.Conv2d(block_in, out_ch, kernel_size=3, stride=1, padding=1)
+        self.norm_out = _norm(block_in).build()
+        self.conv_out = Conv2d.Config(
+            in_channels=block_in,
+            out_channels=config.out_ch,
+            kernel_size=3,
+            padding=1,
+        ).build()
 
     def forward(self, z: Tensor) -> Tensor:
         # get dtype for proper tracing
@@ -312,11 +362,16 @@ class Decoder(nn.Module):
         return h
 
 
-class DiagonalGaussian(nn.Module):
-    def __init__(self, sample: bool = True, chunk_dim: int = 1):
+class DiagonalGaussian(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        sample: bool = True
+        chunk_dim: int = 1
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.sample = sample
-        self.chunk_dim = chunk_dim
+        self.sample = config.sample
+        self.chunk_dim = config.chunk_dim
 
     def forward(self, z: Tensor) -> Tensor:
         mean, logvar = torch.chunk(z, 2, dim=self.chunk_dim)
@@ -327,33 +382,42 @@ class DiagonalGaussian(nn.Module):
             return mean
 
 
-class AutoEncoder(nn.Module):
-    def __init__(self, params: AutoEncoderParams):
-        super().__init__()
-        self.params = params
-        self.encoder = Encoder(
-            resolution=params.resolution,
-            in_channels=params.in_channels,
-            ch=params.ch,
-            # pyrefly: ignore [bad-argument-type]
-            ch_mult=params.ch_mult,
-            num_res_blocks=params.num_res_blocks,
-            z_channels=params.z_channels,
-        )
-        self.decoder = Decoder(
-            resolution=params.resolution,
-            in_channels=params.in_channels,
-            ch=params.ch,
-            out_ch=params.out_ch,
-            # pyrefly: ignore [bad-argument-type]
-            ch_mult=params.ch_mult,
-            num_res_blocks=params.num_res_blocks,
-            z_channels=params.z_channels,
-        )
-        self.reg = DiagonalGaussian()
+class AutoEncoder(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        resolution: int = 256
+        in_channels: int = 3
+        ch: int = 128
+        out_ch: int = 3
+        ch_mult: tuple[int, ...] = (1, 2, 4, 4)
+        num_res_blocks: int = 2
+        z_channels: int = 16
+        scale_factor: float = 0.3611
+        shift_factor: float = 0.1159
 
-        self.scale_factor = params.scale_factor
-        self.shift_factor = params.shift_factor
+    def __init__(self, config: Config):
+        super().__init__()
+        self.encoder = Encoder.Config(
+            resolution=config.resolution,
+            in_channels=config.in_channels,
+            ch=config.ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            z_channels=config.z_channels,
+        ).build()
+        self.decoder = Decoder.Config(
+            resolution=config.resolution,
+            in_channels=config.in_channels,
+            ch=config.ch,
+            out_ch=config.out_ch,
+            ch_mult=config.ch_mult,
+            num_res_blocks=config.num_res_blocks,
+            z_channels=config.z_channels,
+        ).build()
+        self.reg = DiagonalGaussian.Config().build()
+
+        self.scale_factor = config.scale_factor
+        self.shift_factor = config.shift_factor
 
     def encode(self, x: Tensor) -> Tensor:
         z = self.reg(self.encoder(x))
@@ -370,22 +434,22 @@ class AutoEncoder(nn.Module):
 
 def load_ae(
     ckpt_path: str,
-    autoencoder_params: AutoEncoderParams,
+    autoencoder_config: AutoEncoder.Config,
     device: str | torch.device = "cuda",
     dtype=torch.bfloat16,
     random_init=False,
 ) -> AutoEncoder:
-    """
-    Load the autoencoder from the given model name.
+    """Build the autoencoder from a Config and optionally load weights.
+
     Args:
-        name (str): The name of the autoencoder.
-        device (str or torch.device): The device to load the autoencoder to.
-    Returns:
-        AutoEncoder: The loaded autoencoder.
+        ckpt_path: Path to the autoencoder checkpoint.
+        autoencoder_config: AutoEncoder.Config to instantiate.
+        device: Device to load the autoencoder to.
+        dtype: Target dtype after loading.
+        random_init: If True, skip checkpoint loading.
     """
-    # Loading the autoencoder
     with torch.device(device):
-        ae = AutoEncoder(autoencoder_params)
+        ae = autoencoder_config.build()
 
     if random_init:
         return ae.to(dtype=dtype)

@@ -9,12 +9,15 @@
 from dataclasses import dataclass
 
 import torch
-from torch import nn
+import torch.nn as nn
 
-from torchtitan.models.common.attention import AttentionMasksType, GQAttention
+from torchtitan.models.common.attention import (
+    AttentionMasksType,
+    GQAttention,
+    VarlenAttention,
+)
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
-from torchtitan.tools.logging import logger
 
 
 class Qwen3TransformerBlock(TransformerBlock):
@@ -30,58 +33,37 @@ class Qwen3TransformerBlock(TransformerBlock):
 
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
-        depth_init: bool = True
-        moe_enabled: bool = False
+        pass
 
-    def __init__(self, config: Config, *, layer_id: int, dim: int, n_layers: int):
+    def __init__(self, config: Config):
         super().__init__()
 
-        self.attention = config.attention.build(dim=dim)
+        self.attention = config.attention.build()
 
-        self.moe_enabled = config.moe_enabled
+        self.moe_enabled = config.moe is not None
         if self.moe_enabled:
             assert config.moe is not None
-            self.moe = config.moe.build(dim=dim)
+            self.moe = config.moe.build()
         else:
             assert config.feed_forward is not None
-            self.feed_forward = config.feed_forward.build(dim=dim)
+            self.feed_forward = config.feed_forward.build()
 
-        self.attention_norm = config.attention_norm.build(normalized_shape=dim)
-        self.ffn_norm = config.ffn_norm.build(normalized_shape=dim)
-
-        if config.depth_init:
-            self.weight_init_std = 0.02 / (2 * (layer_id + 1)) ** 0.5
-        else:
-            self.weight_init_std = 0.02 / (2 * n_layers) ** 0.5
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
 
     def forward(
         self,
         x: torch.Tensor,
-        freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
-        x = x + self.attention(
-            self.attention_norm(x), freqs_cis, attention_masks, positions
-        )
+        x = x + self.attention(self.attention_norm(x), attention_masks, positions)
 
         if self.moe_enabled:
             x = x + self.moe(self.ffn_norm(x))
         else:
             x = x + self.feed_forward(self.ffn_norm(x))
         return x
-
-    def init_weights(self, **kwargs):
-        buffer_device: torch.device | None = kwargs.get("buffer_device")
-        for norm in (self.attention_norm, self.ffn_norm):
-            norm.init_weights()
-        self.attention.init_weights(self.weight_init_std)
-        if self.moe_enabled:
-            self.moe.init_weights(
-                init_std=self.weight_init_std, buffer_device=buffer_device
-            )
-        else:
-            self.feed_forward.init_weights(self.weight_init_std)
 
 
 class Qwen3Model(Decoder):
@@ -95,57 +77,43 @@ class Qwen3Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         dim: int = 1024
-        n_layers: int = 28
         vocab_size: int = 151936
-        norm_eps: float = 1e-6
-        layer: TransformerBlock.Config
 
         def update_from_config(
             self,
             *,
-            trainer_config,
+            config,
             **kwargs,
         ) -> None:
-            training = trainer_config.training
-            parallelism = trainer_config.parallelism
-            debug = trainer_config.debug
-            seq_len = training.seq_len
-            if seq_len > self.rope.max_seq_len:
-                logger.warning(
-                    f"Sequence length {seq_len} exceeds original maximum {self.rope.max_seq_len}."
-                )
-            # Sync rope max_seq_len
-            import dataclasses as _dc
+            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            parallelism = config.parallelism
 
-            self.rope = _dc.replace(self.rope, max_seq_len=seq_len)
-
-            if self.layer.moe is not None:
-                self.layer.moe._debug_force_load_balance = debug.moe_force_load_balance
-
-            if (
-                parallelism.context_parallel_degree > 1
-                and self.layer.attention.attn_backend == "varlen"
+            if parallelism.context_parallel_degree > 1 and isinstance(
+                self.layers[0].attention.inner_attention, VarlenAttention.Config
             ):
                 raise NotImplementedError(
-                    f"Context Parallel only supports SDPA and FlexAttention."
-                    f"Got attn_backend='{self.layer.attention.attn_backend}'. "
-                    f"Varlen attention is not supported with CP."
+                    "Context Parallel only supports SDPA and FlexAttention. "
+                    "Varlen attention is not supported with CP."
                 )
 
-            if self.enable_weight_tying and parallelism.pipeline_parallel_degree > 1:
-                raise NotImplementedError(
-                    "Weight tying is not supported with Pipeline Parallel."
-                )
+            from torchtitan.models.qwen3.sharding import set_qwen3_sharding_config
+
+            set_qwen3_sharding_config(
+                self,
+                enable_sp=parallelism.enable_sequence_parallel,
+                enable_ep=parallelism.expert_parallel_degree > 1,
+            )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
         ) -> tuple[int, int]:
-            assert isinstance(self.layer.attention, GQAttention.Config)
-            assert self.layer.attention.head_dim is not None
+
+            assert isinstance(self.layers[0].attention, GQAttention.Config)
+            assert self.layers[0].attention.head_dim is not None
             return get_moe_model_nparams_and_flops(
                 self,
                 model,
-                self.layer.attention.n_heads,
-                2 * self.layer.attention.head_dim,
+                self.layers[0].attention.n_heads,
+                2 * self.layers[0].attention.head_dim,
                 seq_len,
             )
