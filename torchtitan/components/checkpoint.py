@@ -371,8 +371,6 @@ class CheckpointManager(Configurable):
         use seed checkpoints to validate model correctness. Enabling this option allows
         checkpoints to be loaded without saving any during the training.
         """
-        
-        allow_partial_load: bool = False
 
         def __post_init__(self):
             if not self.folder.strip():
@@ -424,6 +422,8 @@ class CheckpointManager(Configurable):
                     "an initial_load_path."
                 )
 
+    allow_partial_load: bool = False
+
     def __init__(
         self,
         config: Config,
@@ -461,7 +461,6 @@ class CheckpointManager(Configurable):
         self.initial_load_model_only = config.initial_load_model_only
         self.initial_load_in_hf = config.initial_load_in_hf
         self.initial_load_in_hf_quantized = config.initial_load_in_hf_quantized
-        self.allow_partial_load = config.allow_partial_load
 
         self.enable_first_step_checkpoint = config.enable_first_step_checkpoint
         self.last_save_model_only = config.last_save_model_only

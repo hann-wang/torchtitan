@@ -113,17 +113,23 @@ def llama3_debugmodel_ce_loss() -> Trainer.Config:
 
 
 def llama3_1b() -> Trainer.Config:
+    model_spec = model_registry("1B")
     return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
         hf_assets_path="./assets/hf/Llama-3.1-1B",
-        profiling=ProfilingConfig(
+        profiler=Profiler.Config(
             enable_profiling=True,
             profile_freq=100,
         ),
         metrics=MetricsProcessor.Config(
             enable_tensorboard=True,
         ),
-        model_spec=model_registry("1B"),
-        optimizer=OptimizersContainer.Config(lr=4e-5),
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=4e-5),
         training=TrainingConfig(
             local_batch_size=1,
             seq_len=8192,
@@ -133,10 +139,7 @@ def llama3_1b() -> Trainer.Config:
             dataset="c4",
         ),
         checkpoint=CheckpointManager.Config(interval=500),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-            selective_ac_option="op",
-        ),
+        activation_checkpoint=SelectiveAC.Config(),
         validator=Validator.Config(
             freq=500,
             steps=1200,

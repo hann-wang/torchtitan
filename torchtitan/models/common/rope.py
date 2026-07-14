@@ -137,8 +137,9 @@ class RoPE(Module):
         """
         raise NotImplementedError
 
-    @staticmethod
+    @classmethod
     def apply_rotary_emb(
+        cls,
         query: torch.Tensor,
         key: torch.Tensor,
         rope_cache: torch.Tensor,
@@ -251,8 +252,9 @@ class ComplexRoPE(RoPE):
         complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
         return _reshape_for_broadcast(self.cache, complex_query_shape, positions)
 
-    @staticmethod
+    @classmethod
     def apply_rotary_emb(
+        cls,
         query: torch.Tensor,
         key: torch.Tensor,
         rope_cache: torch.Tensor,
@@ -322,8 +324,9 @@ class CosSinRoPE(RoPE):
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
         return _reshape_for_broadcast(self.cache, query.shape, positions)
 
-    @staticmethod
+    @classmethod
     def apply_rotary_emb(
+        cls,
         query: torch.Tensor,
         key: torch.Tensor,
         rope_cache: torch.Tensor,
