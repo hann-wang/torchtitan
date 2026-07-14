@@ -1,6 +1,6 @@
 #!/bin/bash
 
-IMAGE=ghcr.io/amd-agi/han-workspace:ubuntu22.04-pytorch2.12.0dev20260217-rocm7.2-patch
+IMAGE=wanghanthu/workspace:ubuntu22.04-pytorch2.14.0dev20260707-rocm7.2
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 GID_RENDER=$(getent group render | cut -d: -f3)
 GID_VIDEO=$(getent group video | cut -d: -f3)

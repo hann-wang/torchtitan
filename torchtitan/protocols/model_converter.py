@@ -11,6 +11,7 @@ import torch.nn as nn
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
+from torchtitan.protocols.model import BaseModel
 
 
 class ModelConverter(Protocol):
@@ -24,6 +25,10 @@ class ModelConverter(Protocol):
 
     def convert(self, model: nn.Module):
         """Inplace conversion of the model."""
+        ...
+        
+    def convert_config(self, model_config: BaseModel.Config):
+        """Inplace conversion of the model config."""
         ...
 
     def pre_step(self, model_parts: list[nn.Module]):
@@ -82,6 +87,10 @@ class ModelConvertersContainer(Configurable, ModelConverter):
             mh.convert(model)
         if self.print_after_conversion:
             logger.info(f"Model definition after conversion:\n\n{model}\n\n")
+    
+    def convert_config(self, model_config: BaseModel.Config):
+        for mh in self.converters:
+            mh.convert_config(model_config)
 
     def pre_step(self, model_parts: list[nn.Module]):
         for mh in self.converters:

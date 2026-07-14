@@ -283,10 +283,24 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # build model (using meta init)
         model_config = model_spec.model
+
+        # Build the collection of model converters. No-op if converters empty
+        model_compile_enabled = (
+            config.compile.enable and "model" in config.compile.components
+        )
+        self.model_converters = model_converters = config.model_converters.build(
+            parallel_dims=parallel_dims,
+            model_compile_enabled=model_compile_enabled,
+        )
+
         # set the model args from training job configs
         model_config.update_from_config(
             config=config,
         )
+
+        # convert configs
+        self.model_converters.convert_config(model_config)
+
         self.model_config = model_config
 
         # Apply overrides to the full config tree, before any component is
@@ -305,14 +319,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         ):
             model = model_config.build()
 
-        # Build the collection of model converters. No-op if converters empty
-        model_compile_enabled = (
-            config.compile.enable and "model" in config.compile.components
-        )
-        self.model_converters = model_converters = config.model_converters.build(
-            parallel_dims=parallel_dims,
-            model_compile_enabled=model_compile_enabled,
-        )
         model_converters.convert(model)
 
         # Verify all submodules satisfy the Module protocol
