@@ -13,6 +13,7 @@ import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.dataloader import BaseDataLoader
 from torchtitan.components.loss import LossFunction, ChunkedLossWrapper
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
@@ -124,14 +125,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         device_module.set_device(self.device)
 
         # init distributed and build meshes
-        dist_utils.init_distributed(
-            config.comm,
-            enable_cpu_backend=config.training.enable_cpu_offload,
-        )
-        world_size = int(os.environ["WORLD_SIZE"])
-        self.parallel_dims = parallel_dims = ParallelDims.from_config(
-            config.parallelism, world_size
-        )
+        self.parallel_dims = parallel_dims = self.init_distributed()
 
         # validate dense activation sequence length evenness
         seq_len_divisor = (
@@ -189,6 +183,9 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             config=config,
         )
 
+        # convert configs
+        self.model_converters.convert_config(model_config)
+
         # Apply overrides to the full config tree, before any component is
         # built. The model config is reached via ModelSpec.traverse. Model
         # overrides must run after update_from_config above (it sets sharding
@@ -196,9 +193,6 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # loss, dataloader, …) are built later in __init__.
         if config.override.imports:
             apply_overrides(config.override, config)
-
-        # convert configs
-        self.model_converters.convert_config(model_config)
 
         with (
             torch.device("meta"),
@@ -300,16 +294,18 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                         cast(BaseModel, m).init_weights(buffer_device=buffer_device)
                     m.train()
             else:
-                # apply PT-D Tensor Parallel, activation checkpointing, torch.compile, Data Parallel
-                model = self.model_spec.parallelize_fn(
-                    model,
-                    parallel_dims=parallel_dims,
-                    training=config.training,
-                    parallelism=config.parallelism,
-                    compile_config=config.compile,
-                    ac_config=config.activation_checkpoint,
-                    dump_folder=config.dump_folder,
-                )
+                if not config.checkpoint.create_seed_checkpoint:
+                    # Skip parallelize_fn for seed checkpoints -- nothing from
+                    # it is needed (AC, compile, nD parallelism, mixed precision, etc.).
+                    model = self.model_spec.parallelize_fn(
+                        model,
+                        parallel_dims=parallel_dims,
+                        training=config.training,
+                        parallelism=config.parallelism,
+                        compile_config=config.compile,
+                        ac_config=config.activation_checkpoint,
+                        dump_folder=config.dump_folder,
+                    )
 
                 model.to_empty(device=init_device)
                 with torch.no_grad():
@@ -319,7 +315,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 model.train()
 
                 self.model_parts = [model]
-            
+
         # Set lm_head reference for ChunkedLossWrapper after model construction.
         # Non-PP: single model part always has lm_head.
         # PP: only the last stage has lm_head; non-last stages skip this.
@@ -368,20 +364,6 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
         )
 
-        self.checkpointer = config.checkpoint.build(
-            dataloader=None,
-            model_parts=self.model_parts,
-            optimizers=self.optimizers,
-            lr_schedulers=self.lr_schedulers,
-            states={"train_state": self},
-            sd_adapter=(
-                self.model_spec.state_dict_adapter(model_config, config.hf_assets_path)
-                if self.model_spec.state_dict_adapter
-                else None
-            ),
-            base_folder=config.dump_folder,
-        )
-
         self.train_context = dist_utils.get_spmd_context(
             parallel_dims=parallel_dims,
             spmd_typechecking=(
@@ -390,6 +372,38 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             ),
         )
 
+    @sl.log_trace_span("torch_distributed_init")
+    def init_distributed(self) -> ParallelDims:
+        config = self.config
+        world_size = dist_utils.init_distributed(
+            config.comm,
+            enable_cpu_backend=config.training.enable_cpu_offload,
+            base_folder=config.dump_folder,
+        )
+
+        return ParallelDims.from_config(config.parallelism, world_size)
+
+    def build_checkpointer(
+        self,
+        dataloader: BaseDataLoader | None,
+    ) -> CheckpointManager:
+        config = self.config
+        return config.checkpoint.build(
+            dataloader=dataloader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states={"train_state": self},
+            sd_adapter=(
+                self.model_spec.state_dict_adapter(
+                    self.model_config, config.hf_assets_path
+                )
+                if self.model_spec.state_dict_adapter
+                else None
+            ),
+            base_folder=config.dump_folder,
+        )
+
     def close(self) -> None:
-        if self.checkpointer:
+        if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()

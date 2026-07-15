@@ -6,7 +6,7 @@
 
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from datetime import timedelta
 from typing import Any, cast
 import math
@@ -17,8 +17,9 @@ from torch.distributed.elastic.multiprocessing.errors import record
 from torchtitan.observability import structured_logger as sl
 from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.tokenizer import HuggingFaceTokenizer
+from torchtitan.components.metrics import MetricsProcessor, ensure_pp_loss_visible
+from torchtitan.components.quantization.utils import has_quantization
+from torchtitan.components.tokenizer import BaseTokenizer
 from torchtitan.components.validate import Validator
 from torchtitan.config import ConfigManager
 from torchtitan.distributed import full_dtensor, utils as dist_utils
@@ -34,29 +35,23 @@ from .engine import ForgeEngine
 
 
 class Trainer(ForgeEngine):
-    tokenizer: HuggingFaceTokenizer | None
+    tokenizer: BaseTokenizer
     dataloader: BaseDataLoader
     validator: Validator
     metrics_processor: MetricsProcessor
 
     # additional training states
     step: int
+    ntokens_seen: int
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
     def __init__(self, config: TitanTrainer.Config):
-        if config.debug.print_config:
-            logger.info(f"Running with args: {config.to_dict()}")
-
         # NOTE: Here we are passing in Trainer.Config as a superset of ForgeEngine.Config
         super().__init__(config)
 
         # build tokenizer
-        self.tokenizer = (
-            config.tokenizer.build(tokenizer_path=config.hf_assets_path)
-            if config.tokenizer is not None
-            else None
-        )
+        self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
 
         # build dataloader
         self.dataloader = config.dataloader.build(
@@ -72,8 +67,7 @@ class Trainer(ForgeEngine):
             ),
         )
 
-        model_args = self.model_config
-        logger.info(f"Built {config.model_spec.name} {config.model_spec.flavor}")
+        self.checkpointer = self.build_checkpointer(self.dataloader)
 
         # metrics logging
         self.metrics_processor = config.metrics.build(
@@ -81,6 +75,8 @@ class Trainer(ForgeEngine):
             dump_folder=config.dump_folder,
             pp_schedule=config.parallelism.pipeline_parallel_schedule,
             config_dict=config.to_dict(),
+            has_quantization=has_quantization(self.model_config)
+            or not self.model_converters.is_empty(),
         )
         color = self.metrics_processor.color
 
@@ -90,6 +86,13 @@ class Trainer(ForgeEngine):
             f"{color.blue}Model {config.model_spec.name} {config.model_spec.flavor} "
             f"{color.red}size: {self.model_param_count:,} total parameters{color.reset}"
         )
+
+        if self.parallel_dims.pp_enabled:
+            ensure_pp_loss_visible(
+                parallel_dims=self.parallel_dims,
+                pp_schedule=config.parallelism.pipeline_parallel_schedule,
+                color=color,
+            )
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
@@ -147,13 +150,18 @@ class Trainer(ForgeEngine):
             f"gradient accumulation steps {self.gradient_accumulation_steps}, "
             f"sequence length {config.training.seq_len}, "
             f"total steps {config.training.steps} "
-            f"(warmup {config.lr_scheduler.warmup_steps})."
+            f"(warmup {config.lr_scheduler.warmup_steps})"
         )
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
-    ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
-        """Returns an iterator that processes batches from the data iterator."""
+    ) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        """Returns an iterator that processes batches from the data iterator.
+
+        Note: Tensors are yielded on CPU. The caller is responsible for moving
+        them to GPU when needed. This allows for more efficient memory usage
+        when doing gradient accumulation.
+        """
         data_iterator = iter(data_iterable)
         
         while True:
@@ -233,6 +241,7 @@ class Trainer(ForgeEngine):
 
         return inputs, labels, extra_kwargs
 
+    @sl.log_trace_span("fwd_bwd")
     def forward_backward_step(
         self,
         *,
@@ -280,8 +289,8 @@ class Trainer(ForgeEngine):
                 loss = torch.tensor([-1.0], device=self.device)
         else:
             # Non-PP forward / backward
+            assert len(model_parts) == 1
             with self.train_context():
-                assert len(model_parts) == 1
                 pred = model_parts[0](inputs, **extra_kwargs)
                 loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
                 del pred
@@ -294,7 +303,7 @@ class Trainer(ForgeEngine):
         return loss
 
     def train_step(
-        self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
         # Save per-optimizer-group learning rates for logging
@@ -305,7 +314,6 @@ class Trainer(ForgeEngine):
         parallel_dims = self.parallel_dims
 
         # Collect all microbatches on CPU and count total valid tokens
-        # Here we assume the inputs/labels are on GPU
         microbatches = []
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _microbatch in range(self.gradient_accumulation_steps):
@@ -437,7 +445,7 @@ class Trainer(ForgeEngine):
         # After checkpoint load: self.step = restored step (e.g. 100), or 0 if fresh.
         loaded_step = self.step
 
-        logger.info(f"Training starts at step {self.step + 1}.")
+        logger.info(f"Training starts at step {self.step + 1}")
 
         with self.profiler.active(
             global_step=self.step,
@@ -463,8 +471,9 @@ class Trainer(ForgeEngine):
                     # signal the profiler that the next profiling step has started
                     profiler.step()
 
-                    # reduce timeout after first train step for faster signal
-                    # (assuming lazy init and compilation are finished)
+                    # Reduce timeout after the first train step of THIS process
+                    # (assuming lazy init and compilation are finished). Use the
+                    # relative step so this fires on resumed runs too.
                     if self.step - loaded_step == 1:
                         dist_utils.set_pg_timeouts(
                             timeout=timedelta(seconds=config.comm.train_timeout_seconds),
@@ -488,15 +497,16 @@ class Trainer(ForgeEngine):
         return self.step < self.config.training.steps
 
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step}
+        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
+        self.ntokens_seen = state_dict["ntokens_seen"]
 
     def close(self) -> None:
-        if self.metrics_processor:
-            self.metrics_processor.close()
         super().close()
+        if hasattr(self, "metrics_processor") and self.metrics_processor:
+            self.metrics_processor.close()
 
 
 def main(custom_trainer_class: type[Trainer] | None = None) -> None:
@@ -512,6 +522,17 @@ def main(custom_trainer_class: type[Trainer] | None = None) -> None:
 
     config_manager = ConfigManager()
     config = config_manager.parse_args()
+
+    # NOTE: internal meta tooling relies on source="training".
+    sl.init_structured_logger(
+        source="training",
+        # pyrefly: ignore [missing-attribute]
+        output_dir=config.dump_folder,
+        # pyrefly: ignore [missing-attribute]
+        enable=config.debug.enable_structured_logging,
+    )
+    sl.log_trace_instant("structured_logger_started")
+
     trainer: Trainer | None = None
 
     try:
@@ -549,7 +570,8 @@ def main(custom_trainer_class: type[Trainer] | None = None) -> None:
     else:
         trainer.close()
         if torch.distributed.is_initialized():
-            torch.distributed.destroy_process_group()
+            with sl.log_trace_span("torch_distributed_teardown"):
+                torch.distributed.destroy_process_group()
         logger.info("Process group destroyed")
 
 
