@@ -24,6 +24,7 @@ from torchtitan.models.common.attention import (
     GQAttention,
     QKVLinear,
     VarlenAttention,
+    ScaledDotProductAttention,
 )
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.feed_forward import FeedForward
@@ -75,10 +76,7 @@ def get_attention_config(
     elif backend == "varlen":
         return VarlenAttention.Config()
     elif backend == "sdpa":
-        raise ValueError(
-            "sdpa is no longer supported for language models; positions are "
-            "always available so use flex, flex_flash, or varlen."
-        )
+        return ScaledDotProductAttention.Config()
     else:
         raise ValueError(f"Unknown backend: {backend}")
 

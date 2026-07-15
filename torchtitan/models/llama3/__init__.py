@@ -346,7 +346,7 @@ llama3_configs = {
 
 def model_registry(
     flavor: str,
-    attn_backend: str = "flex",
+    attn_backend: str = "sdpa",
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     config = llama3_configs[flavor](attn_backend=attn_backend)
