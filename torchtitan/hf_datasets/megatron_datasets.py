@@ -53,6 +53,7 @@ class MegatronTextDataset(IterableDataset, Stateful):
         # Variables for checkpointing
         self._sample_idx = 0
         self._token_buffer: list[int] = []
+        self._positions_buffer: list[int] = []
 
     def __len__(self) -> int:
         return len(self._data)
@@ -68,21 +69,41 @@ class MegatronTextDataset(IterableDataset, Stateful):
             subset = Subset(self._data, range(self._sample_idx, len(self._data)))
             return iter(subset)
 
+    def _normalize_positions(self, positions: list[int]) -> list[int]:
+        offset = positions[0]
+        if offset > 0:
+            for i, p in enumerate(positions):
+                if p == 0:
+                    break
+                positions[i] = p - offset
+        return positions
+
     def __iter__(self):
         max_buffer_token_len = 1 + self.seq_len
 
         while True:
             for sample_tokens in self._get_data_iter():
-                self._token_buffer.extend(sample_tokens.tolist())
+                sample_tokens_list = sample_tokens.tolist()
+                self._token_buffer.extend(sample_tokens_list)
                 self._sample_idx += 1
+                self._positions_buffer.extend(range(len(sample_tokens_list)))
 
                 while len(self._token_buffer) >= max_buffer_token_len:
                     x = torch.LongTensor(self._token_buffer[:max_buffer_token_len])
+                    pos = torch.LongTensor(
+                        self._normalize_positions(
+                            self._positions_buffer[:max_buffer_token_len]
+                        )
+                    )
                     # update tokens to the remaining tokens
                     self._token_buffer = self._token_buffer[max_buffer_token_len:]
+                    self._positions_buffer = self._positions_buffer[
+                        max_buffer_token_len:
+                    ]
                     input = x[:-1]
                     label = x[1:]
-                    yield {"input": input}, label
+                    positions = pos[:-1]
+                    yield {"input": input, "positions": positions}, label
 
             if not self.infinite:
                 logger.warning(f"Dataset {self.dataset_name} has run out of data")
@@ -95,10 +116,12 @@ class MegatronTextDataset(IterableDataset, Stateful):
     def load_state_dict(self, state_dict):
         self._token_buffer = state_dict["token_buffer"]
         self._sample_idx = state_dict["sample_idx"]
+        self._positions_buffer = state_dict["positions_buffer"]
 
     def state_dict(self):
         _state_dict = {
             "token_buffer": self._token_buffer,
             "sample_idx": self._sample_idx,
+            "positions_buffer": self._positions_buffer,
         }
         return _state_dict
