@@ -939,7 +939,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
                 with sl.log_trace_span("step"):
                     self.gc_handler.run(self.step)
-                    self.model_converters.pre_step(self.model_parts)
+                    self.model_converters.pre_step(self.model_parts, trainer=self)
                     try:
                         self.train_step(data_iterator)
                     except DataloaderExhaustedError:
