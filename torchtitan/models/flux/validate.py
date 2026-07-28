@@ -5,8 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 
 import torch
 import torch.nn as nn
@@ -20,6 +21,7 @@ from torchtitan.components.validate import ValidationContext, Validator
 from torchtitan.config import ParallelismConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.tools.logging import logger
+from torchtitan.tools.utils import device_module
 
 from .flux_datasets import FluxDataLoader
 from .inference.sampling import generate_image, save_image
@@ -28,6 +30,21 @@ from .model.hf_embedder import FluxEmbedder
 from .tokenizer import build_flux_tokenizer
 from .trainer import FluxTrainer
 from .utils import create_position_encoding_for_latents, pack_latents, preprocess_data
+
+
+def compute_mlperf_validation_loss(
+    loss_sums: torch.Tensor, element_counts: torch.Tensor
+) -> torch.Tensor:
+    """Return the MLPerf metric: mean MSE across eight equal timestep buckets."""
+    if loss_sums.shape != (8,) or element_counts.shape != (8,):
+        raise ValueError(
+            "MLPerf validation expects eight loss sums and eight element counts"
+        )
+    if torch.any(element_counts == 0):
+        raise RuntimeError(
+            "MLPerf validation did not process samples for every timestep"
+        )
+    return (loss_sums / element_counts).mean()
 
 
 class FluxValidator(Validator):
@@ -66,7 +83,8 @@ class FluxValidator(Validator):
         save_img_folder: str = "validation_images"
         """Folder to save validation images"""
 
-    validation_dataloader: BaseDataLoader
+        validation_timeout_seconds: int = 900
+        """Process-group timeout used only while running validation."""
 
     def __init__(
         self,
@@ -98,18 +116,21 @@ class FluxValidator(Validator):
         self.t5_tokenizer, self.clip_tokenizer = build_flux_tokenizer(
             config.dataloader.encoder, config.dataloader.hf_assets_path
         )
-        dl_config = replace(
+        self._is_mlperf_validation = (
+            config.dataloader.dataset == "mlperf-coco-validation"
+        )
+        self.dl_config = replace(
             config.dataloader,
-            infinite=config.steps != -1,
-            generate_timesteps=not config.all_timesteps,
+            # MLPerf validation is finite and must never re-loop. The fixed
+            # sample count also ensures every distributed rank has equal work.
+            infinite=False,
+            generate_timesteps=(
+                not self._is_mlperf_validation and not config.all_timesteps
+            ),
         )
-        self.validation_dataloader = dl_config.build(
-            dp_world_size=dp_world_size,
-            dp_rank=dp_rank,
-            t5_tokenizer=self.t5_tokenizer,
-            clip_tokenizer=self.clip_tokenizer,
-            local_batch_size=local_batch_size,
-        )
+        self.dp_world_size = dp_world_size
+        self.dp_rank = dp_rank
+        self.local_batch_size = local_batch_size
         self.validation_context = validation_context
         self.maybe_enable_amp = maybe_enable_amp
         # pyrefly: ignore [bad-assignment]
@@ -146,23 +167,100 @@ class FluxValidator(Validator):
         model_parts: list[nn.Module],
         step: int,
     ) -> None:
+        with self._validation_timeout():
+            self._validate(model_parts, step)
+
+    @contextmanager
+    def _validation_timeout(self):
+        """Use a longer timeout around validation I/O and FSDP collectives."""
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            dist_utils.set_pg_timeouts(
+                timeout=timedelta(seconds=self.config.validation_timeout_seconds),
+                parallel_dims=self.parallel_dims,
+            )
+        try:
+            yield
+        finally:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                dist_utils.set_pg_timeouts(
+                    timeout=timedelta(
+                        seconds=self.trainer_config.comm.train_timeout_seconds
+                    ),
+                    parallel_dims=self.parallel_dims,
+                )
+
+    def _sync_validation_phase(self, phase: str, validation_step: int) -> None:
+        """Keep ranks at the same collective boundary during validation."""
+        if not (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        ):
+            return
+        if os.environ.get("TORCHTITAN_DEBUG_VALIDATION_SYNC") == "1":
+            logger.info(
+                "Validation rank=%d step=%d phase=%s",
+                torch.distributed.get_rank(),
+                validation_step,
+                phase,
+            )
+        # Specify the active accelerator explicitly.  Without this, NCCL/RCCL
+        # emits one warning for every validation synchronization.
+        torch.distributed.barrier(device_ids=[device_module.current_device()])
+
+    def _validate(
+        self,
+        model_parts: list[nn.Module],
+        step: int,
+    ) -> None:
         # Set model to eval mode
         # TODO: currently does not support pipeline parallelism
         model = model_parts[0]
         model.eval()
 
         assert isinstance(self.config, FluxValidator.Config)
+        if self._is_mlperf_validation:
+            if self.all_timesteps:
+                raise ValueError(
+                    "MLPerf validation requires the timestep assigned by the "
+                    "official manifest; all_timesteps must be False"
+                )
+            expected_samples = 29_696
+            samples_per_step = self.local_batch_size * self.dp_world_size
+            if expected_samples % samples_per_step:
+                raise ValueError(
+                    "MLPerf validation requires its 29,696 samples to divide "
+                    f"evenly across the global batch size, got {samples_per_step}."
+                )
+            expected_steps = expected_samples // samples_per_step
+            if self.config.steps not in (-1, expected_steps):
+                raise ValueError(
+                    "MLPerf validation requires exactly 29,696 samples per "
+                    f"evaluation. Set validator.steps to {expected_steps}, or "
+                    "to -1 to consume the fixed validation dataset."
+                )
         save_img_count = self.config.save_img_count
 
         parallel_dims = self.parallel_dims
 
         accumulated_losses = []
+        mlperf_loss_sums = torch.zeros(8, device=self.device, dtype=torch.float64)
+        mlperf_element_counts = torch.zeros(
+            8, device=self.device, dtype=torch.float64
+        )
+        mlperf_sample_count = torch.zeros(1, device=self.device, dtype=torch.long)
         device_type = dist_utils.device_type
         num_steps = 0
+        validation_dataloader = self.dl_config.build(
+            dp_world_size=self.dp_world_size,
+            dp_rank=self.dp_rank,
+            t5_tokenizer=self.t5_tokenizer,
+            clip_tokenizer=self.clip_tokenizer,
+            local_batch_size=self.local_batch_size,
+        )
 
-        for input_dict, labels in self.validation_dataloader:
+        for input_dict, labels in validation_dataloader:
             if self.config.steps != -1 and num_steps >= self.config.steps:
                 break
+            self._sync_validation_phase("batch_loaded", num_steps)
 
             prompt = input_dict.pop("prompt")
             if not isinstance(prompt, list):
@@ -207,6 +305,7 @@ class FluxValidator(Validator):
                 t5_encoder=self.t5_encoder,
                 batch=input_dict,
             )
+            self._sync_validation_phase("preprocess_complete", num_steps)
             labels = input_dict["img_encodings"].to(device_type)
             clip_encodings = input_dict["clip_encodings"]
             t5_encodings = input_dict["t5_encodings"]
@@ -232,7 +331,10 @@ class FluxValidator(Validator):
             # Apply timesteps here and update our bsz to efficiently compute all timesteps and samples in a single forward pass
             with torch.no_grad(), torch.device(self.device):
                 noise = torch.randn_like(labels)
-                timesteps = stratified_timesteps.to(labels)
+                if self._is_mlperf_validation:
+                    timesteps = stratified_timesteps.to(labels) / 8.0
+                else:
+                    timesteps = stratified_timesteps.to(labels)
                 sigmas = timesteps.view(-1, 1, 1, 1)
                 latents = (1 - sigmas) * labels + sigmas * noise
 
@@ -278,23 +380,74 @@ class FluxValidator(Validator):
                         timesteps=timesteps,
                     )
 
-                loss = self.loss_fn(latent_noise_pred, target)
+                if self._is_mlperf_validation:
+                    timestep_indices = stratified_timesteps.to(
+                        device=self.device, dtype=torch.long
+                    )
+                    if torch.any((timestep_indices < 0) | (timestep_indices >= 8)):
+                        raise ValueError(
+                            "MLPerf validation received a timestep outside [0, 7]"
+                        )
+                    per_sample_loss_sums = (
+                        (latent_noise_pred.float() - target.float())
+                        .square()
+                        .flatten(start_dim=1)
+                        .sum(dim=1)
+                    )
+                    elements_per_sample = target[0].numel()
+                    mlperf_loss_sums.scatter_add_(
+                        0, timestep_indices, per_sample_loss_sums.to(torch.float64)
+                    )
+                    mlperf_element_counts.scatter_add_(
+                        0,
+                        timestep_indices,
+                        torch.full_like(
+                            per_sample_loss_sums,
+                            elements_per_sample,
+                            dtype=torch.float64,
+                        ),
+                    )
+                    mlperf_sample_count += bsz
+                else:
+                    loss = self.loss_fn(latent_noise_pred, target)
 
             del noise, target, latent_noise_pred, latents
 
-            accumulated_losses.append(loss.detach())
+            if not self._is_mlperf_validation:
+                accumulated_losses.append(loss.detach())
 
             num_steps += 1
+            self._sync_validation_phase("forward_complete", num_steps)
 
         # Compute average loss
-        loss = torch.sum(torch.stack(accumulated_losses))
-        loss /= num_steps
-        if parallel_dims.dp_cp_enabled:
-            global_avg_loss = dist_utils.dist_mean(
-                loss, parallel_dims.get_optional_mesh("loss")
-            )
+        if self._is_mlperf_validation:
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(
+                    mlperf_loss_sums, op=torch.distributed.ReduceOp.SUM
+                )
+                torch.distributed.all_reduce(
+                    mlperf_element_counts, op=torch.distributed.ReduceOp.SUM
+                )
+                torch.distributed.all_reduce(
+                    mlperf_sample_count, op=torch.distributed.ReduceOp.SUM
+                )
+            if mlperf_sample_count.item() != 29_696:
+                raise RuntimeError(
+                    "MLPerf validation consumed an incorrect number of samples: "
+                    f"expected 29,696, got {mlperf_sample_count.item()}."
+                )
+            global_avg_loss = compute_mlperf_validation_loss(
+                mlperf_loss_sums, mlperf_element_counts
+            ).item()
         else:
-            global_avg_loss = loss.item()
+            loss = torch.sum(torch.stack(accumulated_losses))
+            loss /= num_steps
+            if parallel_dims.dp_cp_enabled:
+                global_avg_loss = dist_utils.dist_mean(
+                    loss, parallel_dims.get_optional_mesh("loss")
+                )
+            else:
+                global_avg_loss = loss.item()
 
         self.metrics_processor.log_validation(loss=global_avg_loss, step=step)
 

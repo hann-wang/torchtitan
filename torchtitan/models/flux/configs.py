@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(kw_only=True, slots=True)
@@ -51,3 +52,26 @@ class Inference:
     """Batch size for inference"""
     img_size: int = 256
     """Image size for inference"""
+
+
+@dataclass(kw_only=True, slots=True)
+class Distillation:
+    """Configuration for Flux transformer distillation."""
+
+    enable: bool = False
+    """Whether to replace flow-matching training with teacher/student distillation."""
+
+    mode: Literal["off_policy", "on_policy"] = "off_policy"
+    """Rollout policy for the teacher inputs during distillation."""
+
+    num_rollout_steps: int = 4
+    """Number of latent rollout steps used for the distillation loss."""
+
+    teacher_checkpoint_path: str | None = None
+    """Model-only DCP checkpoint path for the frozen teacher transformer."""
+
+    student_checkpoint_path: str | None = None
+    """Model-only DCP checkpoint path used to initialize the student transformer."""
+
+    detach_rollout_latents: bool = True
+    """Detach recurrent rollout latents between steps to avoid long backprop graphs."""

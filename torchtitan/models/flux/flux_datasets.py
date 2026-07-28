@@ -4,11 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import csv
+import io
 import itertools
+import json
 import math
+import tarfile
 import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -26,6 +31,9 @@ from torchtitan.models.flux.tokenizer import build_flux_tokenizer, FluxTokenizer
 from torchtitan.tools.logging import logger
 
 from .configs import Encoder
+
+MLPERF_COCO_VALIDATION_SAMPLES = 29_696
+MLPERF_COCO_TIMESTEPS = 8
 
 
 def _apply_pil_exif_safe_patches() -> None:
@@ -447,6 +455,221 @@ class FluxValidationDataset(FluxDataset):
             yield sample_dict, labels
 
 
+class MLPerfCocoValidationDataset(IterableDataset, Stateful):
+    """Finite, deterministic MLPerf Flux validation dataset.
+
+    The MLPerf ``flux-1-coco`` download contains WebDataset tar shards and the
+    accompanying ``val2014_30k.tsv`` manifest. The manifest is the source of
+    truth for the fixed image/caption pairs and their assigned integer
+    timesteps.
+    """
+
+    def __init__(
+        self,
+        *,
+        dataset_path: str,
+        manifest_path: str,
+        t5_tokenizer: FluxTokenizer,
+        clip_tokenizer: FluxTokenizer,
+        img_size: int,
+        dp_rank: int,
+        dp_world_size: int,
+    ) -> None:
+        if dp_world_size <= 0:
+            raise ValueError(f"dp_world_size must be positive, got {dp_world_size}")
+        if MLPERF_COCO_VALIDATION_SAMPLES % dp_world_size != 0:
+            raise ValueError(
+                "MLPerf validation requires 29,696 samples to divide evenly across "
+                f"the data-parallel world size, got {dp_world_size}"
+            )
+
+        self._t5_tokenizer = t5_tokenizer
+        self._clip_tokenizer = clip_tokenizer
+        self._img_size = img_size
+        self._shard_metadata_by_image_id = self._index_shards(Path(dataset_path))
+        records = self._load_manifest(Path(manifest_path))
+        missing_image_ids = {
+            row["image_id"] for row in records
+        } - self._shard_metadata_by_image_id.keys()
+        if missing_image_ids:
+            sample_ids = sorted(missing_image_ids)[:5]
+            raise ValueError(
+                "MLPerf validation shards are missing manifest image IDs "
+                f"(first five): {sample_ids}"
+            )
+        for row in records:
+            shard_timestep = self._shard_metadata_by_image_id[row["image_id"]][1]
+            manifest_timestep = row.get("timestep")
+            if manifest_timestep not in (None, "") and int(manifest_timestep) != shard_timestep:
+                raise ValueError(
+                    "MLPerf validation timestep differs between manifest and shard "
+                    f"metadata for image_id {row['image_id']}"
+                )
+            row["timestep"] = shard_timestep
+        self._validate_timestep_counts(records)
+        self._records = records[dp_rank::dp_world_size]
+        expected_per_rank = MLPERF_COCO_VALIDATION_SAMPLES // dp_world_size
+        if len(self._records) != expected_per_rank:
+            raise RuntimeError(
+                "MLPerf validation rank received an unexpected sample count: "
+                f"expected {expected_per_rank}, got {len(self._records)}"
+            )
+
+    @staticmethod
+    def _load_manifest(manifest_path: Path) -> list[dict[str, Any]]:
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                "MLPerf validation manifest is required but was not found: "
+                f"{manifest_path}"
+            )
+
+        with manifest_path.open(newline="", encoding="utf-8") as manifest_file:
+            rows = list(csv.DictReader(manifest_file, delimiter="\t"))
+
+        required_columns = {"image_id", "caption"}
+        if not rows or not required_columns.issubset(rows[0]):
+            raise ValueError(
+                f"MLPerf validation manifest {manifest_path} must contain "
+                f"{sorted(required_columns)}, got {list(rows[0]) if rows else []}"
+            )
+        if len(rows) != MLPERF_COCO_VALIDATION_SAMPLES:
+            raise ValueError(
+                "MLPerf validation manifest must contain exactly "
+                f"{MLPERF_COCO_VALIDATION_SAMPLES} rows, got {len(rows)}"
+            )
+
+        image_ids: set[int] = set()
+        for row in rows:
+            try:
+                image_id = int(row["image_id"])
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Invalid image_id in {manifest_path}: {row}"
+                ) from exc
+            if image_id in image_ids:
+                raise ValueError(
+                    "MLPerf validation manifest must contain one caption per image; "
+                    f"duplicate image_id {image_id}"
+                )
+            image_ids.add(image_id)
+            row["image_id"] = image_id
+        return rows
+
+    @staticmethod
+    def _index_shards(dataset_path: Path) -> dict[int, tuple[Path, int]]:
+        if not dataset_path.is_dir():
+            raise FileNotFoundError(
+                "MLPerf validation WebDataset directory is required but was not "
+                f"found: {dataset_path}"
+            )
+        shards = sorted(dataset_path.glob("*.tar"))
+        if not shards:
+            raise FileNotFoundError(
+                f"No WebDataset tar shards were found in {dataset_path}"
+            )
+
+        metadata_by_image_id: dict[int, tuple[Path, int]] = {}
+        for shard in shards:
+            with tarfile.open(shard, "r") as archive:
+                for member in archive:
+                    if not member.isfile() or not member.name.endswith(".json"):
+                        continue
+                    try:
+                        image_id = int(Path(member.name).stem)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"Unexpected metadata filename {member.name} in {shard}"
+                        ) from exc
+                    metadata_file = archive.extractfile(member)
+                    if metadata_file is None:
+                        raise ValueError(
+                            f"Unable to read metadata {member.name} in {shard}"
+                        )
+                    try:
+                        metadata = json.load(metadata_file)
+                        timestep = int(metadata["timestep"])
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                        raise ValueError(
+                            f"Invalid MLPerf metadata {member.name} in {shard}"
+                        ) from exc
+                    if not 0 <= timestep < MLPERF_COCO_TIMESTEPS:
+                        raise ValueError(
+                            f"MLPerf validation timestep must be in [0, 7], got "
+                            f"{timestep} for image_id {image_id}"
+                        )
+                    if image_id in metadata_by_image_id:
+                        raise ValueError(
+                            f"Duplicate image_id {image_id} across MLPerf shards"
+                        )
+                    metadata_by_image_id[image_id] = (shard, timestep)
+        return metadata_by_image_id
+
+    @staticmethod
+    def _validate_timestep_counts(records: list[dict[str, Any]]) -> None:
+        timestep_counts = [0] * MLPERF_COCO_TIMESTEPS
+        for row in records:
+            timestep_counts[row["timestep"]] += 1
+        expected_per_timestep = (
+            MLPERF_COCO_VALIDATION_SAMPLES // MLPERF_COCO_TIMESTEPS
+        )
+        if timestep_counts != [expected_per_timestep] * MLPERF_COCO_TIMESTEPS:
+            raise ValueError(
+                "MLPerf validation shards must have an equal number of samples "
+                f"per timestep ({expected_per_timestep}), got {timestep_counts}"
+            )
+
+    def __iter__(self):
+        open_shard: Path | None = None
+        archive: tarfile.TarFile | None = None
+        try:
+            for row in self._records:
+                image_id = row["image_id"]
+                shard_metadata = self._shard_metadata_by_image_id.get(image_id)
+                if shard_metadata is None:
+                    raise RuntimeError(
+                        f"MLPerf validation image_id {image_id} is absent from shards"
+                    )
+                shard = shard_metadata[0]
+                if shard != open_shard:
+                    if archive is not None:
+                        archive.close()
+                    archive = tarfile.open(shard, "r")
+                    open_shard = shard
+
+                image_member = archive.extractfile(f"{image_id:012d}.png")
+                if image_member is None:
+                    raise RuntimeError(
+                        f"MLPerf validation image_id {image_id} has no PNG payload"
+                    )
+                with PIL.Image.open(io.BytesIO(image_member.read())) as image:
+                    processed_image = _process_cc12m_image(
+                        image, output_size=self._img_size
+                    )
+                if processed_image is None:
+                    raise RuntimeError(
+                        f"MLPerf validation image_id {image_id} could not be decoded"
+                    )
+
+                prompt = row["caption"]
+                yield {
+                    "clip_tokens": self._clip_tokenizer.encode(prompt),
+                    "t5_tokens": self._t5_tokenizer.encode(prompt),
+                    "prompt": prompt,
+                    "sample_key": str(image_id),
+                    "timestep": row["timestep"],
+                }, processed_image
+        finally:
+            if archive is not None:
+                archive.close()
+
+    def state_dict(self) -> dict[str, Any]:
+        # Validation is rebuilt from the fixed manifest for every evaluation.
+        return {}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        del state_dict
+
+
 class FluxDataLoader(ParallelAwareDataloader):
     """Configurable Flux dataloader for both training and validation.
 
@@ -475,6 +698,9 @@ class FluxDataLoader(ParallelAwareDataloader):
         generate_timesteps: bool = False
         """Generate stratified timesteps in round-robin style (for validation)"""
 
+        mlperf_manifest_path: str | None = None
+        """Path to MLPerf's val2014_30k.tsv manifest for fixed COCO validation."""
+
         # TODO: Remove after the tokenizer is properly built from the trainer. E.g.,
         # we can have a tokenizer container which holds the t5 and clip tokenizers.
         encoder: Encoder = field(default_factory=Encoder)
@@ -500,7 +726,23 @@ class FluxDataLoader(ParallelAwareDataloader):
             hf_assets_path=config.hf_assets_path,
         )
 
-        if config.generate_timesteps:
+        if config.dataset == "mlperf-coco-validation":
+            if config.dataset_path is None or config.mlperf_manifest_path is None:
+                raise ValueError(
+                    "mlperf-coco-validation requires both dataloader.dataset_path "
+                    "(the flux-1-coco tar directory) and "
+                    "dataloader.mlperf_manifest_path (val2014_30k.tsv)"
+                )
+            ds = MLPerfCocoValidationDataset(
+                dataset_path=config.dataset_path,
+                manifest_path=config.mlperf_manifest_path,
+                t5_tokenizer=t5_tokenizer,
+                clip_tokenizer=clip_tokenizer,
+                img_size=config.img_size,
+                dp_rank=dp_rank,
+                dp_world_size=dp_world_size,
+            )
+        elif config.generate_timesteps:
             ds = FluxValidationDataset(
                 dataset_name=config.dataset,
                 dataset_path=config.dataset_path,

@@ -136,7 +136,7 @@ def flux_schnell() -> FluxTrainer.Config:
         t5_encoder="google/t5-v1_1-xxl",
         clip_encoder="openai/clip-vit-large-patch14",
         max_t5_encoding_len=256,
-        autoencoder_path="assets/hf/FLUX.1-dev/ae.safetensors",
+        autoencoder_path="assets/hf/FLUX.1-schnell/ae.safetensors",
     )
     return FluxTrainer.Config(
         metrics=MetricsProcessor.Config(log_freq=100),
