@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     libunwind-dev \
     libnl-3-dev \
     libnl-route-3-dev \
+    libibverbs-dev librdmacm-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN update-pciids
@@ -21,7 +22,7 @@ RUN pip install --no-cache-dir huggingface_hub "datasets>=3.6.0,<4.8.0" \
     accelerate pillow "numpy<2" opencv-python-headless scipy \
     numba huggingface-hub[cli,hf_transfer] "packaging>=24.2" \
     "setuptools>=77.0.3,<80.0.0" "setuptools-scm>=8" \
-    protobuf-protoc-bin fmt && \
+    protobuf-protoc-bin fmt nanobind && \
     pip install --no-cache-dir /opt/rocm/share/amd_smi
 
 RUN cd /var/lib/jenkins && \
@@ -29,7 +30,8 @@ RUN cd /var/lib/jenkins && \
     cd lm-evaluation-harness && \
     pip install -e .
 
-RUN rm -rf /opt/cache
+RUN rm -rf /opt/cache && \
+    mv -f /opt/rocm/llvm/bin/original/clang /opt/rocm/llvm/bin/original/clang++ /opt/rocm/llvm/bin/
 
 # ENV PYTORCH_ROCM_ARCH="gfx90a;gfx942;gfx950"
 # ENV RUSTUP_HOME=/opt/rustup
