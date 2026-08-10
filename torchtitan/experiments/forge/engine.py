@@ -33,6 +33,7 @@ from torchtitan.distributed.activation_checkpoint import (
     MemoryBudgetAC,
     SelectiveAC,
 )
+from torchtitan.models.common.attention import FlexAttention
 from torchtitan.protocols import BaseModel
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools import utils
@@ -63,6 +64,55 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         debug: DebugConfig = field(default_factory=DebugConfig)
 
         def __post_init__(self):
+            if self.debug.batch_invariant:
+                raise ValueError(
+                    "Batch-invariant mode is not supported in pre-training."
+                )
+
+            pp_microbatch_size = self.parallelism.pipeline_parallel_microbatch_size
+            if pp_microbatch_size <= 0:
+                raise ValueError(
+                    "parallelism.pipeline_parallel_microbatch_size must be "
+                    "greater than 0."
+                )
+            if (
+                self.parallelism.pipeline_parallel_degree > 1
+                and self.training.local_batch_size % pp_microbatch_size != 0
+            ):
+                raise ValueError(
+                    f"training.local_batch_size ({self.training.local_batch_size}) "
+                    "must be evenly divisible by "
+                    "parallelism.pipeline_parallel_microbatch_size "
+                    f"({pp_microbatch_size}) when pipeline parallelism is enabled."
+                )
+                
+            if (
+                self.parallelism.spmd_backend == "spmd_types"
+                and self.debug.spmd_typechecking
+                and self.parallelism.pipeline_parallel_degree > 1
+            ):
+                # TODO(sanketpurandare): Enable SPMD typechecking under PP.
+                raise ValueError(
+                    "SPMD typechecking is not supported with pipeline parallelism. "
+                    "Validate the same config without PP "
+                    "(--parallelism.pipeline_parallel_degree 1)."
+                )
+
+            if (
+                self.parallelism.spmd_backend == "spmd_types"
+                and self.debug.spmd_typechecking
+                and isinstance(self.activation_checkpoint, SelectiveAC.Config)
+                and self.model_spec is not None
+                and any(self.model_spec.model.traverse(FlexAttention.Config))
+            ):
+                # TODO(pianpwk): Enable SAC with FlexAttention under SPMD typechecking.
+                raise ValueError(
+                    "Selective activation checkpointing (SAC) is not supported "
+                    "with FlexAttention while SPMD typechecking is enabled. "
+                    "Use full activation checkpointing, disable activation "
+                    "checkpointing, or switch to a non-Flex attention backend."
+                )
+
             if isinstance(self.activation_checkpoint, MemoryBudgetAC.Config) and not (
                 self.compile.enable and "model" in self.compile.components
             ):
@@ -93,6 +143,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
     device: torch.device
     gc_handler: utils.GarbageCollection
     gradient_accumulation_steps: int
+    num_pipeline_parallel_microbatches: int
     train_context: Generator[None, None, None]
     pp_has_first_stage: bool
     pp_has_last_stage: bool
@@ -253,6 +304,12 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             config.training.local_batch_size * batch_degree
         )
         assert self.gradient_accumulation_steps > 0
+        self.num_pipeline_parallel_microbatches = (
+            config.training.local_batch_size
+            // config.parallelism.pipeline_parallel_microbatch_size
+            if parallel_dims.pp_enabled
+            else 1
+        )
 
         with sl.log_trace_span("model_parallelism_init"):
             # apply parallelisms and initialization

@@ -28,8 +28,9 @@ from torchtitan.models.common.attention import (
 )
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE
-from torchtitan.models.common.nn_modules import Linear, RMSNorm
+from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
@@ -143,17 +144,6 @@ class Decoder(BaseModel):
                     "Weight tying is not supported with Pipeline Parallel."
                 )
 
-            if parallelism.pipeline_parallel_degree > 1 and any(
-                layer.attention is not None
-                and isinstance(layer.attention.inner_attention, VarlenAttention.Config)
-                for layer in self.layers
-            ):
-                raise ValueError(
-                    "Pipeline Parallel is not compatible with VarlenAttention. "
-                    "Use a FlexAttention backend (attn_backend='flex' or "
-                    "'flex_flash') for pipelined models."
-                )
-
             tp = parallelism.tensor_parallel_degree
             attention = self.first_attention
             if tp > 1 and attention is not None:
@@ -177,7 +167,7 @@ class Decoder(BaseModel):
                         HybridEPTokenDispatcher,
                     )
 
-                    token_dispatcher_cfg = layer_cfg.moe.experts.token_dispatcher
+                    token_dispatcher_cfg = layer_cfg.moe.routed_experts.token_dispatcher
                     if (
                         isinstance(
                             token_dispatcher_cfg,
