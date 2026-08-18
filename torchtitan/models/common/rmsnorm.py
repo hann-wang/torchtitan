@@ -29,7 +29,7 @@ class RMSNorm(nn.RMSNorm, Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         normalized_shape: int = field(init=False)
-        eps: float = 1e-5
+        eps: float | None = 1e-5
         elementwise_affine: bool = True
 
     def __init__(self, config: Config):

@@ -395,6 +395,42 @@ def set_pg_timeouts(
         torch.distributed.distributed_c10d._set_pg_timeout(timeout, group)
 
 
+def _get_total_norm_rocm_safe(
+    grads: list[torch.Tensor],
+    norm_type: float,
+    error_if_nonfinite: bool,
+    foreach: bool | None,
+) -> torch.Tensor:
+    """Compute ROCm L2 norms via FP32 powsums without norm scalar stacking."""
+    if (
+        torch.version.hip is None
+        or norm_type != 2.0
+        or os.environ.get("TORCHTITAN_ROCM_SAFE_GRAD_NORM", "1") == "0"
+    ):
+        return torch.nn.utils.get_total_norm(
+            grads, norm_type, error_if_nonfinite, foreach
+        )
+    if not grads:
+        return torch.tensor(0.0)
+
+    powsum = torch.linalg._powsum(grads[0], norm_type, dtype=torch.float32)
+    for grad in grads[1:]:
+        powsum = powsum + torch.linalg._powsum(
+            grad, norm_type, dtype=torch.float32
+        )
+    if isinstance(powsum, DTensor):
+        powsum = powsum.full_tensor()
+
+    total_norm = powsum.sqrt()
+    if error_if_nonfinite and torch.logical_or(
+        total_norm.isnan(), total_norm.isinf()
+    ):
+        raise RuntimeError(
+            f"The total norm of order {norm_type} for gradients is non-finite."
+        )
+    return total_norm
+
+
 @torch.no_grad()
 def clip_grad_norm_(
     parameters: torch.Tensor | Iterable[torch.Tensor],
@@ -449,7 +485,7 @@ def clip_grad_norm_(
         # prevent generators from being exhausted
         parameters = list(parameters)
     grads = [p.grad for p in parameters if p.grad is not None]
-    total_norm = torch.nn.utils.get_total_norm(
+    total_norm = _get_total_norm_rocm_safe(
         grads, norm_type, error_if_nonfinite, foreach
     )
 
@@ -472,7 +508,10 @@ def clip_grad_norm_(
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
             total_norm **= 1.0 / norm_type
 
-    torch.nn.utils.clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
+    clip_foreach = False if torch.version.hip is not None else foreach
+    torch.nn.utils.clip_grads_with_norm_(
+        parameters, max_norm, total_norm, clip_foreach
+    )
     return total_norm
 
 
@@ -508,14 +547,14 @@ def _clip_grad_norm_with_ep(
     # - In autoparallel, all params may live on a single sparse mesh with "ep" dimension,
     #   so non_ep_grads would be empty
     # - In PP + EP setups, certain PP ranks may only own EP or non-EP layers
-    ep_grads_total_norm = torch.nn.utils.get_total_norm(
+    ep_grads_total_norm = _get_total_norm_rocm_safe(
         ep_grads, norm_type, error_if_nonfinite, foreach
     )
     # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
     if isinstance(ep_grads_total_norm, DTensor):
         ep_grads_total_norm = ep_grads_total_norm.full_tensor()
 
-    non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
+    non_ep_grads_total_norm = _get_total_norm_rocm_safe(
         non_ep_grads, norm_type, error_if_nonfinite, foreach
     )
     # get_total_norm returns tensor(0.) for empty list, which is a non-DTensor
@@ -538,7 +577,12 @@ def _clip_grad_norm_with_ep(
             dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
             total_norm **= 1.0 / norm_type
 
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach)
+    clip_foreach = False if torch.version.hip is not None else foreach
+    torch.nn.utils.clip_grads_with_norm_(
+        ep_params, max_norm, total_norm, clip_foreach
+    )
+    torch.nn.utils.clip_grads_with_norm_(
+        non_ep_params, max_norm, total_norm, clip_foreach
+    )
 
     return total_norm
