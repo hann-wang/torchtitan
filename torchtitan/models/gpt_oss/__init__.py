@@ -48,20 +48,19 @@ __all__ = [
 
 _NORM_INIT = {"weight": nn.init.ones_}
 # GPT-OSS uses std=0.02 for embeddings (model-specific)
-_EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.02)}
+_EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.008)}
 
 
 def _output_linear_init(dim: int) -> dict[str, Callable]:
-    s = dim**-0.5
     return {
-        "weight": partial(nn.init.trunc_normal_, std=s, a=-3 * s, b=3 * s),
+        "weight": partial(nn.init.normal_, std=0.008),
         "bias": nn.init.zeros_,
     }
 
 
 def _depth_init(layer_id: int) -> dict[str, Callable]:
     return {
-        "weight": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
+        "weight": partial(nn.init.normal_, std=0.008),
         "bias": nn.init.zeros_,
     }
 
@@ -316,7 +315,7 @@ def _20b(
             hidden_dim=hidden_dim,
             num_experts=32,
             top_k=4,
-            load_balance_coeff=1e-3,
+            load_balance_coeff=None,
             attn_backend=attn_backend,
             moe_comm_backend=moe_comm_backend,
             rope=CosSinRoPE.Config(
