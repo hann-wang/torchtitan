@@ -271,7 +271,7 @@ def _debugmodel(
             hidden_dim=hidden_dim,
             num_experts=8,
             top_k=4,
-            load_balance_coeff=1e-3,
+            load_balance_coeff=None,
             attn_backend=attn_backend,
             moe_comm_backend=moe_comm_backend,
             rope=CosSinRoPE.Config(

@@ -410,6 +410,12 @@ def register_moe_load_balancing_hook(
             for transformer_block in layers.values():
                 if getattr(transformer_block, "moe_enabled", False):
                     yield transformer_block, cast(_MoELike, transformer_block.moe)
+                    
+    def _has_moe(model_parts: list[nn.Module]) -> bool:
+        moe_layers = list(_iter_moe_layers(model_parts))
+        if not moe_layers:
+            return False
+        return True
 
     def _should_register_moe_balancing_hook(model_parts: list[nn.Module]) -> bool:
         moe_layers = list(_iter_moe_layers(model_parts))
@@ -433,6 +439,7 @@ def register_moe_load_balancing_hook(
     def _update_expert_bias(
         model_parts: list[nn.Module],
         parallel_dims: ParallelDims,
+        update_bias: bool = True,
     ):
         loss_mesh = parallel_dims.get_optional_mesh("loss")
         # TODO: Currently this sync is blocking (thus exposed) and happens on the
@@ -503,28 +510,34 @@ def register_moe_load_balancing_hook(
                     if not transformer_block.moe_enabled:
                         continue
                     moe = cast(_MoELike, transformer_block.moe)
-                    load_balance_coeff = moe.load_balance_coeff
-                    assert load_balance_coeff is not None
 
                     tokens_per_expert_E = tokens_per_expert_E_by_layer[
                         moe_layer_idx
                     ].float()
                     moe_layer_idx += 1
+                    
+                    if update_bias:
+                        load_balance_coeff = moe.load_balance_coeff
+                        assert load_balance_coeff is not None
+                    
+                        # update the expert bias
+                        # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
+                        expert_bias_delta_E = load_balance_coeff * torch.sign(
+                            tokens_per_expert_E.mean() - tokens_per_expert_E
+                        )
+                        expert_bias_delta_E = (
+                            expert_bias_delta_E - expert_bias_delta_E.mean()
+                        )
+                        moe.expert_bias_E.add_(expert_bias_delta_E)
 
-                    # update the expert bias
-                    # this is not exactly the same as https://arxiv.org/pdf/2408.15664 proposed
-                    expert_bias_delta_E = load_balance_coeff * torch.sign(
-                        tokens_per_expert_E.mean() - tokens_per_expert_E
-                    )
-                    expert_bias_delta_E = (
-                        expert_bias_delta_E - expert_bias_delta_E.mean()
-                    )
-                    moe.expert_bias_E.add_(expert_bias_delta_E)
+                    moe.maxvio = tokens_per_expert_E.amax() / tokens_per_expert_E.mean() - 1
                     moe.tokens_per_expert_E.zero_()
 
-    if _should_register_moe_balancing_hook(model_parts):
+    if _has_moe(model_parts):
         optimizers.register_step_pre_hook(
             lambda *args, **kwargs: _update_expert_bias(
-                model_parts, parallel_dims=parallel_dims
+                model_parts,
+                parallel_dims=parallel_dims,
+                update_bias=_should_register_moe_balancing_hook(model_parts),
             )
         )

@@ -130,7 +130,11 @@ class HuggingFaceTokenizer(BaseTokenizer):
         self.eos_token = None
 
         # Load the underlying tokenizer
-        self.tokenizer = self._load_tokenizer_from_path(tokenizer_path)
+        try:
+            self.tokenizer = self._load_tokenizer_from_path(tokenizer_path)
+        except FileNotFoundError:
+            logger.warning(f"Failed to load tokenizer from {tokenizer_path}. Tokenizer is unavailable.")
+            self.tokenizer = None
 
         # Load configuration files
         self._hf_config = self._load_config(
@@ -146,7 +150,8 @@ class HuggingFaceTokenizer(BaseTokenizer):
         # Infer special tokens from config (if available) and BOS/EOS behavior
         if self._hf_config is not None:
             self._infer_special_tokens()
-        self._infer_should_add_bos_eos()
+        if self.tokenizer is not None:
+            self._infer_should_add_bos_eos()
 
         # Auto-load chat template: standalone .jinja file takes priority
         # (e.g. GPT-OSS), then fall back to inline in tokenizer_config.json

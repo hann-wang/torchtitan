@@ -183,6 +183,7 @@ def _moe_sharding_config(*, enable_ep: bool, enable_sp: bool) -> ShardingConfig:
         state_shardings={
             "expert_bias_E": dense_param_placement(tp=spmd.R),
             "tokens_per_expert_E": _tokens_per_expert_placement(enable_ep=enable_ep),
+            "maxvio": dense_param_placement(tp=spmd.R),
         },
         in_src_shardings={"x_BLD": sp_layout},
         in_dst_shardings={"x_BLD": moe_desired_input_layouts},

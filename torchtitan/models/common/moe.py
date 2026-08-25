@@ -411,6 +411,12 @@ class MoE(Module):
             torch.zeros(num_experts, dtype=torch.float32),
             persistent=False,
         )
+        # expert imbalance score
+        self.register_buffer(
+            "maxvio",
+            torch.zeros([], dtype=torch.float32),
+            persistent=False,
+        )
 
     def forward(self, x_BLD: torch.Tensor) -> torch.Tensor:
         """

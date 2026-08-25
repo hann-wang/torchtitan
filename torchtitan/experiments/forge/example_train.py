@@ -400,6 +400,10 @@ class Trainer(ForgeEngine):
         if not self.metrics_processor.should_log(self.step):
             return
         
+        # expert imbalance score
+        assert len(self.model_parts) == 1
+        mean_maxvio = torch.stack([layer.moe.maxvio for layer in self.model_parts[0].layers.values()]).mean()
+        
         with sl.log_trace_span("collect_dist_metrics"):
             sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})
 
@@ -443,6 +447,7 @@ class Trainer(ForgeEngine):
             
         extra_metrics = {
             "n_tokens_seen": global_ntokens_seen,
+            "maxvio": mean_maxvio,
             **lr_metrics,
         }
         self.metrics_processor.log(
