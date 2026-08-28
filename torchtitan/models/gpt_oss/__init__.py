@@ -94,7 +94,7 @@ def _make_gptoss_attn_config(
         )
 
     sinks_init = {
-        "sinks": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id))
+        "sinks": partial(nn.init.trunc_normal_, std=0.008)
     }
 
     if fuse_qkv:
@@ -156,7 +156,7 @@ def _make_gptoss_experts_config(
     non_blocking_capacity_factor: float | None = None,
 ) -> RoutedExperts.Config:
     """Build a fully-specified RoutedExperts.Config for a single GPT-OSS layer."""
-    std = depth_scaled_std(0.02, layer_id)
+    std = 0.008
     experts_init = {
         "mlp1_weight_EGD": partial(nn.init.trunc_normal_, std=std),
         "mlp1_bias_EG": partial(nn.init.trunc_normal_, std=std),
