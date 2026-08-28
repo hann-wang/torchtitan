@@ -51,16 +51,23 @@ _NORM_INIT = {"weight": nn.init.ones_}
 _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.008)}
 
 
-def _output_linear_init(dim: int) -> dict[str, Callable]:
+def _default_init() -> dict[str, Callable]:
     return {
         "weight": partial(nn.init.normal_, std=0.008),
         "bias": nn.init.zeros_,
     }
 
 
-def _depth_init(layer_id: int) -> dict[str, Callable]:
+def _router_init() -> dict[str, Callable]:
     return {
         "weight": partial(nn.init.normal_, std=0.008),
+        "bias": partial(nn.init.normal_, std=0.008),
+    }
+
+
+def _depth_init(layer_id: int) -> dict[str, Callable]:
+    return {
+        "weight": partial(nn.init.normal_, std=depth_scaled_std(0.008, layer_id)),
         "bias": nn.init.zeros_,
     }
 
@@ -93,10 +100,6 @@ def _make_gptoss_attn_config(
             inner_attention, window_size=(sliding_window_size - 1, 0)
         )
 
-    sinks_init = {
-        "sinks": partial(nn.init.trunc_normal_, std=0.008)
-    }
-
     if fuse_qkv:
         qkv = FusedQKVLinear.Config(
             head_dim=head_dim,
@@ -106,7 +109,7 @@ def _make_gptoss_attn_config(
                 in_features=dim,
                 out_features=(n_heads + 2 * n_kv_heads) * head_dim,
                 bias=True,
-                param_init=_depth_init(layer_id),
+                param_init=_default_init(),
             ),
         )
     else:
@@ -116,13 +119,13 @@ def _make_gptoss_attn_config(
                 in_features=dim,
                 out_features=n_heads * head_dim,
                 bias=True,
-                param_init=_depth_init(layer_id),
+                param_init=_default_init(),
             ),
             wkv=Linear.Config(
                 in_features=dim,
                 out_features=n_kv_heads * head_dim,
                 bias=True,
-                param_init=_depth_init(layer_id),
+                param_init=_default_init(),
             ),
         )
 
@@ -140,7 +143,6 @@ def _make_gptoss_attn_config(
         ),
         sliding_window_size=sliding_window_size,
         inner_attention=inner_attention,
-        param_init=sinks_init,
         rope=dataclasses.replace(rope),
     )
 
@@ -159,9 +161,9 @@ def _make_gptoss_experts_config(
     std = 0.008
     experts_init = {
         "mlp1_weight_EGD": partial(nn.init.trunc_normal_, std=std),
-        "mlp1_bias_EG": partial(nn.init.trunc_normal_, std=std),
-        "mlp2_weight_EDF": partial(nn.init.trunc_normal_, std=std),
-        "mlp2_bias_ED": partial(nn.init.trunc_normal_, std=std),
+        "mlp1_bias_EG": nn.init.zeros_,
+        "mlp2_weight_EDF": partial(nn.init.trunc_normal_, std=depth_scaled_std(std, layer_id)),
+        "mlp2_bias_ED": nn.init.zeros_,
     }
     return RoutedExperts.Config(
         inner_experts=GptOssGroupedExperts.Config(
@@ -230,7 +232,7 @@ def _build_gptoss_layers(
                     in_features=dim,
                     out_features=num_experts,
                     bias=True,
-                    param_init=_depth_init(layer_id),
+                    param_init=_router_init(),
                 ),
                 top_k=top_k,
             ),
@@ -262,7 +264,7 @@ def _debugmodel(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=2048,
-            param_init=_output_linear_init(dim),
+            param_init=_default_init(),
         ),
         layers=_build_gptoss_layers(
             fuse_qkv=True,
@@ -306,7 +308,7 @@ def _20b(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=201088,
-            param_init=_output_linear_init(dim),
+            param_init=_default_init(),
         ),
         layers=_build_gptoss_layers(
             fuse_qkv=True,
@@ -350,7 +352,7 @@ def _120b(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=201088,
-            param_init=_output_linear_init(dim),
+            param_init=_default_init(),
         ),
         layers=_build_gptoss_layers(
             fuse_qkv=True,

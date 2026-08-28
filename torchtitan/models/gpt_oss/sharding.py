@@ -101,7 +101,6 @@ def _set_gpt_oss_layer_sharding(
     # Attention: input x gathered to Replicate.
     # sinks parameter is sharded across heads via state_shardings.
     attention.sharding_config = ShardingConfig(
-        state_shardings={"sinks": dense_param_placement(tp=spmd.S(0))},
         in_src_shardings={
             "x": attn_x_layout,
         },
