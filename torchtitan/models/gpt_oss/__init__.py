@@ -160,9 +160,9 @@ def _make_gptoss_experts_config(
     """Build a fully-specified RoutedExperts.Config for a single GPT-OSS layer."""
     experts_init = {
         "mlp1_weight_EGD": partial(nn.init.normal_, std=STD),
-        "mlp1_bias_EG": nn.init.zero_,
+        "mlp1_bias_EG": nn.init.zeros_,
         "mlp2_weight_EDF": partial(nn.init.normal_, std=STD / math.sqrt(2*24)),
-        "mlp2_bias_ED": nn.init.zero_,
+        "mlp2_bias_ED": nn.init.zeros_,
     }
     return RoutedExperts.Config(
         inner_experts=GptOssGroupedExperts.Config(
@@ -231,7 +231,7 @@ def _build_gptoss_layers(
                     in_features=dim,
                     out_features=num_experts,
                     bias=True,
-                    param_init=_depth_init(layer_id),
+                    param_init=_default_init(),
                 ),
                 top_k=top_k,
             ),

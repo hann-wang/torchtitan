@@ -79,7 +79,7 @@ class Attention(BaseAttention):
 
         self.qkv_linear = config.qkv_linear.build()
         self.wo = config.wo.build()
-        self.sinks = nn.Parameter(torch.empty(config.n_heads))
+        # self.sinks = nn.Parameter(torch.empty(config.n_heads))
         self.inner_attention = config.inner_attention.build()
         self.rope = config.rope.build()
 
