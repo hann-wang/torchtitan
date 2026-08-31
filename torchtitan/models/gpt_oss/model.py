@@ -31,13 +31,13 @@ from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
 
 
-def apply_attention_sink_rescale(
-    out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
-) -> torch.Tensor:
-    """Rescale attention output by the learned per-head sink term."""
-    sinks = sinks.view(*([1] * (lse.ndim - 1)), -1)
-    sink_scale = torch.sigmoid(lse - sinks).unsqueeze(-1)
-    return out * sink_scale.to(out.dtype)
+# def apply_attention_sink_rescale(
+#     out: torch.Tensor, lse: torch.Tensor, sinks: torch.Tensor
+# ) -> torch.Tensor:
+#     """Rescale attention output by the learned per-head sink term."""
+#     sinks = sinks.view(*([1] * (lse.ndim - 1)), -1)
+#     sink_scale = torch.sigmoid(lse - sinks).unsqueeze(-1)
+#     return out * sink_scale.to(out.dtype)
 
 
 class Attention(BaseAttention):
@@ -113,7 +113,7 @@ class Attention(BaseAttention):
             attention_masks=attention_masks,
             scale=self.softmax_scale,
             enable_gqa=self.enable_gqa,
-            out_transform=self._apply_sinks,
+            # out_transform=self._apply_sinks,
         )
 
         # Reshape and project output
@@ -123,12 +123,12 @@ class Attention(BaseAttention):
         output = self.wo(output)  # (bsz, seqlen, dim)
         return output
 
-    def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
-        """out_transform hook: rescale attention output by this layer's sinks."""
-        sinks = self.sinks
-        if isinstance(sinks, DTensor):
-            sinks = sinks.to_local(grad_placements=sinks.placements)
-        return apply_attention_sink_rescale(out, lse, sinks)
+    # def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
+    #     """out_transform hook: rescale attention output by this layer's sinks."""
+    #     sinks = self.sinks
+    #     if isinstance(sinks, DTensor):
+    #         sinks = sinks.to_local(grad_placements=sinks.placements)
+    #     return apply_attention_sink_rescale(out, lse, sinks)
 
 
 class GptOssTransformerBlock(TransformerBlock):
