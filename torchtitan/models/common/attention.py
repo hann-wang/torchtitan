@@ -47,6 +47,8 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 from torchtitan.tools.utils import round_up
 
+from .probe import probe_nan
+
 
 __all__ = [
     "FlexAttention",
@@ -172,6 +174,9 @@ class VarlenAttention(Module):
 
         # FA3 varlen attention takes rank-local metadata tensors.
         # TODO(pianpwk): Move this op contract into pytorch/spmd_types.
+        q_TNH = probe_nan(q_TNH, "q_TNH")
+        k_TNH = probe_nan(k_TNH, "k_TNH")
+        v_TNH = probe_nan(v_TNH, "v_TNH")
         with spmd.no_typecheck():
             result = varlen_attn(
                 q_TNH,
@@ -200,6 +205,8 @@ class VarlenAttention(Module):
             return out_BLNH
 
         out_TNH, lse_NT = result
+        out_TNH = probe_nan(out_TNH, "varlen_attn out")
+        lse_NT = probe_nan(lse_NT, "varlen_attn lse")
         if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
             q_local = spmd.get_local_type(q_TNH)
             q_ps = get_partition_spec(q_TNH)
@@ -212,7 +219,10 @@ class VarlenAttention(Module):
         # FA varlen returns the LSE as (N, T); reorder to (B, L, N) so
         # out_transform can broadcast per (token, head).
         lse_BLN = lse_NT.transpose(0, 1).reshape(B, L, -1)
-        return out_transform(out_BLNH, lse_BLN)
+        res = out_transform(out_BLNH, lse_BLN)
+        res = probe_nan(res, "sink")
+
+        return res
 
 
 class FlexAttention(Module):
@@ -799,6 +809,7 @@ class FusedQKVLinear(BaseQKVLinear):
         # [B, L, n_kv_heads * R * head_dim] -> [B, L, n_kv_heads, R, head_dim]
         # Use -1 for n_kv_heads so TP sharding is handled automatically.
         qkv = self.wqkv(x)
+        qkv = probe_nan(qkv, "qkv_proj")
         with spmd.local():  # TODO(pianpwk): same QKV:S(2) unflatten case handled by even sharding
             qkv = qkv.view(bs, seqlen, -1, self.r_dim, self.head_dim)
             if get_spmd_backend() == "spmd_types":

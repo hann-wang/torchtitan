@@ -21,6 +21,7 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 
 from .token_dispatcher import DeepEPTokenDispatcher, LocalTokenDispatcher
+from .probe import probe_nan
 
 # Shape suffix legend
 # (https://medium.com/@NoamShazeer/shape-suffixes-good-coding-style-f836e72e24fd):
@@ -90,22 +91,28 @@ class GroupedExperts(Module):
                 # spmd.P is not currently allowed to mix with spmd.V.
                 # TODO(pianpwk): likely relax this in spmd_types.
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
-
-        h_RF = F.silu(
-            self._grouped_mm(
-                A=x_RD.bfloat16(),
-                B_t=w1_EFD.bfloat16().transpose(-2, -1),
-                offs=offsets_E,
-            )
+                
+        h_RF = self._grouped_mm(
+            A=x_RD.bfloat16(),
+            B_t=w1_EFD.bfloat16().transpose(-2, -1),
+            offs=offsets_E,
         )
-        h_RF = h_RF * self._grouped_mm(
+        h_RF = probe_nan(h_RF, "gmm1")
+        h_RF = F.silu(h_RF)
+
+        u = self._grouped_mm(
             A=x_RD.bfloat16(),
             B_t=w3_EFD.bfloat16().transpose(-2, -1),
             offs=offsets_E,
         )
-        return self._grouped_mm(
+        u = probe_nan(u, "gmm3")
+        h_RF = h_RF * u
+
+        res = self._grouped_mm(
             A=h_RF, B_t=w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
-        ).type_as(x_RD)
+        )
+        res = probe_nan(res, "gmm2")
+        return res.type_as(x_RD)
 
     def _grouped_mm(
         self, *, A: torch.Tensor, B_t: torch.Tensor, offs: torch.Tensor

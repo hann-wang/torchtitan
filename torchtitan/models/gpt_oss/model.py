@@ -29,6 +29,7 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.utils import get_moe_model_nparams_and_flops
 from torchtitan.protocols.module import Module
+from torchtitan.models.common.probe import probe_nan
 
 
 def apply_attention_sink_rescale(
@@ -103,8 +104,13 @@ class Attention(BaseAttention):
         bsz, seqlen, _ = x.size()
 
         q, k, v = self.qkv_linear(x)
+        q = probe_nan(q, "q")
+        k = probe_nan(k, "k")
+        v = probe_nan(v, "v")
 
         q, k = self.rope(q, k, positions)
+        q = probe_nan(q, "rope q")
+        k = probe_nan(k, "rope k")
 
         output = self.inner_attention(
             q,
@@ -115,12 +121,14 @@ class Attention(BaseAttention):
             enable_gqa=self.enable_gqa,
             out_transform=self._apply_sinks,
         )
+        output = probe_nan(output, "inner_attn")
 
         # Reshape and project output
         output = output.reshape(
             bsz, seqlen, -1
         ).contiguous()  # (bsz, seqlen, n_heads * v_head_dim)
         output = self.wo(output)  # (bsz, seqlen, dim)
+        output = probe_nan(output, "o")
         return output
 
     def _apply_sinks(self, out: torch.Tensor, lse: torch.Tensor) -> torch.Tensor:
