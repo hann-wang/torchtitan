@@ -69,7 +69,7 @@ def gpt_oss_debugmodel_flex() -> Trainer.Config:
 
 
 def gpt_oss_20b() -> Trainer.Config:
-    model_spec = model_registry("20b")
+    model_spec = model_registry("20b", attn_backend="flex")
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
