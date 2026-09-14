@@ -215,6 +215,7 @@ class TokenChoiceTopKRouter(Module):
         route_norm: bool = False
         route_scale: float = 1.0
         _debug_force_load_balance: bool = False
+        use_pre_softmax: bool = True
 
     def __init__(self, config: Config):
         super().__init__()
@@ -227,6 +228,7 @@ class TokenChoiceTopKRouter(Module):
         self.route_norm = config.route_norm
         self.route_scale = config.route_scale
         self._debug_force_load_balance = config._debug_force_load_balance
+        self.use_pre_softmax = config.use_pre_softmax
 
     def _debug_force_load_balance_routing(
         self, scores_BLE: torch.Tensor
@@ -304,14 +306,15 @@ class TokenChoiceTopKRouter(Module):
         with torch.autocast(device_type=x_BLD.device.type, dtype=torch.float32):
             scores_BLE = self.gate(x_BLD)
 
-        # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
-        # scores_BLE is already float32 from the autocast above.
-        if self.score_func == "sigmoid":
-            scores_BLE = torch.sigmoid(scores_BLE)
-        elif self.score_func == "softmax":
-            scores_BLE = F.softmax(scores_BLE, dim=-1)
-        else:
-            raise NotImplementedError(f"Unknown score function {self.score_func}")
+        if self.use_pre_softmax:
+            # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
+            # scores_BLE is already float32 from the autocast above.
+            if self.score_func == "sigmoid":
+                scores_BLE = torch.sigmoid(scores_BLE)
+            elif self.score_func == "softmax":
+                scores_BLE = F.softmax(scores_BLE, dim=-1)
+            else:
+                raise NotImplementedError(f"Unknown score function {self.score_func}")
 
         scores_for_choice_BLE = (
             scores_BLE if expert_bias_E is None else scores_BLE + expert_bias_E
@@ -322,12 +325,23 @@ class TokenChoiceTopKRouter(Module):
                 scores_for_choice_BLE
             )
         _, topk_expert_ids_BLK = torch.topk(
-            scores_for_choice_BLE, k=self.top_k, dim=-1, sorted=False
+            scores_for_choice_BLE, k=self.top_k, dim=-1, sorted=torch.is_grad_enabled()
         )
 
         # NOTE: The expert_bias is only used for routing. The gating value
         #       topk_scores_BLK is still derived from the original scores.
         topk_scores_BLK = scores_BLE.gather(dim=-1, index=topk_expert_ids_BLK)
+
+        if not self.use_pre_softmax:
+            # By default, sigmoid or softmax is performed in float32 to avoid loss explosion.
+            # topk_scores_BLK is already float32 from the autocast above.
+            assert topk_scores_BLK.dtype == torch.float32
+            if self.score_func == "sigmoid":
+                topk_scores_BLK = torch.sigmoid(topk_scores_BLK)
+            elif self.score_func == "softmax":
+                topk_scores_BLK = F.softmax(topk_scores_BLK, dim=-1)
+            else:
+                raise NotImplementedError(f"Unknown score function {self.score_func}")
 
         # debug override: balanced round-robin routing
         if self._debug_force_load_balance:

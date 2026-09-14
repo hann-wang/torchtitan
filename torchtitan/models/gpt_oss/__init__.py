@@ -7,6 +7,7 @@
 import dataclasses
 from collections.abc import Callable
 from functools import partial
+import math
 
 import torch.nn as nn
 
@@ -51,16 +52,17 @@ _NORM_INIT = {"weight": nn.init.ones_}
 _EMBEDDING_INIT = {"weight": partial(nn.init.normal_, std=0.008)}
 
 
-def _output_linear_init(dim: int) -> dict[str, Callable]:
+def _output_linear_init(std: float = 0.008, num_layers: int = 24) -> dict[str, Callable]:
     return {
-        "weight": partial(nn.init.normal_, std=0.008),
+        "weight": partial(nn.init.normal_, std=std / math.sqrt(2.0 * num_layers)),
+        # "weight": partial(nn.init.normal_, std=std),
         "bias": nn.init.zeros_,
     }
 
 
-def _depth_init(layer_id: int) -> dict[str, Callable]:
+def _default_init(std: float = 0.008) -> dict[str, Callable]:
     return {
-        "weight": partial(nn.init.normal_, std=0.008),
+        "weight": partial(nn.init.normal_, std=std),
         "bias": nn.init.zeros_,
     }
 
@@ -94,7 +96,7 @@ def _make_gptoss_attn_config(
         )
 
     sinks_init = {
-        "sinks": partial(nn.init.trunc_normal_, std=0.008)
+        "sinks": nn.init.zeros_,
     }
 
     if fuse_qkv:
@@ -106,7 +108,7 @@ def _make_gptoss_attn_config(
                 in_features=dim,
                 out_features=(n_heads + 2 * n_kv_heads) * head_dim,
                 bias=True,
-                param_init=_depth_init(layer_id),
+                param_init=_default_init(),
             ),
         )
     else:
@@ -116,13 +118,13 @@ def _make_gptoss_attn_config(
                 in_features=dim,
                 out_features=n_heads * head_dim,
                 bias=True,
-                param_init=_depth_init(layer_id),
+                param_init=_default_init(),
             ),
             wkv=Linear.Config(
                 in_features=dim,
                 out_features=n_kv_heads * head_dim,
                 bias=True,
-                param_init=_depth_init(layer_id),
+                param_init=_default_init(),
             ),
         )
 
@@ -136,7 +138,7 @@ def _make_gptoss_attn_config(
             in_features=n_heads * head_dim,
             out_features=dim,
             bias=True,
-            param_init=_depth_init(layer_id),
+            param_init=_output_linear_init(),
         ),
         sliding_window_size=sliding_window_size,
         inner_attention=inner_attention,
@@ -156,12 +158,10 @@ def _make_gptoss_experts_config(
     non_blocking_capacity_factor: float | None = None,
 ) -> RoutedExperts.Config:
     """Build a fully-specified RoutedExperts.Config for a single GPT-OSS layer."""
-    std = 0.008
     experts_init = {
-        "mlp1_weight_EGD": partial(nn.init.trunc_normal_, std=std),
-        "mlp1_bias_EG": partial(nn.init.trunc_normal_, std=std),
-        "mlp2_weight_EDF": partial(nn.init.trunc_normal_, std=std),
-        "mlp2_bias_ED": partial(nn.init.trunc_normal_, std=std),
+        "w1_EFD": _default_init()["weight"],
+        "w3_EFD": _default_init()["weight"],
+        "w2_EDF": _output_linear_init()["weight"],
     }
     return RoutedExperts.Config(
         inner_experts=GptOssGroupedExperts.Config(
@@ -225,12 +225,13 @@ def _build_gptoss_layers(
             router=TokenChoiceTopKRouter.Config(
                 num_experts=num_experts,
                 score_func="softmax",
-                route_norm=True,
+                route_norm=False,
+                use_pre_softmax=False,
                 gate=Linear.Config(
                     in_features=dim,
                     out_features=num_experts,
                     bias=True,
-                    param_init=_depth_init(layer_id),
+                    param_init=_default_init(),
                 ),
                 top_k=top_k,
             ),
@@ -262,7 +263,7 @@ def _debugmodel(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=2048,
-            param_init=_output_linear_init(dim),
+            param_init=_default_init(),
         ),
         layers=_build_gptoss_layers(
             fuse_qkv=True,
@@ -306,7 +307,7 @@ def _20b(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=201088,
-            param_init=_output_linear_init(dim),
+            param_init=_default_init(),
         ),
         layers=_build_gptoss_layers(
             fuse_qkv=True,
@@ -350,7 +351,7 @@ def _120b(
         lm_head=Linear.Config(
             in_features=dim,
             out_features=201088,
-            param_init=_output_linear_init(dim),
+            param_init=_default_init(),
         ),
         layers=_build_gptoss_layers(
             fuse_qkv=True,

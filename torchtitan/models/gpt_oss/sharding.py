@@ -28,10 +28,9 @@ if TYPE_CHECKING:
 # Routed-expert layout for ``GptOssGroupedExperts`` (mlp1/mlp2 fused
 # weights + biases): mlp1 colwise, mlp2 rowwise, mlp2_bias replicated.
 _GPT_OSS_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
-    "mlp1_weight_EGD": spmd.S(1),
-    "mlp1_bias_EG": spmd.S(1),
-    "mlp2_weight_EDF": spmd.S(2),
-    "mlp2_bias_ED": spmd.R,
+    "w1_EFD": spmd.S(1),
+    "w2_EDF": spmd.S(2),
+    "w3_EFD": spmd.S(1),
 }
 
 
