@@ -325,7 +325,7 @@ class TokenChoiceTopKRouter(Module):
                 scores_for_choice_BLE
             )
         _, topk_expert_ids_BLK = torch.topk(
-            scores_for_choice_BLE, k=self.top_k, dim=-1, sorted=torch.is_grad_enabled()
+            scores_for_choice_BLE, k=self.top_k, dim=-1, sorted=False,
         )
 
         # NOTE: The expert_bias is only used for routing. The gating value
