@@ -37,7 +37,7 @@ from .nn_modules import (
     SiLU,
 )
 from .rope import ComplexRoPE, CosSinRoPE, RoPE
-from .probe import probe_nan
+from .probe import probe_nan, probe_varlen_attn
 
 __all__ = [
     "Conv1d",
@@ -76,4 +76,5 @@ __all__ = [
     "VarlenMetadata",
     "compute_ffn_hidden_dim",
     "probe_nan",
+    "probe_varlen_attn",
 ]

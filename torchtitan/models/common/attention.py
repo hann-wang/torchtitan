@@ -47,7 +47,7 @@ from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 from torchtitan.tools.utils import round_up
 
-from .probe import probe_nan
+from .probe import probe_nan, probe_varlen_attn
 
 
 __all__ = [
@@ -169,8 +169,8 @@ class VarlenAttention(Module):
         if kwargs.get("enable_gqa", False):
             varlen_kwargs["enable_gqa"] = True
 
-        if out_transform is not None:
-            varlen_kwargs["return_aux"] = VarlenAuxRequest(lse=True)
+        # if out_transform is not None:
+        #     varlen_kwargs["return_aux"] = VarlenAuxRequest(lse=True)
 
         # FA3 varlen attention takes rank-local metadata tensors.
         # TODO(pianpwk): Move this op contract into pytorch/spmd_types.
@@ -178,7 +178,19 @@ class VarlenAttention(Module):
         k_TNH = probe_nan(k_TNH, "k_TNH")
         v_TNH = probe_nan(v_TNH, "v_TNH")
         with spmd.no_typecheck():
-            result = varlen_attn(
+            # result = varlen_attn(
+            #     q_TNH,
+            #     k_TNH,
+            #     v_TNH,
+            #     cu_seq_q,
+            #     cu_seq_k,
+            #     max_q,
+            #     max_k,
+            #     scale=scale,
+            #     window_size=self.window_size,
+            #     **varlen_kwargs,
+            # )
+            result = probe_varlen_attn(
                 q_TNH,
                 k_TNH,
                 v_TNH,
