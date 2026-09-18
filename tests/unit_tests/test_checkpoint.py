@@ -5,18 +5,28 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import queue as queue_lib
 import shutil
 import tempfile
 import time
 import unittest
+import uuid
+from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest import mock
 
+import fsspec
 import torch
 import torch.nn as nn
+from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
 from torch.utils.data import DataLoader
-from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.config.job_config import Checkpoint as CheckpointConfig
+from torchtitan.components.checkpoint import (
+    CheckpointManager,
+    MODEL,
+    ModelWrapper,
+    purge_thread,
+    Terminate,
+)
 
 
 class FakeOptimizersContainer:
@@ -62,30 +72,50 @@ class FakeDataLoader(DataLoader):
         pass
 
 
-class DummyFTManager:
-    """A fake FTManager-like object with enabled=False."""
-
-    def __init__(self):
-        self.enabled = False
-        self.manager = None
-
-
 class DummyFuture:
+    def __new__(cls):
+        # Return a Mock that mimics Future instead of an instance of this class
+        # That allows isinstance(DummyFuture, Future) to pass
+        instance = mock.Mock(spec=Future)
+
+        # Add a custom attribute to the mock the done state
+        instance.finished = False
+
+        # When result() is called, it flips the finished flag
+        def side_effect_result(*args, **kwargs):
+            instance.finished = True
+            return None
+
+        instance.done.side_effect = lambda: instance.finished
+        instance.result.side_effect = side_effect_result
+        instance.result.return_value = None
+
+        return instance
+
+
+class DummyAsyncResult(AsyncSaveResponse):
+    """Mock object that mimics the return value of dcp.async_save with pinned memory"""
+
     def __init__(self):
-        self.result = mock.Mock()
+        self.upload_completion = DummyFuture()
+        self.staging_completion = DummyFuture()
 
 
 def fake_async_save(*args, **kwargs):
-    return DummyFuture()
+    # Check if this is async_with_pinned_mem mode by looking for async_stager parameter
+    if kwargs.get("async_stager"):
+        return DummyAsyncResult()
+    else:
+        return DummyFuture()
 
 
-class DummyJobConfig:
-    def __init__(self, job):
-        self.job = job
-        self.checkpoint = CheckpointConfig(
+class DummyTrainerConfig:
+    def __init__(self, dump_folder):
+        self.dump_folder = dump_folder
+        self.checkpoint = CheckpointManager.Config(
             enable=True,
             async_mode="disabled",
-            folder="",
+            folder="test_folder",
             interval=1,
             keep_latest_k=0,
             last_save_model_only=False,
@@ -94,7 +124,6 @@ class DummyJobConfig:
             initial_load_path=None,
             initial_load_model_only=False,
         )
-        self.fault_tolerance = SimpleNamespace(replica_id=0)
 
 
 class TestCheckpointManager(unittest.TestCase):
@@ -111,12 +140,11 @@ class TestCheckpointManager(unittest.TestCase):
         self.optimizers = FakeOptimizersContainer()
         self.lr_schedulers = FakeLRSchedulersContainer()
         self.data_loader = FakeDataLoader()
-        self.ft_manager = DummyFTManager()
 
-        ckpt_cfg = CheckpointConfig(
+        ckpt_cfg = CheckpointManager.Config(
             enable=True,
             async_mode="DISABLED",
-            folder="",
+            folder=self.test_folder,
             interval=1,
             keep_latest_k=2,
             last_save_model_only=False,
@@ -125,12 +153,9 @@ class TestCheckpointManager(unittest.TestCase):
             initial_load_path=None,
             initial_load_model_only=False,
         )
-        ft_ns = SimpleNamespace(replica_id=0)
-        job_ns = SimpleNamespace(dump_folder=self.test_folder)
-        self.job_config = SimpleNamespace(
+        self.trainer_config = SimpleNamespace(
             checkpoint=ckpt_cfg,
-            fault_tolerance=ft_ns,
-            job=job_ns,
+            dump_folder=self.test_folder,
         )
 
         # Patch process group creation
@@ -175,10 +200,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
 
         w0 = self.model_part.weight.clone()
@@ -209,10 +233,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
 
         manager.save(curr_step=1)
@@ -251,10 +274,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
         manager.save(curr_step=1)
         manager.save(curr_step=2)
@@ -266,8 +288,9 @@ class TestCheckpointManager(unittest.TestCase):
         self.assertEqual(len(mock_save.call_args_list), 3)
         manager.close()
 
-    def test_load_returns_false_when_no_checkpoint_folder(self):
-        cfg = self.job_config.checkpoint
+    @mock.patch("torchtitan.components.checkpoint.logger")
+    def test_load_returns_false_when_no_checkpoint_folder(self, mock_logger):
+        cfg = self.trainer_config.checkpoint
         cfg.folder = "nonexistent"
         manager = CheckpointManager(
             dataloader=self.data_loader,
@@ -275,12 +298,31 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
         self.assertFalse(manager.load(step=-1))
+        mock_logger.info.assert_any_call(
+            "No checkpoint was provided, this is a fresh start."
+        )
+        manager.close()
+
+    def test_explicit_load_step_raises_when_checkpoint_folder_missing(self):
+        cfg = self.trainer_config.checkpoint
+        cfg.folder = "nonexistent"
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=self.trainer_config.checkpoint,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+        with self.assertRaisesRegex(FileNotFoundError, "--checkpoint.load_step=5"):
+            manager.load(step=5)
         manager.close()
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
@@ -292,7 +334,7 @@ class TestCheckpointManager(unittest.TestCase):
             d = os.path.join(ckpt_folder, f"step-{s}")
             os.makedirs(d, exist_ok=True)
             open(os.path.join(d, ".metadata"), "w").close()
-        cfg = self.job_config.checkpoint
+        cfg = self.trainer_config.checkpoint
         cfg.folder = "checkpoints"
         manager = CheckpointManager(
             dataloader=self.data_loader,
@@ -300,17 +342,113 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
         res = manager.load(step=-1)
         expected = os.path.join(ckpt_folder, "step-5")
         mock_load.assert_called_once()
-        args, kwargs = mock_load.call_args
+        _, kwargs = mock_load.call_args
         self.assertEqual(kwargs.get("checkpoint_id"), expected)
         self.assertTrue(res)
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.load")
+    def test_initial_load_path_used_when_folder_has_no_valid_checkpoints(
+        self, mock_load, mock_rank
+    ):
+        initial_load_path = os.path.join(self.base_temp_dir, "initial", "step-100")
+        os.makedirs(initial_load_path, exist_ok=True)
+
+        cfg = self.trainer_config.checkpoint
+        cfg.initial_load_path = initial_load_path
+        cfg.initial_load_model_only = True
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=self.trainer_config.checkpoint,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        res = manager.load(step=-1)
+
+        mock_load.assert_called_once()
+        _, kwargs = mock_load.call_args
+        self.assertEqual(kwargs.get("checkpoint_id"), initial_load_path)
+        self.assertTrue(res)
+        manager.close()
+
+    @mock.patch("torchtitan.components.checkpoint.logger")
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.load")
+    def test_initial_load_path_ignored_when_folder_has_valid_checkpoints(
+        self, mock_load, mock_rank, mock_logger
+    ):
+        # Resuming from checkpoint.folder is the fault-tolerance path: all
+        # initial_* options are silently ignored so a job can keep the same
+        # arguments across automatic restarts.
+        initial_load_path = os.path.join(self.base_temp_dir, "initial", "step-100")
+        os.makedirs(initial_load_path, exist_ok=True)
+        ckpt_folder = os.path.join(self.test_folder, "checkpoints")
+        step_dir = os.path.join(ckpt_folder, "step-5")
+        os.makedirs(step_dir, exist_ok=True)
+        open(os.path.join(step_dir, ".metadata"), "w").close()
+
+        cfg = self.trainer_config.checkpoint
+        cfg.folder = "checkpoints"
+        cfg.initial_load_path = initial_load_path
+        cfg.initial_load_model_only = True
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=self.trainer_config.checkpoint,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        res = manager.load(step=-1)
+
+        self.assertTrue(res)
+        mock_load.assert_called_once()
+        _, kwargs = mock_load.call_args
+        self.assertEqual(kwargs.get("checkpoint_id"), step_dir)
+        mock_logger.warning.assert_not_called()
+        manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.load")
+    def test_explicit_load_step_raises_when_checkpoint_step_missing(
+        self, mock_load, mock_rank
+    ):
+        ckpt_folder = os.path.join(self.test_folder, "checkpoints")
+        os.makedirs(ckpt_folder, exist_ok=True)
+
+        cfg = self.trainer_config.checkpoint
+        cfg.folder = "checkpoints"
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=self.trainer_config.checkpoint,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        with self.assertRaisesRegex(FileNotFoundError, "--checkpoint.load_step=5"):
+            manager.load(step=5)
+
+        mock_load.assert_not_called()
         manager.close()
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
@@ -321,7 +459,7 @@ class TestCheckpointManager(unittest.TestCase):
         Test that save() only triggers on step 1 and multiples of interval, skipping others,
         but respects force flag to override interval.
         """
-        cfg = self.job_config.checkpoint
+        cfg = self.trainer_config.checkpoint
         cfg.interval = 3
         cfg.keep_latest_k = 0
         mock_save.side_effect = self.fake_save
@@ -331,10 +469,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
         manager.save(curr_step=1)
         self.assertEqual(mock_save.call_count, 0)
@@ -359,49 +496,48 @@ class TestCheckpointManager(unittest.TestCase):
         mock_save.side_effect = self.fake_save
         mock_load.side_effect = self.fake_load
         # Phase 1: save model weights only
-        self.job_config.checkpoint.last_save_model_only = True
+        self.trainer_config.checkpoint.last_save_model_only = True
         manager1 = CheckpointManager(
             dataloader=self.data_loader,
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
         manager1.save(curr_step=1, last_step=True)
         path1 = os.path.join(self.test_folder, "step-1")
         self.assertTrue(os.path.isdir(path1))
         # Phase 2: initial load from step-1
-        cfg = self.job_config.checkpoint
+        cfg = self.trainer_config.checkpoint
         cfg.last_save_model_only = False
         cfg.initial_load_model_only = True
         cfg.initial_load_path = path1
-        cfg.folder = ""
-        self.job_config.job.dump_folder = self.test_folder
+        cfg.folder = "new_checkpoints"
+        self.trainer_config.dump_folder = self.test_folder
         manager2 = CheckpointManager(
             dataloader=self.data_loader,
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
-        r1 = manager2.load(step=1)
+        r1 = manager2.load(step=-1)
         self.assertTrue(r1)
         mock_load.assert_called_once()
-        args1, kwargs1 = mock_load.call_args
+        _, kwargs1 = mock_load.call_args
         self.assertEqual(kwargs1.get("checkpoint_id"), path1)
-        # Phase 3: save new step under default folder, then load that
+        # Phase 3: save a new run checkpoint, then load it from the current folder.
         manager2.save(curr_step=2, last_step=True)
-        # Default folder is test_folder, so step-2 under that
-        step2_dir = os.path.join(self.test_folder, "step-2")
+        # New run checkpoints are saved under the configured output folder.
+        step2_dir = os.path.join(self.test_folder, "new_checkpoints", "step-2")
         self.assertTrue(os.path.isdir(step2_dir))
+        manager2.initial_load_path = None
         r2 = manager2.load(step=2)
         self.assertTrue(r2)
         self.assertEqual(mock_load.call_count, 2)
@@ -410,19 +546,80 @@ class TestCheckpointManager(unittest.TestCase):
         manager1.close()
         manager2.close()
 
+    @mock.patch("torchtitan.components.checkpoint.logger")
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torch.cuda.Stream")
+    @mock.patch("torchtitan.components.checkpoint.DefaultStager")
     @mock.patch("torchtitan.components.checkpoint.dist.new_group")
     @mock.patch(
         "torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save
     )
-    def test_async_save_calls_async_wait(self, mock_async_save, mock_new_group):
+    def test_async_save_with_pinned_mem_assigns_staging_future(
+        self,
+        mock_async_save,
+        mock_new_group,
+        mock_default_stager,
+        mock_cuda_stream,
+        mock_rank,
+        mock_logger,
+    ):
+        """
+        Test that AsyncMode.ASYNC_WITH_PINNED_MEM correctly assigns the staging future.
+
+        This test verifies that when using ASYNC_WITH_PINNED_MEM mode, the
+        staging_future is properly captured from the save response. This handle
+        is critical for ensuring that subsequent operations wait for the
+        GPU-to-CPU transfer to complete before proceeding.
+        """
+        # Configure async mode with pinned memory
+        trainer_config = DummyTrainerConfig(dump_folder=self.trainer_config.dump_folder)
+        checkpoint_config = trainer_config.checkpoint
+        checkpoint_config.async_mode = "async_with_pinned_mem"
+
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=checkpoint_config,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        # Initially staging_future should be None
+        self.assertIsNone(manager.staging_future)
+
+        manager.save(curr_step=1, last_step=False)
+        # After save, staging_future shouldn't be None ...
+        self.assertIsNotNone(manager.staging_future)
+        # ... and staging should be running
+        self.assertFalse(manager.staging_future.done())
+
+        # Verify that `maybe_wait_for_staging` actually waits for staging future to complete
+        staging_future = manager.staging_future
+        manager.maybe_wait_for_staging()
+        staging_future.result.assert_called_once()
+
+        # After waiting, the staging future should be None
+        self.assertIsNone(manager.staging_future)
+
+        manager.close()
+
+    @mock.patch("torchtitan.components.checkpoint.dist.new_group")
+    @mock.patch(
+        "torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save
+    )
+    def test_async_save_calls_maybe_wait_for_saving(
+        self, mock_async_save, mock_new_group
+    ):
         """
         Test that in AsyncMode.ASYNC, save() waits on previous async future.
         """
         # Configure async mode
-        job_config = DummyJobConfig(job=self.job_config.job)
-        checkpoint_config = job_config.checkpoint
+        trainer_config = DummyTrainerConfig(dump_folder=self.trainer_config.dump_folder)
+        checkpoint_config = trainer_config.checkpoint
         checkpoint_config.async_mode = "async"
-        ft_manager = DummyFTManager()
         states = {"trainer": torch.tensor([0])}
         manager = CheckpointManager(
             dataloader=self.data_loader,
@@ -430,10 +627,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=states,
-            checkpoint_config=checkpoint_config,
+            config=checkpoint_config,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
 
         # First save schedules async
@@ -449,51 +645,6 @@ class TestCheckpointManager(unittest.TestCase):
         new_future = manager.save_future
         new_future.result.assert_not_called()
 
-    @mock.patch("torch.cuda.Stream")
-    @mock.patch("torchtitan.components.checkpoint.dist.new_group")
-    @mock.patch(
-        "torchtitan.components.checkpoint.dcp.async_save", side_effect=fake_async_save
-    )
-    def test_ft_async_save_calls_async_wait(
-        self,
-        mock_async_save,
-        mock_new_group,
-        mock_cuda_stream,
-    ):
-        """
-        Test that with FT enabled, AsyncMode.ASYNC via FT triggers correct waits.
-        """
-        job_config = DummyJobConfig(job=self.job_config.job)
-        checkpoint_config = job_config.checkpoint
-        checkpoint_config.async_mode = "async"
-        ft_manager = mock.Mock()
-        ft_manager.manager.return_value = mock.Mock()
-        ft_manager.manager.participating_rank = mock.Mock(return_value=0)
-        ft_manager.enabled = True
-        manager = CheckpointManager(
-            dataloader=self.data_loader,
-            model_parts=self.model_parts,
-            optimizers=self.optimizers,
-            lr_schedulers=self.lr_schedulers,
-            states=self.states,
-            checkpoint_config=checkpoint_config,
-            sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
-        )
-
-        # Initially no future
-        self.assertIsNone(manager.save_future)
-        manager.save(curr_step=5, last_step=False)
-        self.assertIsNotNone(manager.save_future)
-
-        manager.save_future.result.assert_not_called()
-        prev_future = manager.save_future
-        manager.save(curr_step=6, last_step=False)
-        prev_future.result.assert_called_once()
-        self.assertIsNotNone(manager.save_future)
-        manager.save_future.result.assert_not_called()
-
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torchtitan.components.checkpoint.dcp.save")
     def test_enable_first_step_checkpoint(self, mock_save, mock_rank):
@@ -503,7 +654,7 @@ class TestCheckpointManager(unittest.TestCase):
         mock_save.side_effect = self.fake_save
 
         # Test with enable_first_step_checkpoint=False (default case)
-        cfg = self.job_config.checkpoint
+        cfg = self.trainer_config.checkpoint
         cfg.interval = 10  # Set interval to 10 so step 1 wouldn't normally trigger save
         cfg.keep_latest_k = 0  # Disable purging to avoid confusion
 
@@ -513,10 +664,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
 
         # Step 1 should not trigger save when enable_first_step_checkpoint=False
@@ -540,10 +690,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
 
         # Step 1 should trigger save due to enable_first_step_checkpoint=True
@@ -578,7 +727,7 @@ class TestCheckpointManager(unittest.TestCase):
         fake_model = FakeModelWithFreqsCis()
         mock_save.side_effect = self.fake_save
 
-        cfg = self.job_config.checkpoint
+        cfg = self.trainer_config.checkpoint
         cfg.keep_latest_k = 0  # Disable purging
 
         manager = CheckpointManager(
@@ -587,10 +736,9 @@ class TestCheckpointManager(unittest.TestCase):
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
 
         manager.save(curr_step=1)
@@ -606,6 +754,62 @@ class TestCheckpointManager(unittest.TestCase):
         self.assertIn("other_param", saved_data)
 
         manager.close()
+
+    @mock.patch("torch.distributed.get_rank", return_value=0)
+    @mock.patch("torchtitan.components.checkpoint.dcp.save")
+    def test_load_only_prevents_saving(self, mock_save, mock_rank):
+        """
+        Test that load_only=True prevents checkpoint saving.
+        """
+        mock_save.side_effect = self.fake_save
+
+        # Configure load_only=True
+        cfg = self.trainer_config.checkpoint
+        cfg.load_only = True
+        cfg.interval = 1  # Set low interval to ensure saves would normally trigger
+
+        manager = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=self.trainer_config.checkpoint,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        # Test various save conditions that would normally trigger saves
+        manager.save(curr_step=1)  # Regular step save
+        self.assertEqual(mock_save.call_count, 0)
+
+        manager.save(curr_step=5)  # Interval-based save
+        self.assertEqual(mock_save.call_count, 0)
+
+        manager.save(curr_step=10, last_step=True)  # Last step save
+        self.assertEqual(mock_save.call_count, 0)
+
+        manager.close()
+
+        # Verify that saves work normally when load_only=False
+        mock_save.reset_mock()
+        cfg.load_only = False
+
+        manager2 = CheckpointManager(
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            config=self.trainer_config.checkpoint,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        manager2.save(curr_step=1)  # Should trigger save now
+        self.assertEqual(mock_save.call_count, 1)
+
+        manager2.close()
 
     @mock.patch("torch.distributed.get_rank", return_value=0)
     @mock.patch("torchtitan.components.checkpoint.dcp.load")
@@ -630,18 +834,17 @@ class TestCheckpointManager(unittest.TestCase):
             self.assertNotIn("model", state_dict)
             self.assertIn("optimizer", state_dict)
 
-        self.job_config.checkpoint.last_save_model_only = True
-        self.job_config.checkpoint.initial_load_model_only = False
+        self.trainer_config.checkpoint.last_save_model_only = True
+        self.trainer_config.checkpoint.initial_load_model_only = False
         manager = CheckpointManager(
             dataloader=self.data_loader,
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
             states=self.states,
-            checkpoint_config=self.job_config.checkpoint,
+            config=self.trainer_config.checkpoint,
             sd_adapter=None,
-            base_folder=self.job_config.job.dump_folder,
-            ft_manager=self.ft_manager,
+            base_folder=self.trainer_config.dump_folder,
         )
 
         mock_save.side_effect = fake_save
@@ -649,6 +852,273 @@ class TestCheckpointManager(unittest.TestCase):
         manager.save(curr_step=1)
         manager.save(curr_step=2, last_step=True)
         manager.load(step=1)
+
+    def test_maybe_wait_for_staging_when_checkpoint_disabled(self):
+        """Verify that calling maybe_wait_for_staging succeeds without errors when the manager is disabled."""
+
+        config = CheckpointManager.Config(enable=False)
+        manager = CheckpointManager(
+            config=config,
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        manager.maybe_wait_for_staging()
+
+    def test_maybe_wait_for_saving_when_checkpoint_disabled(self):
+        """Verify that calling maybe_wait_for_saving succeeds without errors when the manager is disabled."""
+
+        config = CheckpointManager.Config(enable=False)
+        manager = CheckpointManager(
+            config=config,
+            dataloader=self.data_loader,
+            model_parts=self.model_parts,
+            optimizers=self.optimizers,
+            lr_schedulers=self.lr_schedulers,
+            states=self.states,
+            sd_adapter=None,
+            base_folder=self.trainer_config.dump_folder,
+        )
+
+        manager.maybe_wait_for_saving()
+
+
+class TestConfigPostInit(unittest.TestCase):
+    def test_valid_default_config(self):
+        """Verify that default values pass initialization."""
+        try:
+            CheckpointManager.Config()
+        except Exception as e:
+            self.fail(f"Default Config raised {type(e).__name__} unexpectedly!")
+
+    def test_sanity_and_range_checks(self):
+        """Test basic field validation like empty strings and negative numbers."""
+        # Folder cannot be empty
+        with self.assertRaisesRegex(ValueError, "folder.*cannot be empty"):
+            CheckpointManager.Config(folder="   ")
+
+        # Interval must be >= 1
+        with self.assertRaisesRegex(ValueError, "interval.*at least 1"):
+            CheckpointManager.Config(interval=0)
+
+        # keep_latest_k range checks
+        with self.assertRaisesRegex(ValueError, "cannot be negative"):
+            CheckpointManager.Config(keep_latest_k=-1)
+        with self.assertRaisesRegex(ValueError, "at least 2 checkpoint replicas"):
+            CheckpointManager.Config(keep_latest_k=1)
+
+        with self.assertRaisesRegex(
+            ValueError, f"{MODEL} key shouldn't be in exclude_from_loading."
+        ):
+            CheckpointManager.Config(exclude_from_loading=[MODEL])
+
+    def test_path_normalization(self):
+        """initial_load_path is stripped and must be absolute or a remote URI."""
+        # Leading/trailing whitespace is stripped.
+        cfg = CheckpointManager.Config(initial_load_path="  /absolute/path/step-100  ")
+        self.assertEqual(cfg.initial_load_path, "/absolute/path/step-100")
+
+        # A remote URI is accepted (and stripped).
+        cfg = CheckpointManager.Config(initial_load_path="  gs://bucket/run/step-100  ")
+        self.assertEqual(cfg.initial_load_path, "gs://bucket/run/step-100")
+
+        # A bare relative path is rejected.
+        with self.assertRaisesRegex(ValueError, "absolute path or a remote"):
+            CheckpointManager.Config(initial_load_path="relative/path/step-100")
+
+    def test_dependency_assertions(self):
+        """Test logic where one field requires another to be set."""
+        # HF load needs model_only=True; initial_load_path stays optional.
+        with self.assertRaisesRegex(ValueError, "requires initial_load_model_only"):
+            CheckpointManager.Config(
+                initial_load_in_hf=True, initial_load_model_only=False
+            )
+        CheckpointManager.Config(initial_load_in_hf=True, initial_load_path=None)
+
+        # HF quantized requires HF enabled
+        with self.assertRaisesRegex(ValueError, "requires initial_load_in_hf"):
+            CheckpointManager.Config(
+                initial_load_in_hf_quantized=True,
+                initial_load_in_hf=False,
+                initial_load_path="/path/step-1",
+            )
+
+        # HF last save requires model_only
+        with self.assertRaisesRegex(ValueError, "requires last_save_model_only=True"):
+            CheckpointManager.Config(last_save_in_hf=True, last_save_model_only=False)
+
+    def test_remote_hf_rejected(self):
+        """HF safetensors format is not supported with remote (fsspec) paths."""
+        with self.assertRaisesRegex(
+            ValueError, "last_save_in_hf is not supported with a remote"
+        ):
+            CheckpointManager.Config(
+                folder="gs://bucket/run",
+                last_save_in_hf=True,
+                last_save_model_only=True,
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "initial_load_in_hf is not supported with a remote"
+        ):
+            CheckpointManager.Config(
+                initial_load_in_hf=True,
+                initial_load_model_only=True,
+                initial_load_path="gs://bucket/run/step-1",
+            )
+
+    def test_mode_normalization(self):
+        """Test that async_mode is case-normalized."""
+        cfg = CheckpointManager.Config(async_mode="ASYNC")
+        self.assertEqual(cfg.async_mode, "async")
+
+        with self.assertRaisesRegex(ValueError, "Invalid async_mode"):
+            CheckpointManager.Config(async_mode="invalid_mode")
+
+    @mock.patch("torchtitan.components.checkpoint.logger")
+    def test_warnings(self, mock_logger):
+        """Test that logical redundancies trigger warnings but don't crash."""
+
+        # Redundant load_only vs first_step
+        CheckpointManager.Config(load_only=True, enable_first_step_checkpoint=True)
+        mock_logger.warning.assert_any_call(
+            "checkpoint.load_only is True; enable_first_step_checkpoint will be ignored."
+        )
+
+        # model_only=True without a path
+        CheckpointManager.Config(initial_load_model_only=True, initial_load_path=None)
+        mock_logger.warning.assert_any_call(
+            "initial_load_model_only=True has no effect without an initial_load_path."
+        )
+
+
+class TestFindLoadStepRemote(unittest.TestCase):
+    """_find_load_step must discover checkpoints on a remote (fsspec) folder,
+    exercising listdir-basename reduction and per-dir metadata probing over the
+    in-memory backend (no gcsfs/network)."""
+
+    def setUp(self):
+        self.name = f"test-{uuid.uuid4().hex}"
+        self.root = f"memory://{self.name}"
+        self._fs = fsspec.filesystem("memory")
+
+    def tearDown(self):
+        if self._fs.exists(f"/{self.name}"):
+            self._fs.rm(f"/{self.name}", recursive=True)
+
+    def _write(self, url):
+        with fsspec.open(url, "wb") as f:
+            f.write(b"x")
+
+    def test_returns_max_valid_step(self):
+        self._write(f"{self.root}/step-10/.metadata")
+        self._write(f"{self.root}/step-20/.metadata")
+        # step-30 has no core metadata -> not a valid checkpoint.
+        self._write(f"{self.root}/step-30/some_shard")
+        # A non-checkpoint directory must be ignored.
+        self._write(f"{self.root}/logs/events")
+
+        manager = CheckpointManager.__new__(CheckpointManager)
+        self.assertEqual(manager._find_load_step(folder=self.root), 20)
+
+    def test_missing_folder_returns_negative_one(self):
+        manager = CheckpointManager.__new__(CheckpointManager)
+        self.assertEqual(manager._find_load_step(folder=self.root), -1)
+
+
+class TestPurgeThread(unittest.TestCase):
+    """A single failed deletion must not kill the daemon purge thread; otherwise
+    keep_latest_k would silently stop purging for the rest of the run."""
+
+    def test_survives_failed_delete(self):
+        q = queue_lib.Queue()
+        q.put("fails")
+        q.put("succeeds")
+        q.put(Terminate())
+
+        calls = []
+
+        def rmtree(path):
+            calls.append(path)
+            if path == "fails":
+                raise RuntimeError("transient backend error")
+
+        with mock.patch(
+            "torchtitan.components.checkpoint.filesystem.rmtree", side_effect=rmtree
+        ):
+            # Returns once Terminate is dequeued; must not raise.
+            purge_thread(q)
+
+        self.assertEqual(calls, ["fails", "succeeds"])
+
+
+class TestModelWrapper(unittest.TestCase):
+    """ModelWrapper.state_dict() must keep stable tensor storage across calls so
+    the async pinned-memory stager (keyed by source storage) reuses its host
+    buffers, while still reflecting current parameter values -- including for
+    modules whose state_dict hooks emit freshly allocated tensors. CPU-only:
+    checks storage identity and values, no actual staging.
+    """
+
+    def test_plain_param_cached_and_reflects_updates(self):
+        class Plain(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4))
+
+        model = Plain()
+        wrapper = ModelWrapper(model)
+
+        sd1 = wrapper.state_dict()
+        ptr = sd1["w"].untyped_storage().data_ptr()
+
+        with torch.no_grad():
+            model.w.fill_(2.0)
+
+        sd2 = wrapper.state_dict()
+        # Same dict and same storage; the cached view shares the parameter's
+        # storage, so the update shows through with no copy.
+        self.assertIs(sd2, sd1)
+        self.assertEqual(sd2["w"].untyped_storage().data_ptr(), ptr)
+        self.assertTrue(torch.all(sd2["w"] == 2.0))
+
+    def test_hook_tensor_storage_stable_and_refreshed(self):
+        class HookedModule(nn.Module):
+            # Slice a non-leading dim so .contiguous() allocates new storage
+            # disconnected from the parameter, mirroring FusedSwiGLU's split.
+            def __init__(self):
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4, 2, 3))
+                self.register_state_dict_post_hook(self._split)
+
+            @staticmethod
+            def _split(module, state_dict, prefix, local_metadata):
+                w = state_dict.pop(f"{prefix}w")
+                state_dict[f"{prefix}a"] = w[:, 0].contiguous()
+                state_dict[f"{prefix}b"] = w[:, 1].contiguous()
+
+        model = HookedModule()
+        wrapper = ModelWrapper(model)
+
+        sd1 = wrapper.state_dict()
+        self.assertIn("a", sd1)
+        self.assertNotIn("w", sd1)
+        ptr_a = sd1["a"].untyped_storage().data_ptr()
+        self.assertTrue(torch.all(sd1["a"] == 0.0))
+
+        with torch.no_grad():
+            model.w.fill_(1.0)
+
+        sd2 = wrapper.state_dict()
+        # The storage object is reused (pinned staging buffers stay valid) ...
+        self.assertEqual(sd2["a"].untyped_storage().data_ptr(), ptr_a)
+        # ... and the in-place refresh picked up the updated parameter.
+        self.assertTrue(torch.all(sd2["a"] == 1.0))
 
 
 if __name__ == "__main__":

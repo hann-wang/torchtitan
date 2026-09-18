@@ -34,6 +34,8 @@ repos:
           - flake8-bugbear == 22.4.25
           - pep8-naming == 0.12.1
           - torchfix
+          - flake8-pep585
+          - flake8-new-union-types == 0.4.1
         args: ['--config=.flake8']
 
 -   repo: https://github.com/omnilib/ufmt
@@ -49,3 +51,67 @@ repos:
   hooks:
     - id: pydoclint
       args: [--config=pyproject.toml]
+
+- repo: https://github.com/codespell-project/codespell
+  rev: v2.4.1
+  hooks:
+    - id: codespell
+      name: codespell
+      description: Checks for common misspellings in text files.
+      entry: codespell --toml pyproject.toml
+      language: python
+      types: [text]
+      additional_dependencies:
+        - tomli
+
+- repo: https://github.com/facebook/pyrefly-pre-commit
+  rev: 0.45.1
+  hooks:
+    - id: pyrefly-check
+      name: Pyrefly (type checking)
+      pass_filenames: false
+      language: system
+      args: ["--remove-unused-ignores", "--summarize-errors"]
+
+
+- repo: local
+  hooks:
+    # Check hyperlinks and external links
+    - id: lychee-link-checker
+      name: lychee-link-checker
+      language: system
+      entry: |
+        /bin/bash -c '
+        mkdir -p /tmp/lychee 2>/dev/null
+        SENTINEL_DIR="/tmp/lychee/lychee_lock_${PPID}"
+        if ! command -v lychee >/dev/null 2>&1; then
+            # mkdir is atomic; only one process will succeed in creating it
+            if mkdir "$SENTINEL_DIR" 2>/dev/null; then
+                {
+                  echo "--------------------------------------------------------"
+                  echo "Warning: Lychee (link checker) not found. Skipping ... "
+                  echo ""
+                  echo "To enable local link checking, install Lychee:"
+                  echo "  - MacOS: brew install lychee"
+                  echo "  - Linux/Windows: https://github.com/lycheeverse/lychee"
+                  echo "--------------------------------------------------------"
+                } > /dev/tty 2>/dev/null || true
+            fi
+            exit 0
+        fi
+        lychee "$@"
+        ' --
+      args:
+        - "--quiet"
+        - "--no-progress"
+        - "--cache"
+        - "--exclude-path=(^|/)\\.[^/]+/"
+        - "--root-dir=."
+        - "--accept=100..399,400,401,402,403,405..999" # Fail only on 404
+        - "--exclude=http://localhost:.*"
+        - "--exclude=http://127.0.0.1:.*"
+        - "--exclude=tcp://localhost:.*"
+        - "--max-retries=5"
+        - "--retry-wait-time=10"
+        - "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      types_or: [markdown, python]

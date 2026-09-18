@@ -11,8 +11,47 @@
 # installation instructions.
 
 # Note: Performance
-# The quantization modules are intended to be ran under `torch.compile`` for competitive performance
+# The quantization modules are intended to be ran under `torch.compile` for competitive performance
 
-# Import to register quantization modules as ModelConverter
-import torchtitan.components.quantization.float8  # noqa: F401
-import torchtitan.components.quantization.mx  # noqa: F401
+from dataclasses import dataclass
+
+from torchtitan.protocols.model import ModelConfigConverter
+
+
+class QuantizationConverter(ModelConfigConverter):
+    """Base class for quantization converters.
+
+    Subclasses define a nested Config and implement ``convert()``
+    to transform the model config tree.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(ModelConfigConverter.Config):
+        model_compile_enabled: bool = False
+        """Whether torch.compile is enabled for the model."""
+
+
+# Re-export all public symbols so callers can import from the package directly.
+from .float8 import (  # noqa: F401, E402
+    Float8GroupedExpertsConverter,
+    Float8Linear,
+    Float8LinearConverter,
+)
+from .mx import (  # noqa: F401, E402
+    MXFP8GroupedExpertsConverter,
+    MXFP8Linear,
+    MXFP8LinearConverter,
+)
+from .nvfp4 import NVFP4Linear, NVFP4LinearConverter  # noqa: F401, E402
+
+__all__ = [
+    "Float8GroupedExpertsConverter",
+    "Float8Linear",
+    "Float8LinearConverter",
+    "MXFP8GroupedExpertsConverter",
+    "MXFP8Linear",
+    "MXFP8LinearConverter",
+    "NVFP4Linear",
+    "NVFP4LinearConverter",
+    "QuantizationConverter",
+]

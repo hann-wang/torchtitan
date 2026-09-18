@@ -3,13 +3,15 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-from typing import Dict, List, Protocol, Union
+from dataclasses import dataclass, field
+from typing import Protocol
 
 import torch.nn as nn
 
-from torchtitan.config import JobConfig
+from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.tools.logging import logger
+from torchtitan.protocols.model import BaseModel
 
 
 class ModelConverter(Protocol):
@@ -21,64 +23,90 @@ class ModelConverter(Protocol):
         - Fused optimized layers (e.g. flash-attention, norms, ...)
     """
 
-    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
-        ...
-
     def convert(self, model: nn.Module):
         """Inplace conversion of the model."""
         ...
+        
+    def convert_config(self, model_config: BaseModel.Config):
+        """Inplace conversion of the model config."""
+        ...
 
-    def post_optimizer_hook(self, model: Union[nn.Module, List[nn.Module]]):
+    def pre_step(self, model_parts: list[nn.Module], **kwargs):
+        ...
+
+    def post_optimizer_hook(self, model_parts: list[nn.Module], **kwargs):
         """Post-optimizer (optional) hook (e.g. compute weights statistics)."""
         ...
 
+    def post_initialization(self, model_parts: list[nn.Module]):
+        ...
 
-_registry_model_converter_cls: Dict[str, type[ModelConverter]] = {}
-"""Registry of model converter classes.
-"""
-
-
-def register_model_converter(converter_cls: type[ModelConverter], name: str):
-    """Register a model converter class.
-
-    A registered model converter can be applied on any model
-    using the `model.converters` config parameter.
-    """
-    assert (
-        name not in _registry_model_converter_cls
-    ), f"A model converter '{name}' is already registered."
-    _registry_model_converter_cls[name] = converter_cls
+    def finalize(self, model_parts: list[nn.Module]):
+        ...
 
 
-class ModelConvertersContainer(ModelConverter):
+class ModelConvertersContainer(Configurable, ModelConverter):
     """Model converters sequential container.
 
-    The class build the sequence of model converters defined in `model.converters`
-    job config, and apply them to the model sequentially.
+    Builds converters from their Config objects and applies them
+    to the model sequentially.
     """
 
-    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
-        converter_classes = [
-            _registry_model_converter_cls[name] for name in job_config.model.converters
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        """Configuration for model converters (quantization, etc.).
+
+        Each entry in converters should be a Configurable.Config instance
+        (e.g. Float8LinearConverter.Config) whose build() constructs the converter.
+        """
+
+        converters: list = field(default_factory=list)
+        """List of converter Config objects to apply to the model."""
+
+        print_after_conversion: bool = False
+        """If true, model definition will be printed after converters are applied."""
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        parallel_dims: ParallelDims,
+        model_compile_enabled: bool,
+    ):
+        self.converters: list[ModelConverter] = [
+            cc.build(
+                parallel_dims=parallel_dims,
+                model_compile_enabled=model_compile_enabled,
+            )
+            for cc in config.converters
         ]
-        self.converters = [
-            mh_cls(job_config, parallel_dims) for mh_cls in converter_classes
-        ]
-        self.print_after_conversion = job_config.model.print_after_conversion
+        self.print_after_conversion = config.print_after_conversion
 
     def convert(self, model: nn.Module):
         for mh in self.converters:
             mh.convert(model)
         if self.print_after_conversion:
-            logger.info(f"Model definion after conversion:\n\n{model}\n\n")
-
-    def post_optimizer_hook(self, model: Union[nn.Module, List[nn.Module]]):
+            logger.info(f"Model definition after conversion:\n\n{model}\n\n")
+    
+    def convert_config(self, model_config: BaseModel.Config):
         for mh in self.converters:
-            mh.post_optimizer_hook(model)
+            mh.convert_config(model_config)
 
+    def pre_step(self, model_parts: list[nn.Module], **kwargs):
+        for mh in self.converters:
+            mh.pre_step(model_parts, **kwargs)
 
-def build_model_converters(
-    job_config: JobConfig, parallel_dims: ParallelDims
-) -> ModelConvertersContainer:
-    """Build the collection of model converters to apply to the model."""
-    return ModelConvertersContainer(job_config, parallel_dims)
+    def post_optimizer_hook(self, model_parts: list[nn.Module], **kwargs):
+        for mh in self.converters:
+            mh.post_optimizer_hook(model_parts, **kwargs)
+
+    def post_initialization(self, model_parts: list[nn.Module]):
+        for mh in self.converters:
+            mh.post_initialization(model_parts)
+
+    def finalize(self, model_parts: list[nn.Module]):
+        for mh in self.converters:
+            mh.finalize(model_parts)
+
+    def is_empty(self):
+        return len(self.converters) == 0

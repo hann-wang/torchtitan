@@ -14,7 +14,9 @@ Each host has
 
 ### Configuration
 
-Runs were invoked with the following, where `NUM_NODES` was `4` and `8`
+Runs were invoked with the following, where `NUM_NODES` was `4` and `8`.
+
+**Warning**: the command below reflects the original invocation at the time of this benchmark. The torchtitan CLI has since changed to use `--module` and `--config` flags instead of `--job.config-file`. See the current [README](/README.md) for up-to-date usage.
 ```
   torchrun \
     --nnodes $NUM_NODES  \
@@ -27,11 +29,11 @@ Runs were invoked with the following, where `NUM_NODES` was `4` and `8`
     --metrics.enable_wandb \
     --training.local_batch_size=2 \
     --training.compile \
-    --model.converters="float8" \
-    --float8.enable_fsdp_float8_all_gather \
-    --float8.precompute_float8_dynamic_scale_for_fsdp \
-    --float8.force_recompute_fp8_weight_in_bwd \
-    --profiling.profile_freq 1000000
+    --model.converters="quantize.linear.float8" \
+    --quantize.linear.float8.enable_fsdp_float8_all_gather \
+    --quantize.linear.float8.precompute_float8_dynamic_scale_for_fsdp \
+    --quantize.linear.float8.force_recompute_fp8_weight_in_bwd \
+    --profiler.profile_freq 1000000
     --training.steps 2000
 ```
 

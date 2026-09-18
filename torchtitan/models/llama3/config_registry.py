@@ -1,0 +1,445 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from typing import cast
+
+from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.optimizer import default_adamw
+from torchtitan.components.quantization import (
+    Float8LinearConverter,
+    MXFP8LinearConverter,
+    NVFP4LinearConverter,
+)
+from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_tail_fqns
+from torchtitan.components.validate import Validator
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC, SelectiveAC
+from torchtitan.hf_datasets.text_datasets import (
+    ChatDataLoader,
+    HuggingFaceTextDataLoader,
+)
+from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.tools.profiler import Profiler
+from torchtitan.trainer import Trainer
+
+from . import model_registry
+from .model import Llama3Model
+
+
+def llama3_debugmodel() -> Trainer.Config:
+    model_spec = model_registry("debugmodel")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=8,
+            seq_len=2048,
+            steps=10,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        parallelism=ParallelismConfig(pipeline_parallel_schedule="Interleaved1F1B"),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=SelectiveAC.Config(),
+        validator=Validator.Config(
+            freq=5,
+            steps=10,
+        ),
+    )
+
+
+def llama3_debugmodel_varlen_attn() -> Trainer.Config:
+    config = llama3_debugmodel()
+    config.model_spec = model_registry("debugmodel", attn_backend="varlen")
+    return config
+
+
+def llama3_debugmodel_float8() -> Trainer.Config:
+    config = llama3_debugmodel()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            Float8LinearConverter.Config(model_compile_enabled=model_compile_enabled),
+        ],
+    )
+    return config
+
+
+def llama3_debugmodel_nvfp4() -> Trainer.Config:
+    config = llama3_debugmodel()
+    config.parallelism.spmd_backend = "spmd_types"
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    # fqns=["layers"] converts every in-layer Linear (attention + feed_forward)
+    # while leaving the lm_head stock: NVFP4 requires each GEMM dim divisible by
+    # 128, which the vocab projection does not satisfy.
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            NVFP4LinearConverter.Config(
+                fqns=["layers"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_debugmodel_first_85_pct_layers_nvfp4() -> Trainer.Config:
+    config = llama3_debugmodel()
+    config.parallelism.spmd_backend = "spmd_types"
+    assert config.model_spec is not None
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    # Mixed precision: convert the leading decoder layers to NVFP4 and keep the
+    # last _NVFP4_BF16_TAIL_FRACTION of layers (plus the lm_head) in bf16.
+    n_layers = len(cast(Llama3Model.Config, config.model_spec.model).layers)
+    _NVFP4_BF16_TAIL_FRACTION = 0.15
+    fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            NVFP4LinearConverter.Config(
+                fqns=fqns,
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_debugmodel_float8_emulate_lora() -> Trainer.Config:
+    from torchtitan.components.lora import LoRAConverter
+
+    config = llama3_debugmodel()
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            Float8LinearConverter.Config(
+                emulate=True,
+                model_compile_enabled=False,
+            ),
+            LoRAConverter.Config(
+                rank=8, alpha=16.0, target_modules=["wq", "wkv", "wo"]
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_debugmodel_ce_loss() -> Trainer.Config:
+    """Debug model with standard (non-chunked) CrossEntropyLoss."""
+    config = llama3_debugmodel()
+    assert config.model_spec is not None
+    config.loss = CrossEntropyLoss.Config(
+        global_vocab_size=decoder_vocab_size(config.model_spec),
+    )
+    return config
+
+
+def llama3_1b() -> Trainer.Config:
+    model_spec = model_registry("1B")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./assets/hf/Llama-3.1-1B",
+        profiler=Profiler.Config(
+            enable_profiling=True,
+            profile_freq=100,
+        ),
+        metrics=MetricsProcessor.Config(
+            enable_tensorboard=True,
+        ),
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=4e-5),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=8192,
+            steps=1000,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=SelectiveAC.Config(),
+        validator=Validator.Config(
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
+def instella_3b() -> Trainer.Config:
+    return Trainer.Config(
+        hf_assets_path="./assets/hf/Instella-3B-Stage1",
+        model_spec=model_registry("3B_instella"),
+        optimizer=OptimizersContainer.Config(lr=4e-5),
+        training=TrainingConfig(
+            local_batch_size=8,
+            global_batch_size=1024,
+            seq_len=4096,
+            steps=13800,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="tulu,dolmino,openhermes,webinstructsub,codefeedback,ultrachat,pythonedu,mathematics,gsm8k",
+            probabilities=[
+                0.0116,
+                0.8510,
+                0.0069,
+                0.0249,
+                0.0016,
+                0.0125,
+                0.0516,
+                0.0343,
+                0.0056,
+            ],
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
+        validator=Validator.Config(
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
+def llama3_8b() -> Trainer.Config:
+    model_spec = model_registry("8B")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./assets/hf/Llama-3.1-8B",
+        profiler=Profiler.Config(
+            enable_profiling=True,
+            profile_freq=100,
+        ),
+        metrics=MetricsProcessor.Config(
+            enable_tensorboard=True,
+        ),
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=3e-4),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=8192,
+            steps=1000,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=SelectiveAC.Config(),
+        validator=Validator.Config(
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
+def llama3_8b_first_85_pct_layers_nvfp4() -> Trainer.Config:
+    config = llama3_8b()
+    config.parallelism.spmd_backend = "spmd_types"
+    assert config.model_spec is not None
+    # Enable compile so NVFP4's dynamic quantization runs at competitive perf.
+    config.compile = CompileConfig(enable=True, components=["model"])
+    # Mixed precision: convert the leading decoder layers to NVFP4 and keep the
+    # last _NVFP4_BF16_TAIL_FRACTION of layers (plus the lm_head) in bf16.
+    n_layers = len(cast(Llama3Model.Config, config.model_spec.model).layers)
+    _NVFP4_BF16_TAIL_FRACTION = 0.15
+    fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
+    config.model_spec = model_registry(
+        "8B",
+        converters=[
+            NVFP4LinearConverter.Config(
+                fqns=fqns,
+                model_compile_enabled=True,
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_8b_mxfp8() -> Trainer.Config:
+    config = llama3_8b()
+    # Swap dense Linear layers for MXFP8Linear. compile is enabled so the
+    # converter's compile requirement is satisfied. This is the regular-Trainer
+    # (torch.compile) baseline counterpart to graph_trainer_llama3_8b_mxfp8.
+    config.compile = CompileConfig(enable=True, components=["model"])
+    config.model_spec = model_registry(
+        "8B",
+        converters=[
+            MXFP8LinearConverter.Config(model_compile_enabled=True),
+        ],
+    )
+    return config
+
+
+def llama3_70b() -> Trainer.Config:
+    model_spec = model_registry("70B")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./assets/hf/Llama-3.1-70B",
+        profiler=Profiler.Config(
+            enable_profiling=True,
+            profile_freq=100,
+        ),
+        metrics=MetricsProcessor.Config(
+            enable_tensorboard=True,
+        ),
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=1.5e-4),
+        training=TrainingConfig(
+            local_batch_size=8,
+            seq_len=8192,
+            steps=1000,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        parallelism=ParallelismConfig(
+            tensor_parallel_degree=8,
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=FullAC.Config(),
+        validator=Validator.Config(
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
+def llama3_405b() -> Trainer.Config:
+    compile_config = CompileConfig(enable=True)
+    model_spec = model_registry(
+        "405B",
+        converters=[
+            Float8LinearConverter.Config(
+                filter_fqns=["lm_head"],
+                model_compile_enabled=(
+                    compile_config.enable and "model" in compile_config.components
+                ),
+            ),
+        ],
+    )
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./assets/hf/Llama-3.1-405B",
+        profiler=Profiler.Config(
+            enable_profiling=True,
+            profile_freq=100,
+        ),
+        metrics=MetricsProcessor.Config(
+            enable_tensorboard=True,
+        ),
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=8e-5),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=600),
+        training=TrainingConfig(
+            local_batch_size=2,
+            seq_len=8192,
+            steps=3000,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4",
+        ),
+        parallelism=ParallelismConfig(
+            tensor_parallel_degree=8,
+            enable_async_tensor_parallel=True,
+        ),
+        checkpoint=CheckpointManager.Config(interval=500),
+        activation_checkpoint=FullAC.Config(),
+        compile=compile_config,
+        validator=Validator.Config(
+            freq=500,
+            steps=1200,
+        ),
+    )
+
+
+def sft_debugmodel() -> Trainer.Config:
+    """SFT debug config with Llama3 debugmodel and local test data."""
+
+    def process_sample(sample):
+        return [
+            {"role": "user", "content": sample["question"]},
+            {"role": "assistant", "content": sample["answer"]},
+        ]
+
+    model_spec = model_registry("debugmodel", attn_backend="flex")
+
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=8,
+            seq_len=2048,
+            steps=10,
+        ),
+        dataloader=ChatDataLoader.Config(
+            dataset_path="json",
+            load_dataset_kwargs={
+                "data_files": "tests/assets/sft_test/data.json",
+                "split": "train",
+            },
+            sample_processor=process_sample,
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=SelectiveAC.Config(),
+    )

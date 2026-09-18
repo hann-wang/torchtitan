@@ -4,109 +4,203 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
-from importlib.metadata import version
+from dataclasses import dataclass, field, fields
 from importlib.util import find_spec
-from typing import Any, List
+from typing import Literal
 
-import torch.nn as nn
-
-from torchtitan.config.job_config import JobConfig, MX
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.expert_parallel import set_token_group_alignment_size_m
-from torchtitan.protocols.model_converter import (
-    ModelConverter,
-    register_model_converter,
-)
+from torchtitan.components.quantization import QuantizationConverter
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.protocols.module import Module
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
 
-from .utils import module_filter_fn
+from .utils import swap_token_dispatcher
+
+try:
+    from torchao.prototype.moe_training.mxfp8_linear import (
+        MXFP8Linear as TorchAOMXFP8Linear,
+    )
+
+    class MXFP8Linear(TorchAOMXFP8Linear, Module):
+        """Inherits from Module (not Linear) to satisfy the Module protocol
+        (init_states, _param_init) while avoiding MRO conflicts with
+        Linear.__init__. Config still inherits from Linear.Config for
+        field compatibility.
+        """
+
+        @dataclass(kw_only=True, slots=True)
+        class Config(Linear.Config):
+            """Drop-in replacement for Linear.Config that builds MXFP8Linear."""
+
+            pass
+
+        def __init__(self, config: Config):
+            TorchAOMXFP8Linear.__init__(
+                self,
+                config.in_features,
+                config.out_features,
+                bias=config.bias,
+            )
+
+except ImportError:
+    MXFP8Linear = None
 
 
-class MXConverter(ModelConverter):
-    """Converts the linear layers of `model` to `MXLinear`."""
+class MXFP8LinearConverter(QuantizationConverter):
+    """Replace matching Linear.Config with MXFP8Linear.Config."""
 
-    enabled: bool
-    filter_fqns: List[str]
-    mx_config: Any  # MXLinearConfig type when imported
+    @dataclass(kw_only=True, slots=True)
+    class Config(QuantizationConverter.Config):
+        fqns: list[str] = field(default_factory=list)
+        """
+        List of fully qualified names of modules to apply MXFP8 quantization to.
+        Only Linear.Config entries whose FQN contains a match are converted.
+        If empty, all Linear modules are converted.
+        """
 
-    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
-        # Ensure minimum torchao versions
-        if find_spec("torchao") is None:
+    def __init__(self, config: Config):
+        self.config = config
+
+        if MXFP8Linear is None:
             raise ImportError(
                 "torchao is not installed. Please install it to use MXFP8 linear layers."
             )
-        torchao_version = version("torchao")
 
-        # Last torchao release was 0.12.0, so nightly build starts with 0.13.0+git...
-        is_nightly_build = torchao_version.startswith("0.13.0")
-        if not is_nightly_build:
-            raise ImportError(
-                f"torchao version {torchao_version} is too old, please install torchao nightly build and try again"
+        if not has_cuda_capability(10, 0):
+            raise ValueError("MXFP8 is only supported on SM100 or later architectures")
+
+        if not self.config.model_compile_enabled:
+            logger.warning(
+                "torch.compile enablement is required for highest performance "
+                "of MXFP8 dynamic quantization."
             )
 
-        # Can be removed if we enable the emulated versions
-        assert has_cuda_capability(
-            10, 0
-        ), "MXFP8 is only supported on SM100 or architectures"
+    def convert(self, model_config):
+        assert MXFP8Linear is not None
+        fqns = self.config.fqns
+        for fqn, config, parent, attr in model_config.traverse(Linear.Config):
+            if not fqns or any(target_fqn in fqn for target_fqn in fqns):
+                new_config = MXFP8Linear.Config(
+                    in_features=config.in_features,
+                    out_features=config.out_features,
+                    bias=config.bias,
+                    param_init=config.param_init,
+                )
+                if parent is None:
+                    model_config = new_config
+                elif isinstance(parent, list):
+                    parent[attr] = new_config
+                else:
+                    setattr(parent, attr, new_config)
 
-        # TP not yet supported with torch.compile
+        logger.info("Converted Linear layers to MXFP8Linear")
+        return model_config
 
-        model_compile_enabled = (
-            job_config.compile.enable and "model" in job_config.compile.components
-        )
-        assert not (
-            model_compile_enabled and job_config.parallelism.tensor_parallel_degree > 1
-        ), "TP not yet supported with torch.compile for mxfp8"
 
-        # For MoE training with mxfp8, token group sizes must be multiples of 32
-        if job_config.mx.moe_fqns_prototype:
-            mxfp8_block_size = 32
-            set_token_group_alignment_size_m(mxfp8_block_size)
-            logger.info(f"Setting token group alignment size to {mxfp8_block_size}")
+_mxfp8_experts_cache: dict[type, type] = {}
 
-        # Configure MXFP8
-        from torchao.prototype.mx_formats.config import (
-            MXFP8Dim1CastKernelChoice,
-            MXLinearConfig,
-        )
 
-        mx_job_config: MX = job_config.mx
-        config = MXLinearConfig.from_recipe_name(mx_job_config.recipe_name)
-        config.mxfp8_dim1_cast_kernel_choice = MXFP8Dim1CastKernelChoice[
-            mx_job_config.mxfp8_dim1_cast_kernel_choice.upper()
-        ]
-        self.filter_fqns = mx_job_config.filter_fqns
+def _get_mxfp8_grouped_experts_cls(parent_cls: type) -> type:
+    """Get or create an MXFP8-quantized subclass of *parent_cls*.
+
+    Works for any experts module exposing the ``_grouped_mm`` seam (the common
+    ``GroupedExperts`` and ``GptOssGroupedExperts``). The returned class has a
+    proper ``_owner`` set by ``__init_subclass__``.
+
+    The subclass overrides ``_grouped_mm`` to call torchao's
+    ``_quantize_then_scaled_grouped_mm``.
+    """
+    if parent_cls in _mxfp8_experts_cache:
+        return _mxfp8_experts_cache[parent_cls]
+
+    parent_config_cls = parent_cls.Config  # type: ignore[attr-defined]
+
+    class MXFP8GroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
+        @dataclass(kw_only=True, slots=True)
+        class Config(parent_config_cls):  # type: ignore[misc]
+            recipe_name: str = "mxfp8_rceil"
+
+        def __init__(self, config: Config):
+            super().__init__(config)
+            from torchao.prototype.moe_training.config import (
+                MXFP8TrainingOpConfig,
+                MXFP8TrainingRecipe,
+            )
+
+            recipe = MXFP8TrainingRecipe(config.recipe_name)
+            self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+
+        def _grouped_mm(self, *, A, B_t, offs):
+            from torchao.prototype.moe_training.utils import (
+                _quantize_then_scaled_grouped_mm,
+            )
+
+            return _quantize_then_scaled_grouped_mm(
+                A, B_t, config=self._mxfp8_op_config, offs=offs
+            )
+
+    MXFP8GroupedExperts.__name__ = f"MXFP8{parent_cls.__name__}"
+    MXFP8GroupedExperts.__qualname__ = f"MXFP8{parent_cls.__name__}"
+    _mxfp8_experts_cache[parent_cls] = MXFP8GroupedExperts
+    return MXFP8GroupedExperts
+
+
+class MXFP8GroupedExpertsConverter(QuantizationConverter):
+    """Apply MXFP8 quantization to MoE expert grouped GEMMs."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(QuantizationConverter.Config):
+        recipe_name: Literal["mxfp8_rceil"] = "mxfp8_rceil"
+        """
+        Quantization recipe name for grouped GEMMs. Options: ["mxfp8_rceil"]
+
+        - mxfp8_rceil: MXFP8 dynamic quantization with RCEIL rounding mode
+          when computing the e8m0 scale factors.
+        """
+        pad_multiple: int = 32
+        """
+        Pad per-expert token groups to this multiple for MXFP8 grouped GEMM alignment.
+        The CuTeDSL quantization kernel on sm_100 requires multiples of 128.
+        """
+
+    def __init__(self, config: Config):
         self.config = config
-        self.enabled = True
-        logger.info(f"Float8 training active with recipe {mx_job_config.recipe_name}")
 
-    def convert(self, model: nn.Module):
-        """
-        Converts the linear layers of `model` to `MXLinear`.
-        Note that today, only dynamic tensor scaling (the default) is supported.
-        This will mutate the model inplace.
-        """
-        if not self.enabled:
-            return
+        if find_spec("torchao") is None:
+            raise ImportError(
+                "torchao is not installed. Please install it to use MXFP8 MoE training."
+            )
 
-        from torchao.prototype.mx_formats.config import MXLinearConfig
-        from torchao.quantization import quantize_
+        if not has_cuda_capability(10, 0):
+            raise ValueError("MXFP8 is only supported on SM100 or later architectures")
 
-        assert isinstance(self.config, MXLinearConfig)
-        quantize_(
-            model,
-            config=self.config,
-            filter_fn=partial(module_filter_fn, filter_fqns=self.filter_fqns),
+        if not self.config.model_compile_enabled:
+            logger.warning(
+                "torch.compile enablement is required for highest performance "
+                "of MXFP8 dynamic quantization."
+            )
+
+    def convert(self, model_config):
+        for _fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
+            # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
+            swap_token_dispatcher(parent, self.config.pad_multiple)
+            base_module_cls = type(config)._owner
+            quantized_cls = _get_mxfp8_grouped_experts_cls(base_module_cls)
+            config_cls = quantized_cls.Config  # type: ignore[attr-defined]
+            new_config = config_cls(
+                **{f.name: getattr(config, f.name) for f in fields(config)},
+                recipe_name=self.config.recipe_name,
+            )
+            if parent is None:
+                model_config = new_config
+            elif isinstance(parent, list):
+                parent[attr] = new_config
+            else:
+                setattr(parent, attr, new_config)
+
+        logger.info(
+            f"Converted GroupedExperts to use dynamic {self.config.recipe_name} "
+            "quantization for grouped_mm ops"
         )
-        logger.info("Swapped to MXLinear layers")
-
-    def post_optimizer_hook(self, model: nn.Module | list[nn.Module]):
-        """
-        MXFP8 doesn't require any post-optimizer hooks at the moment
-        """
-        return
-
-
-register_model_converter(MXConverter, "mx")
+        return model_config

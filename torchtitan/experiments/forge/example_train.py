@@ -4,83 +4,102 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import importlib
+import os
 import time
+from collections.abc import Iterable, Iterator
 from datetime import timedelta
-from typing import Any, Iterable, Optional
+from typing import Any, cast
+import math
 
+import spmd_types as spmd
 import torch
 from torch.distributed.elastic.multiprocessing.errors import record
-
-import torchtitan.protocols.train_spec as train_spec_module
-from torchtitan.components.dataloader import DataloaderExhaustedError
-from torchtitan.components.metrics import build_metrics_processor
-from torchtitan.components.tokenizer import build_hf_tokenizer
-from torchtitan.components.validate import build_validator
-from torchtitan.config import ConfigManager, JobConfig
-from torchtitan.datasets.hf_datasets import build_hf_dataloader
-from torchtitan.distributed import utils as dist_utils
+from torchtitan.observability import structured_logger as sl
+from torchtitan.components.dataloader import BaseDataLoader, DataloaderExhaustedError
+from torchtitan.components.loss import IGNORE_INDEX
+from torchtitan.components.metrics import MetricsProcessor, ensure_pp_loss_visible
+from torchtitan.components.quantization.utils import has_quantization
+from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.components.validate import Validator
+from torchtitan.config import ConfigManager
+from torchtitan.distributed import full_dtensor, utils as dist_utils
+from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.tools import utils
 from torchtitan.tools.logging import init_logger, logger
-from torchtitan.tools.profiling import (
-    maybe_enable_memory_snapshot,
-    maybe_enable_profiling,
-)
+from torchtitan.trainer import Trainer as TitanTrainer
 
 from .engine import ForgeEngine
 
 
 class Trainer(ForgeEngine):
-    tokenizer: train_spec_module.BaseTokenizer | None
-    dataloader: train_spec_module.BaseDataLoader
-    validator: train_spec_module.BaseValidator
-    metrics_processor: train_spec_module.MetricsProcessor
+    tokenizer: BaseTokenizer
+    dataloader: BaseDataLoader
+    validator: Validator
+    metrics_processor: MetricsProcessor
 
     # additional training states
     step: int
+    ntokens_seen: int
 
     # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
     @record
-    def __init__(self, job_config: JobConfig):
-        logger.info(f"Starting job: {job_config.job.description}")
-
-        if job_config.job.print_args:
-            logger.info(f"Running with args: {job_config.to_dict()}")
-
-        if job_config.experimental.custom_import:
-            importlib.import_module(job_config.experimental.custom_import)
-
-        # NOTE: Here we are passing in JobConfig as a superset of ForgeJobConfig
-        super().__init__(job_config)
+    def __init__(self, config: TitanTrainer.Config):
+        # NOTE: Here we are passing in Trainer.Config as a superset of ForgeEngine.Config
+        super().__init__(config)
 
         # build tokenizer
-        self.tokenizer = build_hf_tokenizer(job_config)
+        self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
 
         # build dataloader
-        self.dataloader = build_hf_dataloader(
-            dp_world_size=self.dp_degree,
-            dp_rank=self.dp_rank,
+        dataloader_batch_size = (
+            config.parallelism.pipeline_parallel_microbatch_size
+            if self.parallel_dims.pp_enabled
+            else config.training.local_batch_size
+        )
+        self.dataloader = config.dataloader.build(
+            dp_world_size=self.batch_degree,
+            dp_rank=self.batch_rank,
             tokenizer=self.tokenizer,
-            job_config=job_config,
+            seq_len=config.training.seq_len,
+            local_batch_size=dataloader_batch_size,
+            snapshot_every_n_steps=(
+                config.checkpoint.interval
+                * self.gradient_accumulation_steps
+                * self.num_pipeline_parallel_microbatches
+                if config.checkpoint.enable
+                else None
+            ),
         )
 
-        model_args = self.model_args
-        logger.info(
-            f"Built {self.train_spec.name} {job_config.model.flavor} with {model_args}"
-        )
+        self.checkpointer = self.build_checkpointer(self.dataloader)
 
         # metrics logging
-        self.metrics_processor = build_metrics_processor(
-            job_config, self.parallel_dims, model_args
+        self.metrics_processor = config.metrics.build(
+            parallel_dims=self.parallel_dims,
+            dump_folder=config.dump_folder,
+            pp_schedule=config.parallelism.pipeline_parallel_schedule,
+            config_dict=config.to_dict(),
+            has_quantization=has_quantization(self.model_config)
+            or not self.model_converters.is_empty(),
         )
         color = self.metrics_processor.color
 
         self.metrics_processor.num_flops_per_token = self.num_flops_per_token
 
         logger.info(
-            f"{color.blue}Model {self.train_spec.name} {job_config.model.flavor} "
+            f"{color.blue}Model {config.model_spec.name} {config.model_spec.flavor} "
             f"{color.red}size: {self.model_param_count:,} total parameters{color.reset}"
         )
+
+        if self.parallel_dims.pp_enabled:
+            ensure_pp_loss_visible(
+                parallel_dims=self.parallel_dims,
+                pp_schedule=config.parallelism.pipeline_parallel_schedule,
+                color=color,
+            )
 
         # initialize device memory monitor and get peak flops for MFU calculation
         device_memory_monitor = self.metrics_processor.device_memory_monitor
@@ -94,158 +113,285 @@ class Trainer(ForgeEngine):
         )
 
         self.metrics_processor.optimizers = self.optimizers
+        self.metrics_processor.model_parts = self.model_parts
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
+        self.ntokens_seen = 0
 
         # Build validator if validation is configured
-        if job_config.validation.enable:
-            self.validator = build_validator(
-                job_config=job_config,
-                dp_world_size=self.dp_degree,
-                dp_rank=self.dp_rank,
+        if config.validator.enable:
+            pp_schedule, pp_has_first_stage, pp_has_last_stage = (
+                (
+                    self.pp_schedule,
+                    self.pp_has_first_stage,
+                    self.pp_has_last_stage,
+                )
+                if self.parallel_dims.pp_enabled
+                else (None, None, None)
+            )
+
+            self.validator = config.validator.build(
+                parallelism=config.parallelism,
+                dp_world_size=self.batch_degree,
+                dp_rank=self.batch_rank,
                 tokenizer=self.tokenizer,
                 parallel_dims=self.parallel_dims,
-                loss_fn=self.train_spec.build_loss_fn(job_config),
+                loss_fn=self.loss_fn,
                 validation_context=self.train_context,
-                maybe_enable_amp=self.maybe_enable_amp,
+                metrics_processor=self.metrics_processor,
+                seq_len=config.training.seq_len,
+                local_batch_size=config.training.local_batch_size,
+                pp_schedule=pp_schedule,
+                pp_has_first_stage=pp_has_first_stage,
+                pp_has_last_stage=pp_has_last_stage,
             )
+
+        self.profiler = config.profiler.build()
 
         logger.info(
             "Trainer is initialized with "
-            f"local batch size {job_config.training.local_batch_size}, "
+            f"local batch size {config.training.local_batch_size}, "
             f"global batch size {self.global_batch_size}, "
             f"gradient accumulation steps {self.gradient_accumulation_steps}, "
-            f"sequence length {job_config.training.seq_len}, "
-            f"total steps {job_config.training.steps} "
-            f"(warmup {job_config.lr_scheduler.warmup_steps})."
+            f"sequence length {config.training.seq_len}, "
+            f"total steps {config.training.steps} "
+            f"(warmup {config.lr_scheduler.warmup_steps})"
         )
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
-    ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
-        """Returns an iterator that processes batches from the data iterator."""
-        device_type = utils.device_type
-        data_iterator = iter(data_iterable)
+    ) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
+        """Returns an iterator that processes batches from the data iterator.
 
+        Note: Tensors are yielded on CPU. The caller is responsible for moving
+        them to GPU when needed. This allows for more efficient memory usage
+        when doing gradient accumulation.
+        """
+        data_iterator = iter(data_iterable)
+        
         while True:
+            data_load_start = time.perf_counter()
             try:
                 batch = next(data_iterator)
             except StopIteration as ex:
                 # If data runs out during gradient accumulation, that
                 # entire step will not be executed.
                 raise DataloaderExhaustedError() from ex
-            data_load_start = time.perf_counter()
             input_dict, labels = batch
-            self.metrics_processor.ntokens_since_last_log += labels.numel()
+            ntokens_batch = labels.numel()
+            self.metrics_processor.ntokens_since_last_log += ntokens_batch
             self.metrics_processor.data_loading_times.append(
                 time.perf_counter() - data_load_start
             )
 
-            # Move tensors to the appropriate device
-            for k, v in input_dict.items():
-                if isinstance(v, torch.Tensor):
-                    input_dict[k] = v.to(device_type)
-            labels = labels.to(device_type)
-
+            # Tensors stay on CPU; moved to GPU per-microbatch during training
             yield input_dict, labels
 
-    def forward_backward_step(
+    @sl.log_trace_span("post_dataloading_process")
+    def post_dataloading_process(
         self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        inputs = input_dict["input"]
+        # Everything else becomes a model-forward kwarg, forwarded to all PP
+        # stages by the schedule. positions is read here so we can build masks.
+        extra_kwargs: dict[str, Any] = {
+            k: v for k, v in input_dict.items() if k != "input"
+        }
+
+        positions = extra_kwargs.get("positions", None)
+        
+        # positions and attention_masks are optional (Decoder.forward defaults
+        # both to None). Build attention masks only for the masked backends
+        # (Flex/Varlen), which is where get_attention_masks is defined. A
+        # maskless backend (e.g. the SDPA config used by the graph_trainer
+        # tests) still receives positions for RoPE but no masks — it relies on
+        # is_causal instead.
+        if isinstance(self.model_config, Decoder.Config) and positions is not None:
+            inner_attention = getattr(
+                self.model_config.first_attention, "inner_attention", None
+            )
+            if isinstance(
+                inner_attention, (FlexAttention.Config, VarlenAttention.Config)
+            ):
+                model = cast(Decoder, self.model_parts[0])
+                extra_kwargs["attention_masks"] = model.get_attention_masks(
+                    positions=positions,
+                )
+
+        if self.parallel_dims.cp_enabled:
+            inputs, labels, extra_kwargs = prepare_context_parallel_input(
+                inputs,
+                labels,
+                extra_kwargs,
+                self.parallel_dims.get_mesh("cp"),
+                self.device,
+                self.config.parallelism.context_parallel_load_balancer,
+                self.config.parallelism.context_parallel_ptrr_mask_key,
+            )
+            
+        # Accumulate after CP sharding so labels.numel() reflects the actual
+        # unique tokens this rank processes (not the full pre-split sequence).
+        self.ntokens_seen += labels.numel()
+        
+        if self.config.parallelism.spmd_backend == "full_dtensor":
+            inputs, labels, extra_kwargs = full_dtensor.parallelize_inputs(
+                self.parallel_dims, inputs, labels, extra_kwargs
+            )
+        elif self.config.parallelism.spmd_backend == "spmd_types":
+            inputs, labels, extra_kwargs = annotate_input_spmd_types(
+                self.parallel_dims,
+                inputs,
+                labels,
+                extra_kwargs,
+            )
+
+        return inputs, labels, extra_kwargs
+
+    @sl.log_trace_span("fwd_bwd")
+    def forward_backward_step(
+        self,
+        *,
+        input_dict: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]],
+        labels: torch.Tensor | list[torch.Tensor],
+        global_valid_tokens: float,
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
 
-        # apply context parallelism if cp is enabled
-        # ensure CP handles the separate freqs_cis buffer for each pp stage
-        inputs = input_dict["input"]
-        # Create the FlexAttention mask according to the input
-        if getattr(self.model_args, "use_flex_attn", False):
-            cp_mesh = (
-                parallel_dims.world_mesh["cp"] if parallel_dims.cp_enabled else None
-            )
-            init_attention_mask(inputs, self.tokenizer.eos_id, cp_mesh)
-
-        optional_context_parallel_ctx = (
-            dist_utils.create_context_parallel_ctx(
-                cp_mesh=parallel_dims.world_mesh["cp"],
-                cp_buffers=[inputs, labels] + [m.freqs_cis for m in model_parts],
-                cp_seq_dims=[1, 1] + [0 for _ in model_parts],
-                cp_no_restore_buffers={inputs, labels},
-                cp_rotate_method=self.job_config.parallelism.context_parallel_rotate_method,
-            )
-            if parallel_dims.cp_enabled
-            else None
-        )
-
         if parallel_dims.pp_enabled:
-            # Pipeline Parallel forward / backward inside step() call
-            with self.train_context(optional_context_parallel_ctx):
-                targets, losses = (
-                    (labels, []) if self.pp_has_last_stage else (None, None)
-                )
-                if self.pp_has_first_stage:
-                    self.pp_schedule.step(
-                        inputs, target=targets, losses=losses, input_batch=inputs
-                    )
-                else:
-                    self.pp_schedule.step(
-                        target=targets, losses=losses, input_batch=inputs
-                    )
-
-            # accumulate losses across pipeline microbatches
-            # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
-            loss = (
-                # using sum instead of mean because we already rescale the
-                # loss_fn down by a factor of n_microbatches in
-                # torchtitan/distributed/pipeline_parallel.py
-                torch.sum(torch.stack(losses)).to(self.device)
-                if self.pp_has_last_stage
-                else torch.tensor([-1.0], device=self.device)
+            assert isinstance(input_dict, list)
+            assert isinstance(labels, list)
+            return self.pp_forward_backward_step(
+                input_dict_mbs=input_dict,
+                label_mbs=labels,
+                global_valid_tokens=global_valid_tokens,
             )
-        else:
-            # Non-PP forward / backward
-            with self.train_context(optional_context_parallel_ctx):
-                assert len(model_parts) == 1
-                with self.maybe_enable_amp:
-                    pred = model_parts[0](inputs)
-                    loss = self.loss_fn(pred, labels)
-                # need to free to before bwd to avoid peaking memory
-                del pred
+
+        assert isinstance(input_dict, dict)
+        assert isinstance(labels, torch.Tensor)
+        inputs, labels, extra_kwargs = self.post_dataloading_process(input_dict, labels)
+
+        with self.train_context():
+            assert len(model_parts) == 1
+            pred = model_parts[0](inputs, **extra_kwargs)
+            loss, _ = self.loss_fn(pred, labels, global_valid_tokens)
+            del pred
+            with spmd.no_typecheck():
+                # this propagates types through BWD, causing unnecessary conflicts
+                # between torch_function and internals (e.g. AC). FWD is sufficient.
                 loss.backward()
 
         return loss
 
+    def pp_forward_backward_step(
+        self,
+        *,
+        input_dict_mbs: list[dict[str, torch.Tensor]],
+        label_mbs: list[torch.Tensor],
+        global_valid_tokens: float,
+    ) -> torch.Tensor:
+        arg_mbs: list[tuple[torch.Tensor, ...]] = []
+        kwarg_mbs: list[dict[str, Any]] = []
+        target_mbs: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
+        for input_dict, labels in zip(input_dict_mbs, label_mbs, strict=True):
+            inputs, labels, extra_kwargs = self.post_dataloading_process(
+                input_dict, labels
+            )
+            if self.pp_has_first_stage:
+                arg_mbs.append((inputs,))
+            kwarg_mbs.append(extra_kwargs)
+            if target_mbs is not None:
+                target_mbs.append(labels)
+
+        loss_kwargs = {"global_valid_tokens": global_valid_tokens}
+        with self.train_context():
+            losses = [] if self.pp_has_last_stage else None
+            self.pp_schedule.step(
+                arg_mbs=arg_mbs if self.pp_has_first_stage else None,
+                kwarg_mbs=kwarg_mbs,
+                target_mbs=target_mbs,
+                losses=losses,
+                loss_kwargs=loss_kwargs,
+                return_outputs=False,
+            )
+
+        # TODO: PP+FSDP unexpectedly puts the loss back to the CPU.
+        if self.pp_has_last_stage:
+            assert losses is not None
+            return torch.sum(torch.stack(losses)).to(self.device)
+        return torch.tensor([-1.0], device=self.device)
+
     def train_step(
-        self, data_iterator: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
+        self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        # Save per-optimizer-group learning rates for logging
+        lr_metrics = self.lr_schedulers.get_metrics()
 
         # Keep these variables local to shorten the code as these are
         # the major variables that are used in the training loop.
         parallel_dims = self.parallel_dims
+        # All groups form one optimizer step; each group feeds one fwd-bwd call.
+        microbatch_groups: list[list[tuple[dict[str, torch.Tensor], torch.Tensor]]] = []
+        local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        for _ in range(self.gradient_accumulation_steps):
+            microbatches = []
+            for _ in range(self.num_pipeline_parallel_microbatches):
+                with sl.log_trace_span("fetching_batch"):
+                    input_dict, labels = next(data_iterator)
+                local_valid_tokens += (labels != IGNORE_INDEX).sum()
+                microbatches.append((input_dict, labels))
+            microbatch_groups.append(microbatches)
+        sl.log_trace_scalar({"local_valid_tokens": int(local_valid_tokens)})
+
+        # All-reduce to get global token count across DP ranks
+        # Move to GPU for distributed communication
+        if parallel_dims.dp_enabled:
+            batch_mesh = parallel_dims.get_mesh("batch")
+            global_valid_tokens = dist_utils.dist_sum(
+                local_valid_tokens.to(self.device), batch_mesh
+            )
+        else:
+            global_valid_tokens = float(local_valid_tokens.item())
 
         accumulated_losses = []
-        # If data runs out during gradient accumulation, that
-        # entire step will not be executed.
-        for microbatch in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
-            loss = self.forward_backward_step(input_dict, labels)
-            accumulated_losses.append(loss.detach())
+        for microbatches in microbatch_groups:
+            input_dict_mbs = []
+            label_mbs = []
+            for input_dict, labels in microbatches:
+                for key, value in input_dict.items():
+                    if isinstance(value, torch.Tensor):
+                        input_dict[key] = value.to(self.device)
+                input_dict_mbs.append(input_dict)
+                label_mbs.append(labels.to(self.device))
 
-        grad_norm = dist_utils.clip_grad_norm_(
-            [p for m in self.model_parts for p in m.parameters()],
-            self.job_config.training.max_norm,
-            foreach=True,
-            pp_mesh=(
-                parallel_dims.world_mesh["pp"] if parallel_dims.pp_enabled else None
-            ),
-            ep_enabled=parallel_dims.ep_enabled,
-        )
-        self.checkpointer.maybe_wait_for_staging()
-        self.optimizers.step()
-        self.lr_schedulers.step()
+            if parallel_dims.pp_enabled:
+                fwd_bwd_input_dict = input_dict_mbs
+                fwd_bwd_labels = label_mbs
+            else:
+                assert len(input_dict_mbs) == len(label_mbs) == 1
+                fwd_bwd_input_dict = input_dict_mbs[0]
+                fwd_bwd_labels = label_mbs[0]
+
+            loss = self.forward_backward_step(
+                input_dict=fwd_bwd_input_dict,
+                labels=fwd_bwd_labels,
+                global_valid_tokens=global_valid_tokens,
+            )
+            accumulated_losses.append(loss.detach())
+        with sl.log_trace_span("optim"):
+            grad_norm = dist_utils.clip_grad_norm_(
+                [p for m in self.model_parts for p in m.parameters()],
+                self.config.training.max_norm,
+                foreach=True,
+                pp_mesh=parallel_dims.get_optional_mesh("pp"),
+                ep_enabled=parallel_dims.ep_enabled,
+            )
+            self.checkpointer.maybe_wait_for_staging()
+            self.optimizers.step()
+            self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
         loss = torch.sum(torch.stack(accumulated_losses))
@@ -253,78 +399,123 @@ class Trainer(ForgeEngine):
         # log metrics
         if not self.metrics_processor.should_log(self.step):
             return
+        
+        with sl.log_trace_span("collect_dist_metrics"):
+            sl.log_trace_scalar({"global_valid_tokens": int(global_valid_tokens)})
 
-        if parallel_dims.dp_cp_enabled:
-            loss = loss.detach()
-            global_avg_loss, global_max_loss = (
-                dist_utils.dist_mean(loss, parallel_dims.world_mesh["dp_cp"]),
-                dist_utils.dist_max(loss, parallel_dims.world_mesh["dp_cp"]),
+            if parallel_dims.dp_cp_enabled:
+                loss = loss.detach()
+                loss_mesh = parallel_dims.get_optional_mesh("loss")
+
+                # For global_avg_loss, we want the average loss across all ranks:
+                # loss = local_loss_sum / global_valid_tokens
+                # global_avg_loss = sum(local_loss_sum) / global_valid_tokens
+                #                 = sum(loss)
+                #
+                # For global_max_loss, we want the max of local average losses across ranks:
+                # local_avg_loss = local_loss_sum / local_valid_tokens
+                #                = (loss * global_valid_tokens) / local_valid_tokens
+                # global_max_loss = max(local_avg_loss)
+                local_avg_loss = loss * global_valid_tokens / local_valid_tokens
+                global_avg_loss, global_max_loss, global_ntokens_seen = (
+                    dist_utils.dist_sum(loss, loss_mesh),
+                    dist_utils.dist_max(local_avg_loss, loss_mesh),
+                    dist_utils.dist_sum(
+                        torch.tensor(
+                            self.ntokens_seen, dtype=torch.int64, device=self.device
+                        ),
+                        loss_mesh,
+                    ),
+                )
+            else:
+                global_avg_loss = global_max_loss = float(loss.detach().item())
+                global_ntokens_seen = self.ntokens_seen
+                
+        # Crash on invalid loss. global_avg_loss is a SUM reduction, so a infinite
+        # loss on any rank propagates here. This reuses the D2H copy already done
+        # for logging, so it adds no extra sync.
+        # TODO: make this step work even logging is off.
+        if not math.isfinite(global_avg_loss):
+            raise RuntimeError(
+                f"Loss is not finite (global_avg_loss={global_avg_loss}) at "
+                f"step {self.step}. Stopping training."
             )
-        else:
-            global_avg_loss = global_max_loss = loss.detach().item()
-
+            
+        extra_metrics = {
+            "n_tokens_seen": global_ntokens_seen,
+            **lr_metrics,
+        }
         self.metrics_processor.log(
             self.step,
             global_avg_loss,
             global_max_loss,
-            grad_norm.item(),
+            float(grad_norm.item()),
+            extra_metrics=extra_metrics,
         )
+
+    def post_training_tasks(self):
+        last_step = not self.should_continue_training()
+        if last_step:
+            self.model_converters.finalize(self.model_parts)
+
+        self.checkpointer.save(self.step, last_step=last_step)
+
+        # Run validation if validator is available
+        if self.config.validator.enable and (
+            self.validator.should_validate(self.step) or last_step
+        ):
+            self.validator.validate(self.model_parts, self.step)
 
     @record
     def train(self):
-        job_config = self.job_config
+        config = self.config
+        
+        sl.log_trace_instant("training_start")
 
-        self.checkpointer.load(step=job_config.checkpoint.load_step)
-        logger.info(f"Training starts at step {self.step + 1}.")
+        self.checkpointer.load(step=config.checkpoint.load_step)
 
-        with (
-            maybe_enable_profiling(
-                job_config.profiling,
-                global_step=self.step,
-                base_folder=job_config.job.dump_folder,
-            ) as torch_profiler,
-            maybe_enable_memory_snapshot(
-                job_config.profiling,
-                global_step=self.step,
-                base_folder=job_config.job.dump_folder,
-            ) as memory_profiler,
-        ):
+        # Capture loaded step for relative_step calculation.
+        # After checkpoint load: self.step = restored step (e.g. 100), or 0 if fresh.
+        loaded_step = self.step
+
+        logger.info(f"Training starts at step {self.step + 1}")
+
+        with self.profiler.active(
+            global_step=self.step,
+            base_folder=config.dump_folder,
+        ) as profiler:
             data_iterator = self.batch_generator(self.dataloader)
-            while self.step < job_config.training.steps:
+            while self.should_continue_training():
                 self.step += 1
-                self.gc_handler.run(self.step)
-                try:
-                    self.train_step(data_iterator)
-                except DataloaderExhaustedError:
-                    logger.warning("Ran out of data; last step was canceled.")
-                    break
+                sl.set_step(self.step, relative_step=self.step - loaded_step)
+                with sl.log_trace_span("step"):
+                    self.gc_handler.run(self.step)
+                    self.model_converters.pre_step(self.model_parts, trainer=self)
+                    try:
+                        self.train_step(data_iterator)
+                    except DataloaderExhaustedError:
+                        logger.warning("Ran out of data; last step was canceled.")
+                        break
 
-                # Run validation if validator is available
-                if (
-                    self.job_config.validation.enable
-                    and self.validator.should_validate(self.step)
-                ):
-                    self.validator.validate(self.model_parts, self.step)
+                    # Save Checkpoint
+                    # Run validation if validator is available
+                    self.post_training_tasks()
 
-                self.checkpointer.save(
-                    self.step, last_step=(self.step == job_config.training.steps)
-                )
+                    # signal the profiler that the next profiling step has started
+                    profiler.step()
 
-                # signal the profiler that the next profiling step has started
-                if torch_profiler:
-                    torch_profiler.step()
-                if memory_profiler:
-                    memory_profiler.step()
+                    # Reduce timeout after the first train step of THIS process
+                    # (assuming lazy init and compilation are finished). Use the
+                    # relative step so this fires on resumed runs too.
+                    if self.step - loaded_step == 1:
+                        dist_utils.set_pg_timeouts(
+                            timeout=timedelta(seconds=config.comm.train_timeout_seconds),
+                            parallel_dims=self.parallel_dims,
+                        )
 
-                # reduce timeout after first train step for faster signal
-                # (assuming lazy init and compilation are finished)
-                if self.step == 1:
-                    dist_utils.set_pg_timeouts(
-                        timeout=timedelta(
-                            seconds=job_config.comm.train_timeout_seconds
-                        ),
-                        world_mesh=self.parallel_dims.world_mesh,
-                    )
+        if not self.training_enabled():
+            # just run validation
+            self.post_training_tasks()
 
         if torch.distributed.get_rank() == 0:
             logger.info("Sleeping 2 seconds for other ranks to complete")
@@ -332,32 +523,90 @@ class Trainer(ForgeEngine):
 
         logger.info("Training completed")
 
+    def training_enabled(self) -> bool:
+        return self.step > 0
+
+    def should_continue_training(self) -> bool:
+        return self.step < self.config.training.steps
+
     def state_dict(self) -> dict[str, Any]:
-        return {"step": self.step}
+        return {"step": self.step, "ntokens_seen": self.ntokens_seen}
 
     def load_state_dict(self, state_dict: dict[str, Any]):
         self.step = state_dict["step"]
+        self.ntokens_seen = state_dict["ntokens_seen"]
 
     def close(self) -> None:
-        if self.metrics_processor:
-            self.metrics_processor.close()
         super().close()
+        if hasattr(self, "metrics_processor") and self.metrics_processor:
+            self.metrics_processor.close()
 
 
-if __name__ == "__main__":
+def main(custom_trainer_class: type[Trainer] | None = None) -> None:
+    """Main entry point for training."""
     init_logger()
+
+    import torchtitan
+
+    logger.info(
+        "torchtitan version: %s (0.0.0 means __version__ is not defined correctly).",
+        torchtitan.__version__,
+    )
+
     config_manager = ConfigManager()
     config = config_manager.parse_args()
-    trainer: Optional[Trainer] = None
+
+    # NOTE: internal meta tooling relies on source="training".
+    sl.init_structured_logger(
+        source="training",
+        # pyrefly: ignore [missing-attribute]
+        output_dir=config.dump_folder,
+        # pyrefly: ignore [missing-attribute]
+        enable=config.debug.enable_structured_logging,
+    )
+    sl.log_trace_instant("structured_logger_started")
+
+    trainer: Trainer | None = None
 
     try:
-        trainer = Trainer(config)
-        trainer.train()
+        # TODO(local_tensor): Remove this special case once LocalTensor supports
+        # init_states() and foreach_allgather. In local tensor mode, skip
+        # training/checkpointing as the # model is not fully initialized
+        # pyrefly: ignore [missing-attribute]
+        if config.comm.mode == "local_tensor":
+            logger.info("Local tensor mode enabled - skipping training execution")
+            return
+
+        # pyrefly: ignore [missing-attribute]
+        if custom_trainer_class is not None:
+            trainer = custom_trainer_class(config)
+        else:
+            trainer = config.build()
+
+        # pyrefly: ignore [missing-attribute]
+        if config.checkpoint.create_seed_checkpoint:
+            assert (
+                int(os.environ["WORLD_SIZE"]) == 1
+            ), "Must create seed checkpoint using a single device, to disable sharding."
+            assert (
+                # pyrefly: ignore [missing-attribute]
+                config.checkpoint.enable
+            ), "Must enable checkpointing when creating a seed checkpoint."
+            trainer.checkpointer.save(curr_step=0, last_step=True)
+            logger.info("Created seed checkpoint")
+        else:
+            trainer.train()
     except Exception:
         if trainer:
             trainer.close()
         raise
     else:
         trainer.close()
-        torch.distributed.destroy_process_group()
-        logger.info("Process group destroyed.")
+        if torch.distributed.is_initialized():
+            with sl.log_trace_span("torch_distributed_teardown"):
+                torch.distributed.destroy_process_group()
+        logger.info("Process group destroyed")
+
+
+if __name__ == "__main__":
+    main(Trainer)

@@ -6,6 +6,7 @@ on:
     paths-ignore:
       - 'torchtitan/experiments/**'
   pull_request:
+    types: [labeled, synchronize]
     branches: [ main ]
     paths-ignore:
       - 'torchtitan/experiments/**'
@@ -21,36 +22,78 @@ defaults:
   run:
     shell: bash -l -eo pipefail {0}
 
+permissions:
+  id-token: write
+  contents: read
+
 jobs:
-  build-test:
-    uses: pytorch/test-infra/.github/workflows/linux_job.yml@main
+  # CUDA: run the suite on an H100 runner via linux_job_v3.
+  set-matrix:
+    # Skip scheduled runs on forks, where they would only fail and email the fork owner
+    if: >-
+      (github.repository_owner == 'pytorch' || github.event_name != 'schedule') &&
+      (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ciflow/h100.8'))
+    uses: ./.github/workflows/set-matrix.yaml
     with:
-      runner: linux.aws.h100.8
-      gpu-arch-type: cuda
-      gpu-arch-version: "12.6"
-      # This image is faster to clone than the default, but it lacks CC needed by triton
-      # (1m25s vs 2m37s).
-      docker-image: torchtitan-ubuntu-20.04-clang12
+      runner-cuda: mt-l-bx86iamx-176-1800-h100-8
+      gpu-arch: cuda
+
+  build-test:
+    needs: set-matrix
+    # Skip cleanly when the matrix is empty (e.g. CUDA on a label-triggered,
+    # ROCm-only run); an empty matrix would otherwise error at evaluation.
+    if: ${{ needs.set-matrix.outputs.matrix != '' && fromJSON(needs.set-matrix.outputs.matrix).include[0] != null }}
+    uses: pytorch/test-infra/.github/workflows/linux_job_v3.yml@main
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.set-matrix.outputs.matrix) }}
+    with:
+      runner: ${{ matrix.runner }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      # Private-ECR image, tagged with the .ci/docker hash from set-matrix.yaml.
+      docker-image: 308535385114.dkr.ecr.us-east-1.amazonaws.com/torchtitan/${{ matrix.docker-image }}:${{ needs.set-matrix.outputs.docker-hash }}
       repository: pytorch/torchtitan
       upload-artifact: outputs
+      timeout: 45
       script: |
-        set -eux
+        TORCH_VERSION="${{ matrix.torch-version }}" \
+        INDEX_URL="${{ matrix.index-url }}" \
+        GPU_ARCH_TYPE="${{ matrix.gpu-arch-type }}" \
+        bash .github/scripts/run_8xgpu_integration_tests.sh
 
-        # The generic Linux job chooses to use base env, not the one setup by the image
-        CONDA_ENV=$(conda env list --json | jq -r ".envs | .[-1]")
-        conda activate "${CONDA_ENV}"
+  # ROCm: run the same suite on a ROCm runner via linux_job_v2. v2 is required
+  # because linux_job_v3 does not authenticate ROCm runners to the private ECR
+  # (the pull fails with "no basic auth credentials"); the bare image name lets
+  # v2 resolve and authenticate against ECR.
+  set-matrix-rocm:
+    # Skip scheduled runs on forks, where they would only fail and email the fork owner
+    if: >-
+      (github.repository_owner == 'pytorch' || github.event_name != 'schedule') &&
+      (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ciflow/h100.8'))
+    uses: ./.github/workflows/set-matrix.yaml
+    with:
+      gpu-arch: rocm
 
-        # Log CUDA driver version for debugging.
-        DRIVER_VERSION=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n 1 || true)
-        echo "CUDA driver version: ${DRIVER_VERSION}"
-
-        pip config --user set global.progress_bar off
-
-        python -m pip install --force-reinstall --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
-
-        USE_CPP=0 python -m pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu126
-
-        mkdir artifacts-to-be-uploaded
-
-        # Enable CPP stacktraces for debugging symmetric memory initialization errors.
-        TORCH_SHOW_CPP_STACKTRACES=1 python -m tests.integration_tests.run_tests --test_suite h100 artifacts-to-be-uploaded --ngpu 8
+  build-test-rocm:
+    needs: set-matrix-rocm
+    # Skip cleanly when the matrix is empty (e.g. ROCm on an ordinary
+    # synchronize push); an empty matrix would otherwise error at evaluation.
+    if: ${{ needs.set-matrix-rocm.outputs.matrix != '' && fromJSON(needs.set-matrix-rocm.outputs.matrix).include[0] != null }}
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.set-matrix-rocm.outputs.matrix) }}
+    with:
+      runner: ${{ matrix.runner }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      docker-image: ${{ matrix.docker-image }}
+      repository: pytorch/torchtitan
+      upload-artifact: outputs
+      timeout: 45
+      script: |
+        TORCH_VERSION="${{ matrix.torch-version }}" \
+        INDEX_URL="${{ matrix.index-url }}" \
+        GPU_ARCH_TYPE="${{ matrix.gpu-arch-type }}" \
+        bash .github/scripts/run_8xgpu_integration_tests.sh

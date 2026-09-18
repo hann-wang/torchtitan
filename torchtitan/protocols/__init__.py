@@ -4,15 +4,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from .model import BaseModelArgs, ModelProtocol
-from .model_converter import ModelConverter, ModelConvertersContainer
+from torchtitan.config import Configurable
+
+from .model import BaseModel
+from .model_spec import ModelSpec
+from .module import Module
 from .state_dict_adapter import BaseStateDictAdapter, StateDictAdapter
 
 __all__ = [
-    "BaseModelArgs",
-    "ModelProtocol",
-    "ModelConverter",
-    "ModelConvertersContainer",
+    "BaseModel",
+    "Configurable",
+    "ModelSpec",
+    "Module",
     "StateDictAdapter",
     "BaseStateDictAdapter",
 ]

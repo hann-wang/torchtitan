@@ -7,62 +7,58 @@ For offline explorations, we recommend the same steps, unless otherwise noted.
 Please refer to the [Llama 3 folder](llama3) as an example.
 
 The folder should be organized as follows
-- `model` folder: a self-contained folder of model definition and args
-  - `args.py`
-    - Inherit [`BaseModelArgs`](/torchtitan/protocols/model.py) and implement the interfaces.
-      - `get_nparams_and_flops()` will be used to understand model size and compute throughput.
-      - `update_from_config()` updates the model args from training configs. To extend training configs, see the bullet point below on `job_config.py`.
-  - `model.py`
-    - NOTE: Please adhere to the guiding principles and write single-device model code.
-    - NOTE: We prioritize readability over flexibility. The preferred style is to not share modules among different models, except for the most common and complicated ones.
-    - Inherit [`ModelProtocol`](/torchtitan/protocols/model.py) and implement the interfaces.
-      - `__init__()` consumes a `ModelArgs` input to build the model
-      - `init_weights()` is used to properly initialize the parameters and buffers in the model. Please define it in a recursive way so that every submodule has its own `init_weights()`.
-    - Add additional files to reduce the complexity of `model.py` if it grows too large or complex, e.g. moe.py to host the `MoE`, `Router`, and `GroupedExperts` modules.
-  - `state_dict_adapter.py`
-    - Inherit [`BaseStateDictAdapter`](/torchtitan/protocols/state_dict_adapter.py) to implement state dict mappings between `torchtitan` model definition and other model definitions (e.g. from HuggingFace so that we can save / load model checkpoints in HF formats).
-    - There are multiple ways such adapters could be used
-      - Checkpoint conversion scripts in `scripts/checkpoint_conversion/` will use them to adapt state dicts containing non-sharded `torch.Tensor` on CPU.
-      - During training, [`CheckpointManager`](/torchtitan/components/checkpoint.py) will use them to adapt state dicts containing (potentially sharded) `DTensor` on GPUs to save / load checkpoints in HF format.
-      - In post-training, `to_hf()` helps convert a torchtitan model to HF model, which can be used for inference by other frameworks.
-    - This is optional for offline exploration.
-- `infra` folder: containing the functions used to parallelize the model using PyTorch native techniques
-  - `parallelize.py`
-    - apply training techniques in the following order
-      - TP (and EP if the model has MoE architecture)
-      - activation checkpointing
-      - `torch.compile`
-      - FSDP /  HSDP
-      - NOTE: currently CP support for language models is enabled via a context manager in `torchtitan/train.py`. Ideally no extra work is needed to enable CP.
-  - `pipeline.py` (optional if model size is small)
-    - apply PP
-  - Include other util files if necessary.
+- `model.py`
+  - NOTE: Please adhere to the guiding principles and write single-device model code.
+  - NOTE: We prioritize readability over flexibility. The preferred style is to not share modules among different models, except for the most common and complicated ones.
+  - Define a Model class inheriting from a base model (e.g. `Decoder` from `torchtitan/models/common/decoder.py`).
+  - The model class should contain a nested `Config` dataclass (inheriting from the base model's `Config`) that holds all architecture hyperparameters.
+    - `get_nparams_and_flops()` will be used to understand model size and compute throughput.
+    - `update_from_config()` updates the model config from training configs (e.g. syncing seq_len, handling hardware-specific settings).
+  - `__init__()` consumes the `Config` to build the model.
+  - Parameter initialization is handled by the `param_init` system on each module's `Config`. Set `param_init` (a `dict[str, Callable]` mapping parameter names to init functions) on every sub-config in the model config registry. `init_states()` auto-recurses into all submodules, so manual recursive calls are not needed. Override `_init_self_buffers()` for device-aware buffer initialization (e.g., RoPE, MoE).
+  - Add additional files to reduce the complexity of `model.py` if it grows too large or complex, e.g. moe.py to host the `MoE`, `Router`, and `GroupedExperts` modules.
+- `state_dict_adapter.py`
+  - Inherit [`BaseStateDictAdapter`](/torchtitan/protocols/state_dict_adapter.py) to implement state dict mappings between `torchtitan` model definition and other model definitions (e.g. from HuggingFace so that we can save / load model checkpoints in HF formats).
+  - There are multiple ways such adapters could be used
+    - Checkpoint conversion scripts in `scripts/checkpoint_conversion/` will use them to adapt state dicts containing non-sharded `torch.Tensor` on CPU.
+    - During training, [`CheckpointManager`](/torchtitan/components/checkpoint.py) will use them to adapt state dicts containing (potentially sharded) `DTensor` on GPUs to save / load checkpoints in HF format.
+    - In post-training, `to_hf()` helps convert a torchtitan model to HF model, which can be used for inference by other frameworks.
+  - This is optional for offline exploration.
+- `sharding.py`
+  - Define `set_<model>_sharding_config(config, *, enable_sp, ...)` that populates `sharding_config` on each `Module.Config` in the model config (embeddings, norms, attention, feed-forward, output). TP, SP, and inner-attention `LocalMapConfig` placements are expressed declaratively via `ShardingConfig` instead of a runtime `parallelize_module` plan.
+  - Call the helper from `Model.Config.update_from_config()` so placements depend on the trainer's `parallelism` settings.
+  - Reuse shared helpers from `torchtitan/models/common/decoder_sharding.py` (`set_decoder_sharding_config`, `set_dense_ffn_sharding`, `set_gqa_attention_sharding`, `norm_config`, `dense_param_placement`, `dense_activation_placement`) where possible.
+  - Under `--parallelism.spmd_backend full_dtensor`, declare the mesh axes in canonical outer-to-inner SPMD order: `(dp_replicate, dp_shard, cp, tp)` for dense (attention/MLP/norm/embed/lm_head) and `(dp_replicate, efsdp, ep)` for sparse (MoE expert weights). `Module.parallelize` resolves the mesh by the declared order and validates it matches one of the SPMD meshes; declaring axes out of order raises `ValueError`.
+- `parallelize.py`
+  - apply training techniques in the following order
+    - `model.parallelize(parallel_dims)` — auto-recursive declarative sharding driven by `sharding_config` (TP, SP, attention `local_map`). Replaces per-model `parallelize_module` plan dicts.
+    - (MoE models) `apply_moe_ep_tp` for expert-parallel + TP on MoE experts (not yet config-based).
+    - activation checkpointing
+    - `torch.compile`
+    - FSDP /  HSDP
+    - NOTE: currently CP support for language models is enabled via a context manager in `torchtitan/train.py`. Ideally no extra work is needed to enable CP.
+- `pipeline.py` (optional if model size is small)
+  - apply PP
 - `__init__.py`
-  - A dictionary of the actual model configurations, of the type `[str: ModelArgs]`.
-  - Define `get_train_spec` to return a [`TrainSpec`](/torchtitan/protocols/train_spec.py), consisting a tuple of
-    - model name, model class, model args
-      - Model name should be the same as the folder name, which should be added to `torchtitan/models/__init__.py` or ``torchtitan/experiments/__init__.py``.
+  - A dictionary of the actual model configurations, of the type `[str: Model.Config]`.
+  - Define `model_registry(flavor)` to return a [`ModelSpec`](/torchtitan/protocols/model_spec.py), consisting of
+    - model name and flavor
+    - model config (a `Model.Config` dataclass)
     - parallelizing function, pipelining function
-    - builder functions for optimizer, lr scheduler, data loader, tokenizer, and loss function
-      - More often than not, existing components can be reused.
-      - Adding new datasets requires the `torchtitan` team’s review and legal approval.
-      - Try to have minimal dependency on external libraries, if any.
+    - loss function builder
     - state dict adapter
-  - If developing outside of torchtitan, one can call `register_train_spec` to register a `TrainSpec` so that `train.py` can be reused.
-  - Read [more](/docs/extension.md#trainspec) on `TrainSpec`.
+  - Model name should be the same as the folder name, which should be added to `torchtitan/models/__init__.py` or ``torchtitan/experiments/__init__.py``.
+  - Read [more](/docs/extension.md#modelspec) on `ModelSpec`.
+- `config_registry.py`
+  - Define one function for each training configuration (e.g. `llama3_debugmodel`, `llama3_8b`, `llama3_70b`).
+  - Each function returns a `Trainer.Config` (or subclass) instance with all training settings.
+  - Functions can derive from each other via mutation for variants (e.g. flex_attn, float8).
+  - These are selected at runtime via `--module <model_name> --config <function_name>`.
 - `README.md`
   - Include [instructions](/README.md#downloading-a-tokenizer) to download tokenizers / encoders.
   - Include instructions to download model checkpoints for continued pretraining or post training.
   - Update the current status of development, including the supported features and coming features.
   - This is optional for offline exploration.
-- `job_config.py` (if necessary)
-  - Sometimes a new model needs to access additional configs, to be consumed by various training components. Read the [guidance](/docs/extension.md#train-script) on extending `JobConfig`.
-- `train.py` (only if absolutely necessary)
-  - Sometimes `torchtitan/train.py` may not be enough to run the model. There is a [tradeoff](/docs/extension.md#train-script) between extending the existing one vs. having a new one.
-  - Even if a new one needs to be added, it should reuse `torchtitan/train.py` as much as possible. See `torchtitan/experiments/flux/train.py` as an example.
-- `train_configs` folder
-  - There should be one `.toml` file for each model variant (e.g. Llama 3.1 8B / 70B / 405B) as well as a `debug_model.toml`.
-  - They should be verified with real training jobs, in terms of optimized throughput and loss converging.
 
 ## Testing and Benchmarking
 - Numerics testing

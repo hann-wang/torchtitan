@@ -4,10 +4,15 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'torchtitan/components/ft.py'
+      - 'torchtitan/experiments/torchft/**'
+      - 'torchtitan/components/checkpoint.py'
+      - '.github/workflows/integration_test_8gpu_torchft.yaml'
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
-      - 'torchtitan/components/ft.py'
+      - 'torchtitan/experiments/torchft/**'
+      - 'torchtitan/components/checkpoint.py'
+      - '.github/workflows/integration_test_8gpu_torchft.yaml'
   schedule:
     # Runs every 6 hours
     - cron: '0 */6 * * *'
@@ -19,18 +24,34 @@ defaults:
   run:
     shell: bash -l -eo pipefail {0}
 
+permissions:
+      id-token: write
+      contents: read
+
 jobs:
-  build-test:
-    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+  # Step 1: Dynamically compute the matrix based on conditions
+  set-matrix:
+    # Skip scheduled runs on forks, where they would only fail and email the fork owner
+    if: github.repository_owner == 'pytorch' || github.event_name != 'schedule'
+    uses: ./.github/workflows/set-matrix.yaml
     with:
-      runner: linux.g5.48xlarge.nvidia.gpu
-      gpu-arch-type: cuda
-      gpu-arch-version: "12.6"
-      # This image is faster to clone than the default, but it lacks CC needed by triton
-      # (1m25s vs 2m37s).
-      docker-image: torchtitan-ubuntu-20.04-clang12
+      is-experimental: true
+
+  # Step 2: Use the dynamic matrix in the build-test job
+  build-test:
+    needs: set-matrix
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.set-matrix.outputs.matrix) }}
+    with:
+      runner: ${{ matrix.runner }}
+      gpu-arch-type: ${{ matrix.gpu-arch-type }}
+      gpu-arch-version: ${{ matrix.gpu-arch-version }}
+      docker-image: ${{ matrix.docker-image }}
       repository: pytorch/torchtitan
       upload-artifact: outputs
+      timeout: 45
       script: |
         set -eux
 
@@ -45,13 +66,27 @@ jobs:
         pip config --user set global.progress_bar off
 
         python -m pip install torchft-nightly
-        python -m pip install --force-reinstall --pre torch --index-url https://download.pytorch.org/whl/nightly/cu126
-        USE_CPP=0 python -m pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu126
+        TORCH_SPEC="torch"
+        if [ -n "${{ matrix.torch-version }}" ]; then
+          TORCH_SPEC="torch==${{ matrix.torch-version }}"
+        fi
+        python -m pip install --force-reinstall --pre \
+          "${TORCH_SPEC}" --index-url ${{ matrix.index-url }}
 
-        mkdir artifacts-to-be-uploaded
+        if [[ "${{ matrix.gpu-arch-type }}" == "rocm" ]]; then
+          export HIPBLASLT_TENSILE_LIBPATH="$(python -c 'import os, torch; print(os.path.join(os.path.dirname(torch.__file__), "lib", "hipblaslt", "library"))')"
+          echo "HIPBLASLT_TENSILE_LIBPATH=${HIPBLASLT_TENSILE_LIBPATH}"
+        fi
+
+        USE_CPP=0 python -m pip install --pre torchao --index-url ${{ matrix.index-url }}
+
+        sudo mkdir -p "$RUNNER_TEMP/artifacts-to-be-uploaded"
+        sudo chown -R $(id -u):$(id -g) "$RUNNER_TEMP/artifacts-to-be-uploaded"
+
         echo "torchft_lighthouse"
         RUST_BACKTRACE=1 torchft_lighthouse --min_replicas 1 --quorum_tick_ms 100 --join_timeout_ms 10000 > /dev/null 2>&1 &
         echo "ft_integration_test"
         # Getting error - Cuda failure 217 'peer access is not supported between these two devices'
-        python -m tests.integration_tests.ft artifacts-to-be-uploaded --ngpu 8
+        python -m torchtitan.experiments.torchft.tests.integration_tests $RUNNER_TEMP/artifacts-to-be-uploaded --ngpu 8
         # pkill -9 torchft_lighthouse
+        rm -rf $RUNNER_TEMP/artifacts-to-be-uploaded/*/checkpoint
