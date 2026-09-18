@@ -46,7 +46,11 @@ from torchtitan.distributed.activation_checkpoint import (
 )
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+from torchtitan.models.common.attention import (
+    FlexAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
+)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import structured_logger as sl
 from torchtitan.protocols import BaseModel
@@ -725,6 +729,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                 extra_kwargs["attention_masks"] = model.get_attention_masks(
                     positions=positions,
                 )
+            elif isinstance(inner_attention, ScaledDotProductAttention.Config):
+                # sdpa cannot mask document boundaries, so position-driven
+                # RoPE would not match what its mask actually allows.
+                del extra_kwargs["positions"]
 
         if self.parallel_dims.cp_enabled:
             inputs, labels, extra_kwargs = prepare_context_parallel_input(

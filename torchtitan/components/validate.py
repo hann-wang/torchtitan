@@ -21,7 +21,11 @@ from torchtitan.config import Configurable, ParallelismConfig
 from torchtitan.distributed import full_dtensor, ParallelDims, utils as dist_utils
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
-from torchtitan.models.common.attention import FlexAttention, VarlenAttention
+from torchtitan.models.common.attention import (
+    FlexAttention,
+    ScaledDotProductAttention,
+    VarlenAttention,
+)
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools import utils
@@ -192,6 +196,9 @@ class Validator(BaseValidator):
                 extra_kwargs["attention_masks"] = model.get_attention_masks(
                     positions=positions,
                 )
+            elif isinstance(inner_attention, ScaledDotProductAttention.Config):
+                # See Trainer.post_dataloading_process.
+                del extra_kwargs["positions"]
 
         if self.parallel_dims.cp_enabled:
             inputs, labels, extra_kwargs = prepare_context_parallel_input(
