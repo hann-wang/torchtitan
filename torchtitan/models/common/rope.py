@@ -10,10 +10,9 @@ from typing import Literal
 
 import spmd_types as spmd
 import torch
-from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.fx.experimental.symbolic_shapes import guard_or_false
 
-from torchtitan.protocols.module import Module
+from torchtitan.distributed.local_compile import local_compile
+from torchtitan.models.base.module import Module
 
 __all__ = [
     "ComplexRoPE",
@@ -32,9 +31,8 @@ def _maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None
     """
     if torch.compiler.is_compiling():
         return
-    pos_local = positions.to_local() if isinstance(positions, DTensor) else positions
     torch._assert_async(
-        torch.all(pos_local <= max_valid_pos),
+        torch.all(positions <= max_valid_pos),
         f"position_ids exceed {max_valid_pos=}",
     )
 
@@ -55,7 +53,7 @@ def _yarn_inv_freq(
     convention: ``low <- beta_fast`` (extrapolation boundary), ``high <-
     beta_slow`` (interpolation boundary). ``truncate`` floors/ceils the cutoffs
     (DeepSeek style); ``truncate=False`` keeps fractional cutoffs (gpt-oss
-    style). The range is always clamped to ``[0, dim/2 - 1]``. The YaRN
+    style). The range is always clamped to ``[0, dim - 1]``. The YaRN
     attention "mscale" is intentionally NOT applied here -- the rope stays a
     pure rotation and the model folds mscale into its softmax scale.
     """
@@ -72,9 +70,8 @@ def _yarn_inv_freq(
         low = math.floor(low)
         high = math.ceil(high)
     low, high = max(low, 0), min(high, dim - 1)
-    assert (
-        0 < low < high < dim - 1
-    ), f"Invalid YaRN params: 0 < {low} < {high} < {dim - 1}"
+    if low == high:
+        high += 0.001
 
     ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low)).clamp(
         0, 1
@@ -93,7 +90,7 @@ class RoPE(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         dim: int
-        max_seq_len: int
+        max_context_length: int
         theta: float = 10000.0
         scaling: Literal["none", "llama", "yarn"] = "none"
         # llama scaling params
@@ -114,7 +111,7 @@ class RoPE(Module):
         self.register_buffer("cache", self._precompute_cache(), persistent=False)
 
     def _precompute_cache(self) -> torch.Tensor:
-        """Build the reusable cache for all positions up to ``max_seq_len``.
+        """Build the reusable cache for all positions up to ``max_context_length``.
 
         Returns:
             RoPE cache for all valid positions.
@@ -129,8 +126,8 @@ class RoPE(Module):
         """Return a cache aligned to ``query`` and ``positions``.
 
         Args:
-            query: Query tensor of shape ``(batch, seq_len, n_heads, head_dim)``.
-            positions: Optional position IDs of shape ``(batch, seq_len)``.
+            query: Query tensor with shape ``[T, N, H]``.
+            positions: Optional position IDs with shape ``[T]``.
 
         Returns:
             Prepared RoPE cache for the concrete RoPE format.
@@ -141,32 +138,38 @@ class RoPE(Module):
     def apply_rotary_emb(
         cls,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply a prepared RoPE cache to query and key.
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Apply a prepared RoPE cache to query and optional key.
 
         Args:
-            query: Query tensor of shape ``(batch, seq_len, n_heads, head_dim)``.
-            key: Key tensor of shape ``(batch, seq_len, n_heads, head_dim)``.
+            query: Query tensor with shape ``[T, N, H]``.
+            key: Optional key tensor with the same leading dimensions as
+                ``query``. If ``None``, only ``query`` is rotated and returned.
             rope_cache: Prepared cache broadcastable to ``query`` and ``key``
                 according to the concrete RoPE format.
+            inverse: Whether to apply the inverse rotation.
 
         Returns:
-            Rotated query and key tensors with the same shapes and dtypes as
-            ``query`` and ``key``.
+            Rotated query tensor when ``key`` is ``None``; otherwise rotated
+            query and key tensors with the same shapes and dtypes as inputs.
         """
         raise NotImplementedError
 
     def forward(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply rotary embeddings to query and key tensors."""
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Apply rotary embeddings to query and optional key tensors."""
         reshaped_cache = self._reshape_cache(query, positions)
-        return self.apply_rotary_emb(query, key, reshaped_cache)
+        return self.apply_rotary_emb(query, key, reshaped_cache, inverse=inverse)
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         # TODO: In long-term we need to have buffer abstraction in `Module`` class to infer the buffer_device
@@ -183,15 +186,44 @@ class ComplexRoPE(RoPE):
     class Config(RoPE.Config):
         pass
 
+    # Cat options: only fp32/fp16 inputs reach the stack (bf16 writes int32 pairs); they write
+    # each half with one store, instead of one masked kernel over both.
+    # No pointwise autotuning: the rotation's kernel configs can round differently (likely FMA
+    # contraction), so picking one by timing could change numerics from run to run.
+    # recompile_limit counts graphs per process; one more raises. DeepSeek-V4 calls this from
+    # 4 sites, one graph each, so its recipes compile 4. no_grad calls double that to 8. A
+    # second token count recompiles each graph with a dynamic size: up to 16. Unpacked batches
+    # and calls without positions take other paths through the compressor, and a token count
+    # that leaves one compressed entry adds a few more: up to 26 in one process. Hence 32.
+    @local_compile(
+        "rope",
+        batch_invariant=True,
+        recompile_limit=32,
+        options={
+            "max_pointwise_cat_inputs": 0,
+            "max_complex_pointwise_cat_inputs": 0,
+            "triton.autotune_pointwise": False,
+        },
+    )
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return super().forward(query, key, positions, inverse=inverse)
+
     def _precompute_cache(self) -> torch.Tensor:
         """Precompute complex cis values.
 
         Returns:
-            Cache of shape ``(max_seq_len, dim / 2)``.
+            Cache of shape ``(max_context_length, dim / 2)``.
         """
         cfg = self.config
         dim = cfg.dim
-        end = cfg.max_seq_len
+        end = cfg.max_context_length
         theta = cfg.theta
 
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
@@ -217,7 +249,7 @@ class ComplexRoPE(RoPE):
                 wavelen > low_freq_wavelen
             )
             freqs = torch.where(is_medium_freqs, smoothed_freqs, freqs)
-        elif cfg.scaling == "yarn" and end > cfg.original_seq_len:
+        elif cfg.scaling == "yarn" and cfg.rope_factor > 1.0:
             # YaRN (DeepSeek V3 style)
             freqs = _yarn_inv_freq(
                 dim,
@@ -239,14 +271,20 @@ class ComplexRoPE(RoPE):
         query: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return complex cache shaped for query/key broadcast.
+        """Return the cache shaped for query/key broadcast.
 
         Returns:
-            Cache of shape ``(1 or batch, seq_len, 1, dim / 2)``.
+            Complex cache of shape ``(T, 1, dim / 2)``; under compile, its real view
+            ``(T, 1, dim)`` with each ``(cos, sin)`` pair adjacent.
         """
-        positions = _maybe_wrap_positions(positions, query)
         if positions is not None:
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
+        if torch.compiler.is_compiling():
+            # Gather rows of the real view, (T, 1, dim): Inductor can't load complex, so a complex
+            # gather runs as its own kernel, while a float gather fuses into the rotation.
+            return _reshape_for_broadcast(
+                torch.view_as_real(self.cache).flatten(-2), query.shape, positions
+            )
         # Complex RoPE cache has width dim / 2 because each complex value
         # represents a pair of real dimensions.
         complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
@@ -256,15 +294,94 @@ class ComplexRoPE(RoPE):
     def apply_rotary_emb(
         cls,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Apply complex RoPE using adjacent-dim pairs."""
+        if torch.compiler.is_compiling():
+            # Inductor can't compile a complex multiply, so rotate in real arithmetic: it fuses
+            # with the casts, within 1 bf16 ulp of eager. Eager keeps the complex ops.
+            # _reshape_cache hands over the real view, gathered as floats; direct callers may
+            # still pass the complex cache.
+            if rope_cache.is_complex():
+                cache = torch.view_as_real(rope_cache)
+            else:
+                cache = rope_cache.unflatten(-1, (-1, 2))
+            cos, sin = cache[..., 0], cache[..., 1]
+            if inverse:
+                sin = -sin
+            query_out = _RotatePairs.apply(query, cos, sin)
+            if key is None:
+                return query_out
+            return query_out, _RotatePairs.apply(key, cos, sin)
+
+        if inverse:
+            rope_cache = rope_cache.conj()
+
         xq_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], -1, 2))
+        query_out = torch.view_as_real(xq_ * rope_cache).flatten(-2).type_as(query)
+        if key is None:
+            return query_out
+
         xk_ = torch.view_as_complex(key.float().reshape(*key.shape[:-1], -1, 2))
-        xq_out = torch.view_as_real(xq_ * rope_cache).flatten(3)
-        xk_out = torch.view_as_real(xk_ * rope_cache).flatten(3)
-        return xq_out.type_as(query), xk_out.type_as(key)
+        key_out = torch.view_as_real(xk_ * rope_cache).flatten(-2).type_as(key)
+        return query_out, key_out
+
+
+class _RotatePairs(torch.autograd.Function):
+    """Rotate each ``(x[2i], x[2i + 1])`` pair by the angle with ``cos[i]``, ``sin[i]``::
+
+        out[2i]     = x[2i] * cos[i] - x[2i + 1] * sin[i]
+        out[2i + 1] = x[2i] * sin[i] + x[2i + 1] * cos[i]
+
+    A Function because the bf16 path's int32 views have no autograd. The backward is the
+    same rotation by the opposite angle, one kernel. ``cos`` and ``sin`` get no gradient:
+    they come from the RoPE cache buffer.
+    """
+
+    @staticmethod
+    def forward(  # pyrefly: ignore[bad-override]
+        ctx, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        ctx.save_for_backward(cos, sin)
+        return _RotatePairs.rotate(x, cos, sin)
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):  # pyrefly: ignore[bad-override]
+        cos, sin = ctx.saved_tensors
+        return _RotatePairs.rotate(grad, cos, -sin), None, None
+
+    @staticmethod
+    def rotate(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """``x`` may also hold bf16 pairs already packed as int32 words (MLA's ``_RotateTail``); the
+        result is then int32 too.
+        """
+        packed = x.dtype == torch.int32
+        out_dtype = torch.bfloat16 if packed else x.dtype
+        if packed or (x.dtype == torch.bfloat16 and x.is_contiguous()):
+            # Read each pair as one int32 (little-endian: x[2i] in the low half), so loads stay contiguous.
+            # A bf16 shifted into the high 16 bits is its exact fp32. The int32 view also
+            # ends the fusion with whatever produced x, which is written out first. It needs an
+            # even element offset: every caller slices q/k at even widths.
+            pairs = x if packed else x.view(torch.int32)
+            x_real = (pairs << 16).view(torch.float32)
+            x_imag = (pairs & ~0xFFFF).view(torch.float32)
+        else:
+            # Split views and other dtypes: read the two halves. An int32 view of a split
+            # view would be copied first.
+            x_pairs = x.float().unflatten(-1, (-1, 2))
+            x_real, x_imag = x_pairs[..., 0], x_pairs[..., 1]
+        real = (x_real * cos - x_imag * sin).to(out_dtype)
+        imag = (x_real * sin + x_imag * cos).to(out_dtype)
+        if out_dtype == torch.bfloat16:
+            # Write each rotated pair as one int32 so stores stay contiguous; a store per half
+            # writes every other element.
+            low = real.view(torch.int16).to(torch.int32) & 0xFFFF
+            high = imag.view(torch.int16).to(torch.int32) << 16
+            return low | high if packed else (low | high).view(torch.bfloat16)
+        return torch.stack((real, imag), dim=-1).flatten(-2)
 
 
 class CosSinRoPE(RoPE):
@@ -272,15 +389,26 @@ class CosSinRoPE(RoPE):
     class Config(RoPE.Config):
         pass
 
+    @local_compile("rope", batch_invariant=True)
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return super().forward(query, key, positions, inverse=inverse)
+
     def _precompute_cache(self) -> torch.Tensor:
         """Precompute cos/sin values.
 
         Returns:
-            Cache of shape ``(max_seq_len, dim * 2)``.
+            Cache of shape ``(max_context_length, dim * 2)``.
         """
         cfg = self.config
         dim = cfg.dim
-        max_seq_len = cfg.max_seq_len
+        max_context_length = cfg.max_context_length
         base = cfg.theta
 
         if cfg.scaling == "llama":
@@ -301,7 +429,9 @@ class CosSinRoPE(RoPE):
                 base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
             )
 
-        t = torch.arange(max_seq_len, dtype=inv_freq.dtype, device=inv_freq.device)
+        t = torch.arange(
+            max_context_length, dtype=inv_freq.dtype, device=inv_freq.device
+        )
         freqs = torch.outer(t, inv_freq).float()
         theta = torch.cat([freqs, freqs], dim=-1)
 
@@ -317,9 +447,8 @@ class CosSinRoPE(RoPE):
         """Return cos/sin cache shaped for query/key broadcast.
 
         Returns:
-            Cache of shape ``(1 or batch, seq_len, 1, dim * 2)``.
+            Cache of shape ``(T, 1, dim * 2)``.
         """
-        positions = _maybe_wrap_positions(positions, query)
         if positions is not None:
             _maybe_check_max_pos(positions, max_valid_pos=self.cache.shape[0] - 1)
         return _reshape_for_broadcast(self.cache, query.shape, positions)
@@ -328,16 +457,24 @@ class CosSinRoPE(RoPE):
     def apply_rotary_emb(
         cls,
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Apply cos/sin RoPE using the rotate-half convention."""
+        if inverse:
+            raise NotImplementedError("CosSinRoPE does not support inverse rotation.")
+
         head_dim = query.shape[-1]
         cos = rope_cache[..., :head_dim]
         sin = rope_cache[..., head_dim:]
         query_f = query.float()
-        key_f = key.float()
         xq_out = (query_f * cos) + (CosSinRoPE._rotate_half(query_f) * sin)
+        if key is None:
+            return xq_out.type_as(query)
+
+        key_f = key.float()
         xk_out = (key_f * cos) + (CosSinRoPE._rotate_half(key_f) * sin)
         return xq_out.type_as(query), xk_out.type_as(key)
 
@@ -348,87 +485,24 @@ class CosSinRoPE(RoPE):
         return torch.cat((-x2, x1), dim=-1)
 
 
-@spmd.local_map(out_types={"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.R})
+@spmd.local_map(
+    out_types=(
+        {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R},
+        spmd.PartitionSpec(("dp", "cp"), None, None),
+    )
+)
 def _reshape_for_broadcast(
     rope_cache: torch.Tensor,
     query_shape: torch.Size | tuple[int, ...],
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reshape a RoPE cache for broadcasting with query/key tensors."""
-    ndim = len(query_shape)
-    assert ndim > 1
-    bsz, seqlen = query_shape[:2]
-    # cache_width is `head_dim * 2` for CosSinRoPE, and `head_dim // 2` for ComplexRoPE
+    # cache_width: `head_dim * 2` for CosSinRoPE; `head_dim // 2` for ComplexRoPE's complex
+    # cache, `head_dim` for its real view under compile.
     cache_width = rope_cache.shape[-1]
+    num_tokens = query_shape[0]
     if positions is None:
-        # No explicit positions: use the prefix cache and broadcast it over batch.
-        rope_cache = rope_cache[0:seqlen]
-        # assert rope_cache.shape == (seqlen, cache_width)
-        shape = [
-            d if i == 1 else cache_width if i == ndim - 1 else 1
-            for i, d in enumerate(query_shape)
-        ]
-        return rope_cache.view(*shape)
-
-    # TODO(pianpwk): Remove this vLLM inference compatibility branch once
-    # singleton positions can use the general gather path; see PR #3750.
-    # Concrete/provable singleton positions can use the cheaper prefix-shaped
-    # view path. If singleton-ness is symbolic, fall through to gather below.
-    if guard_or_false(positions.size(0) == 1):
-        # assert positions.shape == (1, seqlen)
-        rope_cache = rope_cache[positions.squeeze(0)]
-        # assert rope_cache.shape == (seqlen, cache_width)
-        shape = [
-            d if i == 1 else cache_width if i == ndim - 1 else 1
-            for i, d in enumerate(query_shape)
-        ]
-        return rope_cache.view(*shape)
+        rope_cache = rope_cache[:num_tokens]
     else:
-        # Per-batch positions, plus singleton positions whose first dimension was
-        # not statically provable above, use the general gather path.
-        # assert positions.shape == (bsz, seqlen)
-        positions = positions.expand(bsz, -1)
-        rope_cache_expanded = rope_cache[None, :, None, :].expand(bsz, -1, -1, -1)
-        rope_cache = torch.gather(
-            rope_cache_expanded,
-            dim=1,
-            index=positions.view(bsz, seqlen, 1, 1).expand(bsz, seqlen, 1, cache_width),
-        )
-        return rope_cache
-
-
-def _maybe_wrap_positions(
-    positions: torch.Tensor | None,
-    x: torch.Tensor,
-) -> torch.Tensor | None:
-    """Wrap positions as a DTensor deriving mesh and placements from x (xq/xk).
-
-    TODO: In a full DTensor rewrite, positions should be made a DTensor
-    in/right after dataloading, together with inputs and labels.
-
-    When TP uses use_local_output=False (DeepSeek V3, Qwen3, GPT-OSS),
-    x is a DTensor but positions is a plain tensor. The downstream
-    torch.gather requires both operands to be the same type.
-
-    Positions (bsz, seqlen) has fewer dimensions than x (bsz, seqlen,
-    n_heads, head_dim), so we only preserve Shard placements for shared
-    dimensions. Shard dims beyond positions' rank (e.g. Shard(2) for TP
-    on heads) become Replicate.
-    """
-    if (
-        positions is not None
-        and isinstance(x, DTensor)
-        and not isinstance(positions, DTensor)
-    ):
-        ndim = positions.ndim
-        placements = tuple(
-            p if not isinstance(p, Shard) or p.dim < ndim else Replicate()
-            for p in x.placements
-        )
-        positions = DTensor.from_local(
-            positions,
-            x.device_mesh,
-            placements,
-            run_check=False,
-        )
-    return positions
+        rope_cache = rope_cache[positions]
+    return rope_cache.view(num_tokens, 1, cache_width)

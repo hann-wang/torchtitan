@@ -4,15 +4,21 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 import logging
 import re
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
-logger = logging.getLogger()
+from torchtitan.models.base.state_dict_adapter import dtensor_safe, StateDictAdapter
 
 from torchtitan.models.common.rope import ComplexRoPE
-from torchtitan.protocols.state_dict_adapter import StateDictAdapter
-from .model import Llama3Model
+
+if TYPE_CHECKING:
+    from .model import Llama3Model
+
+
+logger = logging.getLogger(__name__)
 
 
 class Llama3StateDictAdapter(StateDictAdapter):
@@ -44,7 +50,21 @@ class Llama3StateDictAdapter(StateDictAdapter):
             "lm_head.weight": "lm_head.weight",
         }
 
+        # pyrefly: ignore [missing-attribute]
+        self.qk_norm_over_heads = model_config.layers[0].attention.qk_norm_over_heads
+        if self.qk_norm_over_heads:
+            # Instella-3B names its pre-norms differently from Llama.
+            del self.from_hf_map["model.layers.{}.input_layernorm.weight"]
+            del self.from_hf_map["model.layers.{}.post_attention_layernorm.weight"]
+            self.from_hf_map.update(
+                {
+                    "model.layers.{}.pre_attention_layernorm.weight": "layers.{}.attention_norm.weight",
+                    "model.layers.{}.pre_feedforward_layernorm.weight": "layers.{}.ffn_norm.weight",
+                }
+            )
+
     # HuggingFace permutation function (exact copy from their conversion script)
+    @dtensor_safe
     def _permute(self, w, n_heads_arg, dim1=None, dim2=None):
         if dim1 is None:
             dim1 = w.shape[0]
@@ -57,6 +77,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
             .clone()
         )
 
+    @dtensor_safe
     def _reverse_permute(self, w, n_heads_arg, dim1=None, dim2=None):
         if dim1 is None:
             dim1 = w.shape[0]
@@ -68,8 +89,15 @@ class Llama3StateDictAdapter(StateDictAdapter):
             .reshape(dim1, dim2)
         )
 
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
-
+    def to_hf(
+        self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False
+    ) -> dict[str, Any]:
+        if to_quantized_layout:
+            raise ValueError(
+                f"{type(self).__name__} does not support loading quantized "
+                "HF checkpoints."
+            )
+        state_dict = self._native_fused_linears_to_hf(state_dict)
         # pyrefly: ignore [missing-attribute]
         attn = self.model_config.layers[0].attention
         n_heads = attn.n_heads
@@ -96,6 +124,14 @@ class Llama3StateDictAdapter(StateDictAdapter):
                 if abstract_key == "layers.{}.attention.qkv_linear.wk.weight":
                     key_value_dim = head_dim * n_kv_heads
                     value = self._permute(value, n_kv_heads, key_value_dim, dim)
+                # Norms over all heads scale the same rows as Q/K weights.
+                if abstract_key == "layers.{}.attention.q_norm.weight":
+                    value = self._permute(value.unsqueeze(-1), n_heads).squeeze(-1)
+                if abstract_key == "layers.{}.attention.k_norm.weight":
+                    key_value_dim = head_dim * n_kv_heads
+                    value = self._permute(
+                        value.unsqueeze(-1), n_kv_heads, key_value_dim, 1
+                    ).squeeze(-1)
 
                 new_key = new_key.format(layer_num)
             else:
@@ -112,7 +148,14 @@ class Llama3StateDictAdapter(StateDictAdapter):
 
         return hf_state_dict
 
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    def from_hf(
+        self, hf_state_dict: dict[str, Any], *, is_quantized_layout: bool = False
+    ) -> dict[str, Any]:
+        if is_quantized_layout:
+            raise ValueError(
+                f"{type(self).__name__} does not support loading quantized "
+                "HF checkpoints."
+            )
         self._validate_hf_rope_config(ComplexRoPE.Config)
         if (
             self.model_config.enable_weight_tying  # pyrefly: ignore [missing-attribute]
@@ -141,6 +184,15 @@ class Llama3StateDictAdapter(StateDictAdapter):
                 if abstract_key == "model.layers.{}.self_attn.k_proj.weight":
                     key_value_dim = head_dim * n_kv_heads
                     value = self._reverse_permute(value, n_kv_heads, key_value_dim, dim)
+                if abstract_key == "model.layers.{}.self_attn.q_norm.weight":
+                    value = self._reverse_permute(
+                        value.unsqueeze(-1), n_heads
+                    ).squeeze(-1)
+                if abstract_key == "model.layers.{}.self_attn.k_norm.weight":
+                    key_value_dim = head_dim * n_kv_heads
+                    value = self._reverse_permute(
+                        value.unsqueeze(-1), n_kv_heads, key_value_dim, 1
+                    ).squeeze(-1)
 
                 new_key = self.from_hf_map[abstract_key]
                 if new_key is None:
@@ -153,4 +205,4 @@ class Llama3StateDictAdapter(StateDictAdapter):
 
             state_dict[new_key] = value
 
-        return state_dict
+        return self._native_fused_linears_from_hf(state_dict)

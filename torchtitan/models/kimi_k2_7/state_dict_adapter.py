@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 """State dict adapter for Kimi K2.5 (MoonViT3d + DeepSeekV3).
 
 The language model is DeepSeekV3, so this subclasses
@@ -19,13 +21,14 @@ Vision name/shape mappings (``HF -> torchtitan``; reversed on save):
 """
 
 import re
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import torch
 
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 
-from .model import KimiK25Model
+if TYPE_CHECKING:
+    from .model import KimiK25Model
 
 
 class KimiK25StateDictAdapter(DeepSeekV3StateDictAdapter):
@@ -76,15 +79,19 @@ class KimiK25StateDictAdapter(DeepSeekV3StateDictAdapter):
             "mm_projector.proj.2.bias": "vision_encoder.projector.linear_2.bias",
         }
 
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    def from_hf(
+        self, hf_state_dict: dict[str, Any], *, is_quantized_layout: bool = False
+    ) -> dict[str, Any]:
         if self.vision_encoder is None:
-            return super().from_hf(
+            state_dict = super().from_hf(
                 {
                     key: value
                     for key, value in hf_state_dict.items()
                     if not key.endswith("rotary_emb.inv_freq")
-                }
+                },
+                is_quantized_layout=is_quantized_layout,
             )
+            return self._native_fused_linears_from_hf(state_dict)
 
         lm_hf: dict[str, Any] = {}
         vision: dict[str, Any] = {}
@@ -160,13 +167,16 @@ class KimiK25StateDictAdapter(DeepSeekV3StateDictAdapter):
             )
 
         # DeepSeekV3 handles the LM keys (incl. RoPE validation + experts).
-        state_dict = super().from_hf(lm_hf)
+        state_dict = super().from_hf(lm_hf, is_quantized_layout=is_quantized_layout)
         state_dict.update(vision)
-        return state_dict
+        return self._native_fused_linears_from_hf(state_dict)
 
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf(
+        self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False
+    ) -> dict[str, Any]:
+        state_dict = self._native_fused_linears_to_hf(state_dict)
         if self.vision_encoder is None:
-            return super().to_hf(state_dict)
+            return super().to_hf(state_dict, to_quantized_layout=to_quantized_layout)
 
         to_hf_map = {v: k for k, v in self.vision_from_hf_map.items()}
         use_kimi_vl_projector_names = (
@@ -216,6 +226,11 @@ class KimiK25StateDictAdapter(DeepSeekV3StateDictAdapter):
 
         # Re-add the ``language_model.`` nesting that super (DeepSeek-V3) drops.
         hf_state_dict.update(
-            {f"language_model.{k}": v for k, v in super().to_hf(lm_titan).items()}
+            {
+                f"language_model.{k}": v
+                for k, v in super()
+                .to_hf(lm_titan, to_quantized_layout=to_quantized_layout)
+                .items()
+            }
         )
         return hf_state_dict
