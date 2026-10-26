@@ -361,6 +361,29 @@ def log_trace_instant(event_type: str, *, stacklevel: int = 2) -> None:
     )
 
 
+def log_trace_message(
+    event_type: str,
+    message: str,
+    *,
+    level: int = logging.INFO,
+    stacklevel: int = 2,
+) -> None:
+    """Emit a named structured text event.
+
+    Unlike :func:`log_trace_instant`, this preserves a bounded diagnostic
+    message in the JSONL record. Use a stable ``event_type``; dynamic details
+    belong in ``message`` so trace consumers do not get unbounded event names.
+    """
+    if torch.compiler.is_compiling() or _structured_logger_disabled():
+        return
+    _structured_logger.log(
+        level,
+        message,
+        extra=event_extra(event_type, event_name=event_type, log_type=LogType.TEXT),
+        stacklevel=stacklevel,
+    )
+
+
 class log_trace_span:  # noqa: N801
     """Time a block of work; emits ``_start`` and ``_end`` records.
 
