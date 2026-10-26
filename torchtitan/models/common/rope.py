@@ -411,10 +411,38 @@ class CosSinRoPE(RoPE):
         max_context_length = cfg.max_context_length
         base = cfg.theta
 
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
+        )
         if cfg.scaling == "llama":
-            raise NotImplementedError("Cos/sin RoPE does not support Llama scaling.")
-
-        if cfg.scaling == "yarn" and cfg.rope_factor > 1.0:
+            # Match Hugging Face's Llama-3.1/3.2 ``_compute_llama3_parameters``:
+            # low frequencies are scaled, high frequencies are unchanged, and
+            # the interval between them is linearly interpolated.
+            wavelen = 2 * math.pi / inv_freq
+            high_freq_wavelen = (
+                cfg.original_max_position_embeddings / cfg.high_freq_factor
+            )
+            low_freq_wavelen = (
+                cfg.original_max_position_embeddings / cfg.low_freq_factor
+            )
+            scaled_inv_freq = torch.where(
+                wavelen > low_freq_wavelen,
+                inv_freq / cfg.scaling_factor,
+                inv_freq,
+            )
+            smooth_factor = (
+                cfg.original_max_position_embeddings / wavelen - cfg.low_freq_factor
+            ) / (cfg.high_freq_factor - cfg.low_freq_factor)
+            smoothed_inv_freq = (
+                1 - smooth_factor
+            ) * inv_freq / cfg.scaling_factor + smooth_factor * inv_freq
+            is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(
+                wavelen > low_freq_wavelen
+            )
+            inv_freq = torch.where(
+                is_medium_freq, smoothed_inv_freq, scaled_inv_freq
+            )
+        elif cfg.scaling == "yarn" and cfg.rope_factor > 1.0:
             inv_freq = _yarn_inv_freq(
                 dim,
                 base,
@@ -424,11 +452,6 @@ class CosSinRoPE(RoPE):
                 cfg.original_seq_len,
                 cfg.truncate,
             )
-        else:
-            inv_freq = 1.0 / (
-                base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)
-            )
-
         t = torch.arange(
             max_context_length, dtype=inv_freq.dtype, device=inv_freq.device
         )

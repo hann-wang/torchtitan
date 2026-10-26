@@ -12,7 +12,7 @@ from typing import Any, TYPE_CHECKING
 
 from torchtitan.models.base.state_dict_adapter import dtensor_safe, StateDictAdapter
 
-from torchtitan.models.common.rope import ComplexRoPE
+from torchtitan.models.common.rope import ComplexRoPE, CosSinRoPE
 
 if TYPE_CHECKING:
     from .model import Llama3Model
@@ -89,6 +89,32 @@ class Llama3StateDictAdapter(StateDictAdapter):
             .reshape(dim1, dim2)
         )
 
+    def _uses_complex_rope_layout(self) -> bool:
+        """Validate the configured RoPE and report whether Q/K rows are paired.
+
+        Native ``ComplexRoPE`` rotates adjacent dimensions, so it requires the
+        Hugging Face half-split Q/K row permutation. ``CosSinRoPE`` uses
+        Hugging Face's rotate-half convention directly and needs no permutation.
+        """
+        rope_types = {
+            type(layer.attention.rope)
+            for layer in self.model_config.layers
+            if layer.attention.rope is not None
+        }
+        unsupported = rope_types - {ComplexRoPE.Config, CosSinRoPE.Config}
+        if unsupported:
+            names = ", ".join(sorted(rope.__qualname__ for rope in unsupported))
+            raise ValueError(
+                "HF checkpoint conversion requires ComplexRoPE.Config or "
+                f"CosSinRoPE.Config; got {names}."
+            )
+        if len(rope_types) > 1:
+            raise ValueError(
+                "HF checkpoint conversion requires one RoPE layout across "
+                f"Llama layers; got {[rope.__qualname__ for rope in rope_types]}."
+            )
+        return rope_types == {ComplexRoPE.Config}
+
     def to_hf(
         self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False
     ) -> dict[str, Any]:
@@ -104,6 +130,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
         n_kv_heads = attn.n_kv_heads if attn.n_kv_heads is not None else n_heads
         dim = self.model_config.dim  # pyrefly: ignore [missing-attribute]
         head_dim = attn.head_dim or dim // n_heads
+        permute_qk = self._uses_complex_rope_layout()
         hf_state_dict = {}
 
         to_hf_map = {v: k for k, v in self.from_hf_map.items() if v is not None}
@@ -119,15 +146,27 @@ class Llama3StateDictAdapter(StateDictAdapter):
                     continue
 
                 # Apply HF permutation for Q/K weights
-                if abstract_key == "layers.{}.attention.qkv_linear.wq.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "layers.{}.attention.qkv_linear.wq.weight"
+                ):
                     value = self._permute(value, n_heads)
-                if abstract_key == "layers.{}.attention.qkv_linear.wk.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "layers.{}.attention.qkv_linear.wk.weight"
+                ):
                     key_value_dim = head_dim * n_kv_heads
                     value = self._permute(value, n_kv_heads, key_value_dim, dim)
                 # Norms over all heads scale the same rows as Q/K weights.
-                if abstract_key == "layers.{}.attention.q_norm.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "layers.{}.attention.q_norm.weight"
+                ):
                     value = self._permute(value.unsqueeze(-1), n_heads).squeeze(-1)
-                if abstract_key == "layers.{}.attention.k_norm.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "layers.{}.attention.k_norm.weight"
+                ):
                     key_value_dim = head_dim * n_kv_heads
                     value = self._permute(
                         value.unsqueeze(-1), n_kv_heads, key_value_dim, 1
@@ -156,7 +195,7 @@ class Llama3StateDictAdapter(StateDictAdapter):
                 f"{type(self).__name__} does not support loading quantized "
                 "HF checkpoints."
             )
-        self._validate_hf_rope_config(ComplexRoPE.Config)
+        permute_qk = self._uses_complex_rope_layout()
         if (
             self.model_config.enable_weight_tying  # pyrefly: ignore [missing-attribute]
             and "lm_head.weight" not in hf_state_dict
@@ -179,16 +218,28 @@ class Llama3StateDictAdapter(StateDictAdapter):
                 layer_num = re.search(r"\d+", key).group(0)
 
                 # Reverse-permute Q and K for RoPE compatibility
-                if abstract_key == "model.layers.{}.self_attn.q_proj.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "model.layers.{}.self_attn.q_proj.weight"
+                ):
                     value = self._reverse_permute(value, n_heads)
-                if abstract_key == "model.layers.{}.self_attn.k_proj.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "model.layers.{}.self_attn.k_proj.weight"
+                ):
                     key_value_dim = head_dim * n_kv_heads
                     value = self._reverse_permute(value, n_kv_heads, key_value_dim, dim)
-                if abstract_key == "model.layers.{}.self_attn.q_norm.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "model.layers.{}.self_attn.q_norm.weight"
+                ):
                     value = self._reverse_permute(
                         value.unsqueeze(-1), n_heads
                     ).squeeze(-1)
-                if abstract_key == "model.layers.{}.self_attn.k_norm.weight":
+                if (
+                    permute_qk
+                    and abstract_key == "model.layers.{}.self_attn.k_norm.weight"
+                ):
                     key_value_dim = head_dim * n_kv_heads
                     value = self._reverse_permute(
                         value.unsqueeze(-1), n_kv_heads, key_value_dim, 1
