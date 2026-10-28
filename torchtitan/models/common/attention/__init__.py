@@ -25,6 +25,7 @@ from .attention import (  # noqa: F401
     ScaledDotProductInnerAttention,
     SDPAAttentionMetadata,
     SlidingWindowFlexInnerAttention,
+    SlidingWindowVarlenInnerAttention,
     VarlenAttentionMetadata,
     VarlenInnerAttention,
 )

@@ -34,6 +34,7 @@ from .attention import (
     ScaledDotProductInnerAttention,
     SDPAAttentionMetadata,
     SlidingWindowFlexInnerAttention,
+    SlidingWindowVarlenInnerAttention,
     VarlenAttentionMetadata,
     VarlenInnerAttention,
 )
@@ -92,6 +93,7 @@ __all__ = [
     "ScaledDotProductInnerAttention",
     "SDPAAttentionMetadata",
     "SlidingWindowFlexInnerAttention",
+    "SlidingWindowVarlenInnerAttention",
     "Sigmoid",
     "SiLU",
     "BinaryActivationFn",

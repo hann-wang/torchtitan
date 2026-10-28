@@ -17,7 +17,7 @@ from torch.distributed.fsdp import FSDPModule
 
 from torchtitan.components.checkpointer import BaseCheckpointManager, CheckpointManager
 from torchtitan.components.data.types import TrainingMicrobatch
-from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper
+from torchtitan.components.loss import ChunkedLossWrapper, Loss
 from torchtitan.components.model_converter import ModelConvertersContainer
 from torchtitan.components.optim import Optim
 from torchtitan.config import Configurable, TORCH_DTYPE_MAP
@@ -128,7 +128,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         sdc_replayer: SDCReplayer.Config | None = None
         comm: CommConfig = field(default_factory=CommConfig)
         debug: DebugConfig = field(default_factory=DebugConfig)
-        loss: BaseLoss.Config = field(default_factory=BaseLoss.Config)
+        loss: Loss.Config = field(default_factory=Loss.Config)
         dist_moe_runtime: Configurable.Config | None = None
         """Optional rank-wide Dist-MoE memory and pipeline-slot policy."""
         model_converters: ModelConvertersContainer.Config = field(
@@ -235,7 +235,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     model_parts: list[BaseModel]
     model_config: BaseModel.Config
     output_dir: str
-    loss_fn: BaseLoss
+    loss_fn: Loss[Any]
     optim: Optim
     checkpointer: BaseCheckpointManager
     pp_has_last_stage: bool
@@ -289,7 +289,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
         """Build model converters and apply their model config conversions."""
         self.model_converters = self.config.model_converters.build(
             parallelism_context=self.parallelism_context,
-            model_compile_enabled=bool(self.model_config.local_compile_regions),
+            model_compile_enabled=bool(self.model_config.local_compile.regions),
         )
         self.model_converters.convert_config(self.model_config)
         self.has_quantization = (
@@ -461,13 +461,13 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
     def _parallelize_compile_kwargs(self) -> dict[str, Any]:
         """Return the compile kwargs ``model.parallelize``/``model.pipeline`` expect for this engine's models.
 
-        Regular models expect ``local_compile_regions`` (compiled regions); GraphTrainer overrides this to
+        Regular models expect ``local_compile`` (compiled regions); GraphTrainer overrides this to
         return ``compile_config`` (whole-step compile).
         """
         # TODO: apply local compile outside parallelize/pipeline (#5026 review). That needs
         # GraphTrainer to stop reading its compile config there first (apply_compile,
         # EP-overlap chunking, enable_autoparallel, GraphPP runtime); then delete this hook.
-        return {"local_compile_regions": self.model_config.local_compile_regions}
+        return {"local_compile": self.model_config.local_compile}
 
     def _initialize_optim(self) -> None:
         """Construct the parameter update and its state."""
@@ -845,7 +845,7 @@ class TrainingEngine(Configurable, torch.distributed.checkpoint.stateful.Statefu
             pred = self.model_parts[0](inputs, **model_kwargs)
             loss, self.loss_metrics = self.loss_fn(
                 pred,
-                labels,  # pyrefly: ignore[bad-argument-type]
+                labels,
                 **loss_kwargs,
             )
             del pred
