@@ -23,12 +23,17 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal, TYPE_CHECKING
-
+import warnings
 import torch
-from torch.distributed.pipelining import (
-    analyze_pipeline_activation_liveness,
-    PipelineStageInfo,
-)
+try:
+    from torch.distributed.pipelining import (
+        analyze_pipeline_activation_liveness,
+        PipelineStageInfo,
+    )
+except ImportError:
+    analyze_pipeline_activation_liveness = None
+    PipelineStageInfo = None
+    warnings.warn("analyze_pipeline_activation_liveness is not available")
 from torch.distributed.pipelining.schedules import PipelineScheduleMulti
 from torch.utils.hooks import RemovableHandle
 

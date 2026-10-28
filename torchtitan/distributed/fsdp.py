@@ -313,12 +313,19 @@ def apply_fsdp_to_decoder(
         param_dtype_override_fn: Optional callback that overrides ``param_dtype``
             for selected parameters.
     """
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-        cast_forward_inputs=False,
-        param_dtype_override_fn=param_dtype_override_fn,
-    )
+    if param_dtype_override_fn is not None:
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+            param_dtype_override_fn=param_dtype_override_fn,
+        )
+    else:
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            cast_forward_inputs=False,
+        )
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if dp_mesh_dims is not None:
         fsdp_config["dp_mesh_dims"] = dp_mesh_dims
