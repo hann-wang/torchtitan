@@ -7,6 +7,7 @@
 from .activation import (
     BinaryActivationFn,
     ClampedSwiGLU,
+    LimitedSwiGLU,
     Sigmoid,
     SiLU,
     SiTUGLU,
@@ -67,6 +68,7 @@ __all__ = [
     "FlexAttentionMetadata",
     "FlexInnerAttention",
     "HiMidLoLinear",
+    "LimitedSwiGLU",
     "QKVLinear",
     "GELU",
     "GatedRMSNorm",
