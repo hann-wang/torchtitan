@@ -10,7 +10,7 @@ import glob
 import logging
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -23,20 +23,31 @@ from torchtitan.components.data.dataset import (
     TextSequence,
     WeightedDataset,
 )
+from torchtitan.components.data.packing import ConcatThenSplitPackingConfig
 from torchtitan.components.data.types import DatasetBuildContext
 from torchtitan.config import Configurable
 
+from .dp_split import MegatronDpSplitPackingConfig
 from .indexed_datasets import IndexedDataset
+
+DpSplit = Literal["torchtitan", "megatron"]
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DpSplit",
     "IndexedDataset",
+    "MegatronDpSplitPackingConfig",
     "MegatronIndexedSource",
     "PretokenizedProcessor",
+    "MEGATRON_DP_SPLIT",
     "get_megatron_prefixes",
     "megatron_dataset_config",
+    "megatron_packed_dataset",
 ]
+
+# "torchtitan" slices documents per rank. "megatron" stripes global token windows.
+MEGATRON_DP_SPLIT: DpSplit = "torchtitan"
 
 
 class MegatronIndexedSource(Configurable):
@@ -140,3 +151,31 @@ def megatron_dataset_config(
     if len(datasets) == 1:
         return datasets[0]
     return DatasetConcatConfig(datasets=tuple(datasets))
+
+
+def megatron_packed_dataset(
+    dataset_path: str,
+    weights: list[float] | None = None,
+    *,
+    split: DpSplit = MEGATRON_DP_SPLIT,
+) -> DatasetConfig:
+    """Build the dataloader dataset for one Megatron indexed corpus.
+
+    ``split="torchtitan"`` gives each rank a contiguous slice of documents and
+    packs that slice locally. ``split="megatron"`` keeps every ``.idx`` file in
+    ``megatron_dataset_config`` order, concatenates those sequences, then gives
+    rank ``r`` global windows ``r, r + dp, r + 2dp, ...``.
+    """
+    if split == "megatron" and weights is not None:
+        raise ValueError(
+            "split='megatron' reads one flat token stream and does not "
+            "apply blend weights"
+        )
+    documents = megatron_dataset_config(dataset_path, weights)
+    if split == "torchtitan":
+        return ConcatThenSplitPackingConfig(dataset=documents)
+    if split == "megatron":
+        return MegatronDpSplitPackingConfig(dataset=documents)
+    raise ValueError(
+        f"unknown dp split {split!r}; expected 'torchtitan' or 'megatron'"
+    )
