@@ -56,6 +56,7 @@ class TextProcessor(SampleProcessor):
         text_fn: Callable[[dict[str, Any]], str] = _read_text
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        super().__init__(config, context=context)
         self._tokenizer = context.tokenizer
         self._text_fn = config.text_fn
 
@@ -69,9 +70,11 @@ class TextProcessor(SampleProcessor):
         )
         if len(input_ids) < 2:
             return None
-        return TextSequence(
-            input_ids=input_ids[:-1],
-            labels=input_ids[1:],
+        return self.align_document(
+            TextSequence(
+                input_ids=input_ids[:-1],
+                labels=input_ids[1:],
+            )
         )
 
 
@@ -115,6 +118,7 @@ class ChatProcessor(SampleProcessor):
         """Model renderer; None uses the tokenizer's single-turn chat template."""
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        super().__init__(config, context=context)
         self._tokenizer = context.tokenizer
         self._max_context_length = context.max_context_length
         self._messages_fn = config.messages_fn
@@ -194,7 +198,7 @@ class ChatProcessor(SampleProcessor):
         _require_token_prefix(full_tokens, prompt_tokens)
         prompt_len = len(prompt_tokens)
         sequence.labels[: max(prompt_len - 1, 0)] = IGNORE_INDEX
-        return sequence
+        return self.align_document(sequence)
 
     def _tokenize_with_renderer(
         self,
@@ -221,7 +225,7 @@ class ChatProcessor(SampleProcessor):
 
         # Shift the mask with the labels: label j predicts token j + 1.
         sequence.labels[~np.asarray(rendered.loss_mask[1:], dtype=bool)] = IGNORE_INDEX
-        return sequence
+        return self.align_document(sequence)
 
     def _create_sequence(
         self, full_tokens: list[int], *, full_text: str | None = None

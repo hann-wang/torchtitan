@@ -81,7 +81,7 @@ class PretokenizedProcessor(SampleProcessor):
         pass
 
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
-        del config, context
+        super().__init__(config, context=context)
 
     def __call__(
         self, sample: dict[str, Any], rng: np.random.Generator
@@ -90,7 +90,9 @@ class PretokenizedProcessor(SampleProcessor):
         tokens = np.asarray(sample["tokens"], dtype=np.int64)
         if len(tokens) < 2:
             return None
-        return TextSequence(input_ids=tokens[:-1], labels=tokens[1:])
+        return self.align_document(
+            TextSequence(input_ids=tokens[:-1], labels=tokens[1:])
+        )
 
 
 def get_megatron_prefixes(start_path: str) -> list[str]:
@@ -107,7 +109,10 @@ def get_megatron_prefixes(start_path: str) -> list[str]:
 
 
 def megatron_dataset_config(
-    dataset_path: str, weights: list[float] | None = None
+    dataset_path: str,
+    weights: list[float] | None = None,
+    *,
+    seq_align: int | None = None,
 ) -> DatasetConfig:
     """Build an unpacked document dataset from Megatron indexed datasets.
 
@@ -132,7 +137,7 @@ def megatron_dataset_config(
     datasets = [
         SingleDatasetConfig(
             source=MegatronIndexedSource.Config(path_prefix=prefix),
-            processor=PretokenizedProcessor.Config(),
+            processor=PretokenizedProcessor.Config(seq_align=seq_align),
             post_filters=(lambda sample: sample is not None,),
         )
         for prefix in prefixes
@@ -158,6 +163,7 @@ def megatron_packed_dataset(
     weights: list[float] | None = None,
     *,
     split: DpSplit = MEGATRON_DP_SPLIT,
+    seq_align: int | None = None,
 ) -> DatasetConfig:
     """Build the dataloader dataset for one Megatron indexed corpus.
 
@@ -171,7 +177,14 @@ def megatron_packed_dataset(
             "split='megatron' reads one flat token stream and does not "
             "apply blend weights"
         )
-    documents = megatron_dataset_config(dataset_path, weights)
+    if split == "megatron" and seq_align is not None:
+        raise ValueError(
+            "seq_align pads each document, and split='megatron' does not "
+            "keep document boundaries"
+        )
+    documents = megatron_dataset_config(
+        dataset_path, weights, seq_align=seq_align
+    )
     if split == "torchtitan":
         return ConcatThenSplitPackingConfig(dataset=documents)
     if split == "megatron":

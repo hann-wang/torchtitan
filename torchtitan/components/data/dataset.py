@@ -21,6 +21,7 @@ from torchtitan.components.data.sources import (
     StreamingDataSource,
 )
 from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.config import Configurable
 
 
@@ -68,12 +69,61 @@ class TextSequence:
             )
 
 
+def align_text_sequence(sequence: TextSequence, seq_align: int) -> TextSequence:
+    """Pad one document so its length is a multiple of ``seq_align``.
+
+    The pad is appended to the document. Positions continue, so packing and
+    varlen metadata keep those tokens in the same sequence. Their labels are
+    ``IGNORE_INDEX`` and ``padding_mask`` is true.
+    """
+    if seq_align <= 0:
+        raise ValueError(f"seq_align must be positive, got {seq_align}")
+    length = len(sequence.input_ids)
+    remainder = length % seq_align
+    if remainder == 0:
+        return sequence
+    pad = seq_align - remainder
+    input_ids = np.pad(np.asarray(sequence.input_ids), (0, pad))
+    labels = np.pad(
+        np.asarray(sequence.labels), (0, pad), constant_values=IGNORE_INDEX
+    )
+    if sequence.padding_mask is None:
+        padding_mask = np.zeros(length, dtype=np.bool_)
+    else:
+        padding_mask = np.asarray(sequence.padding_mask, dtype=np.bool_)
+    padding_mask = np.pad(padding_mask, (0, pad), constant_values=True)
+    positions = sequence.positions
+    if positions is not None:
+        positions = np.asarray(positions)
+        start = int(positions[-1]) + 1 if length else 0
+        positions = np.concatenate(
+            (positions, np.arange(start, start + pad, dtype=positions.dtype))
+        )
+    return TextSequence(
+        input_ids=input_ids,
+        labels=labels,
+        positions=positions,
+        padding_mask=padding_mask,
+    )
+
+
 class SampleProcessor(Configurable, ABC):
     """Configured row processor using Grain-provided deterministic randomness."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        pass
+        seq_align: int | None = None
+        """Pad each text document to a multiple of this length. ``None`` leaves it unchanged."""
+
+    def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        del context
+        self._seq_align = config.seq_align
+
+    def align_document(self, sequence: TextSequence | None) -> TextSequence | None:
+        """Apply :attr:`Config.seq_align` to one processed document."""
+        if sequence is None or self._seq_align is None:
+            return sequence
+        return align_text_sequence(sequence, self._seq_align)
 
     @abstractmethod
     def __call__(
