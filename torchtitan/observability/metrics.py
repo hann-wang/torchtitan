@@ -27,6 +27,7 @@ from torchtitan.components.optim import OptimizersContainer
 from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelismContext
 from torchtitan.observability.logging import Color, NoColor
+from torchtitan.observability.weight_update import WeightUpdateMonitor
 from torchtitan.tools import utils
 from torchtitan.tools.utils import device_module, device_type
 
@@ -392,9 +393,27 @@ class MetricsProcessor(Configurable):
         enable_mlflow: bool = False
         """Whether to log metrics to MLflow"""
 
+        log_weight_update_distance: bool = False
+        """Log ``||W_after - W_before|| / ||W_before||`` for each Linear and grouped-GEMM weight.
+
+        The distance is the net change of the stored weight across the optimizer
+        step being logged, on the same cadence as ``log_freq``. Should be used with
+        TensorBoard, WandB, and/or MLflow.
+        """
+
         def __post_init__(self) -> None:
             if self.log_freq <= 0:
                 raise ValueError("metrics.log_freq must be greater than 0.")
+            backends = (
+                self.enable_tensorboard or self.enable_wandb or self.enable_mlflow
+            )
+            if self.log_weight_update_distance and not backends:
+                logger.warning(
+                    "metrics.log_weight_update_distance is enabled, but TensorBoard, "
+                    "WandB, and MLflow are all off, so relative update distances will "
+                    "not be recorded."
+                )
+                self.log_weight_update_distance = False
 
     config: Config
     logger: BaseLogger
@@ -460,11 +479,22 @@ class MetricsProcessor(Configurable):
         self.num_flops_per_token = -1
         self.optimizers = None
         self.model_parts = None
+        self.weight_updates = WeightUpdateMonitor(
+            bool(config.log_weight_update_distance)
+        )
 
     def should_log(self, step: int) -> bool:
         if self.step_last_log is None:
             self.step_last_log = step - 1
         return step == 1 or step % self.config.log_freq == 0
+
+    def observe_weight_updates(self, active: bool):
+        """Snapshot linear and grouped-GEMM weights around one optimizer step.
+
+        ``active`` is this step's ``should_log`` decision. Pass the same value
+        on every rank. ``log`` writes the resulting distances.
+        """
+        return self.weight_updates.observe(self.model_parts, active)
 
     def _build_metric_logger(
         self,
@@ -639,6 +669,7 @@ class MetricsProcessor(Configurable):
 
         if extra_metrics:
             metrics.update(extra_metrics)
+        metrics.update(self.weight_updates.consume())
 
         self.logger.log(metrics, step)
 

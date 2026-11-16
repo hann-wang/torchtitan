@@ -394,7 +394,8 @@ class Trainer(Configurable):
         # Capture the learning rates used by this optimizer update before the
         # scheduler advances in engine.optim_step().
         lr_metrics = engine.optim.lr_schedulers.get_metrics() if should_log else {}
-        grad_norm = engine.optim_step()
+        with self.metrics_processor.observe_weight_updates(should_log):
+            grad_norm = engine.optim_step()
 
         # log metrics
         if not should_log:

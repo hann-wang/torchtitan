@@ -419,7 +419,8 @@ class FaultTolerantTrainer(Configurable):
             else global_loss_token_counts[0]
         )
 
-        grad_norm = engine.optim_step()
+        with self.metrics_processor.observe_weight_updates(should_log):
+            grad_norm = engine.optim_step()
 
         # log metrics
         if not should_log:
