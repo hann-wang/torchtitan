@@ -8,7 +8,7 @@
 # Shape suffixes: B = batch, L = per-sample sequence, T = packed tokens,
 # D = feature dimension, H = heads, K = query/key head dimension, V = value dimension.
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import spmd_types as spmd
 import torch
@@ -260,21 +260,50 @@ class ModulationOut:
 
 
 class Modulation(Module):
+    """adaLN whose scale, shift, and gate are constant on each block of channels.
+
+    ``lin`` is configured for the full layout (``6H`` or ``3H``). The built
+    projection predicts one value per ``block_size`` channels, and the forward
+    repeats it. Channels that share an MXFP4 scale then also share one
+    modulation value, so the affine factors out of that scale.
+    """
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         lin: Linear.Config
         double: bool
+        block_size: int = 32
 
     def __init__(self, config: Config):
         super().__init__()
         self.is_double = config.double
         self.multiplier = 6 if config.double else 3
-        self.lin = config.lin.build()
+        self.block_size = config.block_size
+        if config.block_size < 1:
+            raise ValueError(f"block_size must be positive, got {config.block_size}")
+        if config.lin.out_features % self.multiplier != 0:
+            raise ValueError(
+                f"modulation out_features {config.lin.out_features} must be "
+                f"divisible by {self.multiplier}"
+            )
+        width = config.lin.out_features // self.multiplier
+        if width % config.block_size != 0:
+            raise ValueError(
+                f"modulation width {width} must be divisible by block_size "
+                f"{config.block_size}"
+            )
+        reduced = replace(
+            config.lin,
+            out_features=config.lin.out_features // config.block_size,
+        )
+        self.lin = reduced.build()
 
     def forward(self, vec: Tensor) -> tuple[ModulationOut, ModulationOut | None]:
-        out = self.lin(nn.functional.silu(vec))[:, None, :].chunk(
-            self.multiplier, dim=-1
+        # [B, multiplier * H / block] -> [B, multiplier * H], one value per block.
+        raw = self.lin(nn.functional.silu(vec)).repeat_interleave(
+            self.block_size, dim=-1
         )
+        out = raw[:, None, :].chunk(self.multiplier, dim=-1)
 
         return (
             ModulationOut(*out[:3]),

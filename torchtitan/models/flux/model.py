@@ -163,15 +163,16 @@ class FluxModel(BaseModel):
             # base counts them as per-token; replace with amortized per-token
             # cost (once per sample / seq_len tokens).
             #
-            # Per-sample modulation weight params:
-            #   DoubleStreamBlock: img_mod(6h²) + txt_mod(6h²) = 12h² per block
-            #   SingleStreamBlock: modulation(3h²) per block
-            #   LastLayer: adaLN_modulation(2h²)
+            # Per-sample modulation weight params. Block adaLN predicts one
+            # value per ``block_size`` channels. LastLayer adaLN stays
+            # per-channel.
             sb_h = self.single_blocks[0].hidden_size
             fl_h = self.final_layer_config.hidden_size
+            db_block = self.double_blocks[0].img_mod.block_size
+            sb_block = self.single_blocks[0].modulation.block_size
             nparams_mod_per_sample = (
-                12 * db_h * db_h * self.depth
-                + 3 * sb_h * sb_h * self.depth_single_blocks
+                12 * db_h * db_h // db_block * self.depth
+                + 3 * sb_h * sb_h // sb_block * self.depth_single_blocks
                 + 2 * fl_h * fl_h
             )
             num_flops_per_token -= 6 * nparams_mod_per_sample * (seq_len - 1) // seq_len
