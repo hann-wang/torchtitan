@@ -16,6 +16,10 @@ from torchtitan.observability.logging import NoColor
 from torchtitan.observability.metrics import DeviceMemStats, MetricsProcessor
 from torchtitan.observability.weight_update import (
     WeightUpdateMonitor,
+    _failure_record,
+    _is_head,
+    _storage_ulp,
+    _summarize_failures,
     relative_l2_distance,
 )
 
@@ -198,4 +202,147 @@ def test_training_log_includes_observed_weight_updates():
     )
     assert logged["n_tokens_seen"] == 3
     assert logged["grad_norm"] == 1.0
+    assert logged["fp4_failure/A_sub_ulp_fraction"] == pytest.approx(0.0)
+    assert logged["fp4_failure/B_sign_flip_fraction"] == pytest.approx(0.0)
     assert processor.weight_updates.consume() == {}
+
+
+def test_storage_ulp_matches_bfloat16_power_of_two_gap():
+    weight = torch.tensor([256.0], dtype=torch.bfloat16)
+    # 256 = 2^8 and BF16 has 7 mantissa bits, so the gap above 256 is 2.
+    assert float(_storage_ulp(weight)) == pytest.approx(2.0)
+
+
+def test_sub_ulp_fraction_is_one_when_bf16_add_rounds_away():
+    layer = nn.Linear(4, 4, bias=False)
+    with torch.no_grad():
+        layer.weight.fill_(256)
+    layer.weight = nn.Parameter(layer.weight.bfloat16())
+    # Half an ulp of 256 in BF16 is 1. A step of 0.5 cannot change the stored value.
+    layer.weight.grad = torch.ones_like(layer.weight)
+    optim = torch.optim.SGD(layer.parameters(), lr=0.5)
+    monitor = WeightUpdateMonitor(enabled=True)
+    with monitor.observe([layer], active=True):
+        optim.step()
+    extra = monitor.consume()
+    assert extra["fp4_failure/A_sub_ulp_fraction"] == pytest.approx(1.0)
+    assert extra["fp4_failure/A_max_sub_ulp_fraction"] == pytest.approx(1.0)
+    assert "fp4_failure/A_median_update_over_ulp" not in extra
+    assert torch.equal(layer.weight, torch.full_like(layer.weight, 256))
+
+
+def test_sign_flip_exact_zero_and_outlier_fractions():
+    layer = nn.Linear(8, 8, bias=False)
+    with torch.no_grad():
+        layer.weight.fill_(0.25)
+        layer.weight.view(-1)[0] = 100.0
+    layer.weight.grad = torch.ones_like(layer.weight)
+    optim = torch.optim.SGD(layer.parameters(), lr=1.0)
+    before = layer.weight.detach().clone()
+    monitor = WeightUpdateMonitor(enabled=True)
+    with monitor.observe([layer], active=True):
+        optim.step()
+    extra = monitor.consume()
+    after = layer.weight.detach()
+    sign_flip = ((before > 0) & (after < 0)) | ((before < 0) & (after > 0))
+    assert extra["fp4_failure/B_sign_flip_fraction"] == pytest.approx(
+        float(sign_flip.float().mean())
+    )
+    assert extra["fp4_failure/B_sign_flip_fraction"] > 0.9
+    assert extra["fp4_failure/E_max_over_rms"] > 6.0
+    assert extra["fp4_failure/E_outlier_fraction"] > 0.0
+    assert "fp4_failure/E_update_sign_reversal_fraction" not in extra
+
+    zeros = nn.Linear(4, 4, bias=False)
+    with torch.no_grad():
+        zeros.weight.zero_()
+    zeros.weight.grad = torch.zeros_like(zeros.weight)
+    optim = torch.optim.SGD(zeros.parameters(), lr=0.1)
+    monitor = WeightUpdateMonitor(enabled=True)
+    with monitor.observe([zeros], active=True):
+        optim.step()
+    extra = monitor.consume()
+    assert extra["fp4_failure/B_exact_zero_fraction"] == pytest.approx(1.0)
+    assert extra["fp4_failure/B_near_zero_fraction"] == pytest.approx(1.0)
+
+
+def test_update_sign_reversal_uses_the_previous_logged_step():
+    layer = nn.Linear(4, 4, bias=False)
+    with torch.no_grad():
+        layer.weight.fill_(1.0)
+    optim = torch.optim.SGD(layer.parameters(), lr=0.1)
+    monitor = WeightUpdateMonitor(enabled=True)
+
+    layer.weight.grad = torch.ones_like(layer.weight)
+    with monitor.observe([layer], active=True):
+        optim.step()
+    assert "fp4_failure/E_update_sign_reversal_fraction" not in monitor.consume()
+
+    layer.weight.grad = -torch.ones_like(layer.weight)
+    with monitor.observe([layer], active=True):
+        optim.step()
+    extra = monitor.consume()
+    assert extra["fp4_failure/E_update_sign_reversal_fraction"] == pytest.approx(1.0)
+
+
+def test_head_row_mean_drift_is_logged_for_the_output_projection():
+    class _Output(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.linear = nn.Linear(4, 4, bias=False)
+
+    class _Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.final_layer = _Output()
+            self.body = nn.Linear(4, 4, bias=False)
+
+    model = _Model()
+    with torch.no_grad():
+        model.final_layer.linear.weight.fill_(2.0)
+        model.body.weight.fill_(2.0)
+    model.final_layer.linear.weight.grad = -torch.ones_like(model.final_layer.linear.weight)
+    model.body.weight.grad = torch.zeros_like(model.body.weight)
+    optim = torch.optim.SGD(
+        [model.final_layer.linear.weight, model.body.weight], lr=1.0
+    )
+    monitor = WeightUpdateMonitor(enabled=True)
+    with monitor.observe([model], active=True):
+        optim.step()
+    extra = monitor.consume()
+    # Every output row moved from 2 to 3, so the row-mean vector grew by half.
+    assert extra["fp4_failure/C_head_row_mean_relative_drift"] == pytest.approx(0.5)
+    assert extra["fp4_failure/C_head_row_mean_rms"] == pytest.approx(3.0)
+    assert extra["fp4_failure/C_head_update_mean_over_rms"] == pytest.approx(1.0)
+    assert _is_head("weight_update/linear/final_layer.linear")
+    assert _is_head("weight_update/linear/lm_head")
+    assert not _is_head("weight_update/linear/body")
+
+
+def test_failure_record_counts_a_sub_ulp_step_and_summarizes_heads_only():
+    before = torch.tensor([[256.0]], dtype=torch.bfloat16)
+    after = before.clone()
+    record, sign = _failure_record(before, after, prev_sign=None)
+    assert record["sub_ulp"] == pytest.approx(1.0)
+    assert record["n_moved"] == pytest.approx(0.0)
+    assert torch.equal(sign, torch.zeros(1, 1, dtype=torch.int8))
+
+    summary = _summarize_failures(
+        {
+            "weight_update/linear/body": {
+                **record,
+                "row_mean_rel_drift": 9.0,
+            },
+            "weight_update/linear/lm_head": {
+                **record,
+                "numel": 4.0,
+                "sub_ulp": 0.0,
+                "row_mean_rms": 1.5,
+                "row_mean_rel_drift": 0.25,
+                "update_mean_over_rms": 0.4,
+            },
+        }
+    )
+    assert summary["fp4_failure/C_head_row_mean_relative_drift"] == pytest.approx(0.25)
+    assert summary["fp4_failure/A_sub_ulp_fraction"] == pytest.approx(1.0 / 5.0)
+    assert "fp4_failure/E_update_sign_reversal_fraction" not in summary

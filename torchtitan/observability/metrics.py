@@ -397,8 +397,10 @@ class MetricsProcessor(Configurable):
         """Log ``||W_after - W_before|| / ||W_before||`` for each Linear and grouped-GEMM weight.
 
         The distance is the net change of the stored weight across the optimizer
-        step being logged, on the same cadence as ``log_freq``. Should be used with
-        TensorBoard, WandB, and/or MLflow.
+        step being logged, on the same cadence as ``log_freq``. The same snapshots
+        also log ``fp4_failure/`` summaries: sub-ulp updates, exact zeros and sign
+        flips, output-projection row-mean drift, and outlier / update-sign reversal.
+        Should be used with TensorBoard, WandB, and/or MLflow.
         """
 
         def __post_init__(self) -> None:
