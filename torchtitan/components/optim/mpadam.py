@@ -1,5 +1,5 @@
 # mypy: allow-untyped-defs
-"""M-Adam: an Adam variant tailored for low-precision (e.g. bf16/fp8) weights.
+"""MPAdam: an Adam variant tailored for low-precision (e.g. bf16/fp8) weights.
 
 Reference algorithm: https://github.com/Anima-Lab/M-Adam-Low-precision-training
 (``optimizer_torch/m_adam.py``).
@@ -12,8 +12,8 @@ step counter ``t``). Here, following the convention used by
 :class:`torch.optim.Adam`/:class:`torch.optim.AdamW`, ``lr`` is simply read
 from ``param_group["lr"]`` on every step and is expected to be driven by a
 ``torch.optim.lr_scheduler`` (or any external code that mutates the param
-group) instead. See :class:`MAdam` for how the second, exponent-only
-learning rate (``lr_e``) is handled.
+group) instead. The exponent step uses ``lr * lr_e_ratio`` on every
+step, so the same scheduler scales both updates.
 
 Structurally this module mirrors the reference repo's own simplified
 ``optimizer_torch/adam.py`` (a from-scratch, always-fp32-math, single
@@ -22,28 +22,30 @@ for-loop Adam/AdamW used there as a baseline) rather than the full
 ``differentiable``/``amsgrad`` support, just a straightforward per-parameter
 loop. Argument validation, the ``defaults`` dict, lazy per-parameter state
 initialization, and ``@torch.no_grad() def step(self, closure=None)`` all
-follow the same conventions as PyTorch's built-in optimizers so ``MAdam``
+follow the same conventions as PyTorch's built-in optimizers so ``MPAdam``
 is a drop-in swap wherever ``Adam``/``AdamW`` is used.
 """
 
 import math
-from typing import Iterable, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Iterable, Optional
 
 import torch
 from torch import Tensor
-from torch.optim.optimizer import Optimizer
 
-__all__ = ["MAdam"]
+from .optimizer import BaseOptimizer
+
+__all__ = ["MPAdam"]
 
 
 def _rms(x: Tensor) -> Tensor:
     return x.pow(2).mean().sqrt()
 
 
-class MAdam(Optimizer):
-    r"""Implements the M-Adam algorithm for low-precision weight training.
+class MPAdam(BaseOptimizer):
+    """Adam on a mantissa/exponent parameterization for low-precision weights.
 
-    M-Adam decomposes each fp32 view of a weight into a mantissa/exponent
+    MPAdam decomposes each fp32 view of a weight into a mantissa/exponent
     pair via :func:`torch.frexp`, ``w = m * 2**e`` with ``m`` in
     ``[0.5, 1)``, and performs two coupled Adam-style updates every step:
 
@@ -57,152 +59,143 @@ class MAdam(Optimizer):
       exponent, so the low-precision rounding introduced by casting back to
       the parameter's dtype happens at the right scale.
 
-    Unlike the reference implementation, ``MAdam`` does not schedule its
-    own learning rate. As with :class:`torch.optim.Adam`, ``lr`` is read
-    from ``param_group["lr"]`` on every :meth:`step`, so any
-    ``torch.optim.lr_scheduler`` (or manual updates to the param group)
-    drives it from the outside. The exponent-only learning rate ``lr_e``
-    can either:
-
-    * track ``lr`` at a fixed ratio (``tie_e_to_m=True``): ``lr_e`` is
-      recomputed every step as ``lr * (lr_e / lr)`` using the ratio fixed
-      at construction time, so a single external scheduler acting on
-      ``lr`` scales both updates together; or
-    * be read directly, and independently, from ``param_group["lr_e"]``
-      (``tie_e_to_m=False``, the default) -- useful if you want to keep the
-      exponent step size constant, or drive it with your own schedule.
-
-    Args:
-        params (iterable): iterable of parameters to optimize or dicts
-            defining parameter groups.
-        lr (float, optional): mantissa/weight learning rate (default: 1e-3).
-            Read from ``param_group["lr"]`` every step.
-        betas (Tuple[float, float], optional): coefficients used for
-            computing running averages of gradient and its square, shared
-            by the mantissa and exponent updates (default: ``(0.9, 0.999)``).
-        eps (float, optional): term added to the denominator to improve
-            numerical stability (default: 1e-8).
-        weight_decay (float, optional): decoupled (AdamW-style) weight
-            decay applied to the reconstructed fp32 weight in the mantissa
-            update (default: 0).
-        lr_e (float, optional): exponent learning rate (default: 1e-2).
-            Read from ``param_group["lr_e"]`` every step when
-            ``tie_e_to_m=False``; when ``tie_e_to_m=True`` this value only
-            seeds the initial ``lr_e / lr`` ratio.
-        tie_e_to_m (bool, optional): if ``True``, derive ``lr_e`` from
-            ``lr`` every step via the ratio fixed at construction
-            (default: ``False``).
-        weight_decay_e (float, optional): decoupled weight decay applied to
-            the exponent itself, pulling ``|w|`` back towards 1
-            (default: 0).
-        p_scale (float, optional): multiplier on a parameter's initial RMS
-            used to set its absolute-value clamp bound when
-            ``abs_clamp=True`` (default: 3.0).
-        g_bound (float, optional): clamp bound applied to the normalized
-            exponent gradient (default: 20.0).
-        abs_clamp (bool, optional): if ``True``, clamp updated weights to
-            ``[-abs_max, abs_max]``, where ``abs_max`` is fixed once at
-            initialization from ``p_scale`` and ``abs_clamp_floor``
-            (default: ``False``).
-        abs_clamp_floor (float, optional): minimum value for ``abs_max``
-            (default: 0).
-        clip_e_final (bool, optional): if ``True``, clamp the exponent to
-            ``[e_final_min, e_final_max]`` every step (default: ``False``).
-        e_final_min (float, optional): lower exponent clamp bound
-            (default: -60.0).
-        e_final_max (float, optional): upper exponent clamp bound
-            (default: 60.0).
-        use_de_step_cap (bool, optional): if ``True``, clamp the per-step
-            exponent delta to ``[-de_step_cap, de_step_cap]``
-            (default: ``True``).
-        de_step_cap (float, optional): exponent per-step delta clamp bound
-            (default: 0.5).
-        maximize (bool, optional): maximize the objective with respect to
-            the params, instead of minimizing (default: ``False``).
+    ``lr`` is read from ``param_group["lr"]`` on every :meth:`step`, so any
+    ``torch.optim.lr_scheduler`` drives it from the outside. The exponent
+    learning rate is always ``lr * lr_e_ratio``.
     """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseOptimizer.Config):
+        lr: float = 1e-3
+        """Mantissa/weight learning rate. Read from the param group every step."""
+
+        betas: tuple[float, float] = (0.9, 0.999)
+        """Coefficients for the running averages of the gradient and its square.
+
+        Shared by the mantissa and exponent updates.
+        """
+
+        eps: float = 1e-8
+        """Term added to the denominator to improve numerical stability."""
+
+        weight_decay: float = 0.0
+        """Decoupled (AdamW-style) weight decay on the reconstructed fp32 weight."""
+
+        lr_e_ratio: float = 1.0
+        """Exponent learning rate divided by ``lr``.
+
+        Every step uses ``lr * lr_e_ratio`` as the exponent step size, so an
+        external schedule on ``lr`` moves both updates together.
+        """
+
+        weight_decay_e: float = 0.0
+        """Decoupled weight decay on the exponent, pulling ``|w|`` back towards 1."""
+
+        p_scale: float = 3.0
+        """Multiplier on a parameter's initial RMS for the absolute-value clamp.
+
+        Used when ``abs_clamp`` is true. ``abs_max`` is fixed once at
+        initialization from this scale and ``abs_clamp_floor``.
+        """
+
+        g_bound: float = 20.0
+        """Clamp bound applied to the normalized exponent gradient."""
+
+        abs_clamp: bool = False
+        """Clamp updated weights to ``[-abs_max, abs_max]``."""
+
+        abs_clamp_floor: float = 0.0
+        """Minimum value for ``abs_max``."""
+
+        clip_e_final: bool = False
+        """Clamp the exponent to ``[e_final_min, e_final_max]`` every step."""
+
+        e_final_min: float = -60.0
+        """Lower exponent clamp bound."""
+
+        e_final_max: float = 60.0
+        """Upper exponent clamp bound."""
+
+        use_de_step_cap: bool = True
+        """Clamp the per-step exponent delta to ``[-de_step_cap, de_step_cap]``."""
+
+        de_step_cap: float = 0.5
+        """Exponent per-step delta clamp bound."""
+
+        maximize: bool = False
+        """Maximize the objective with respect to the params, instead of minimizing."""
+
+        def __post_init__(self) -> None:
+            if not 0.0 <= self.lr:
+                raise ValueError(f"Invalid learning rate: {self.lr}")
+            if not 0.0 <= self.lr_e_ratio:
+                raise ValueError(
+                    f"Invalid exponent learning-rate ratio: {self.lr_e_ratio}"
+                )
+            if not 0.0 <= self.eps:
+                raise ValueError(f"Invalid epsilon value: {self.eps}")
+            if not 0.0 <= self.betas[0] < 1.0:
+                raise ValueError(
+                    f"Invalid beta parameter at index 0: {self.betas[0]}"
+                )
+            if not 0.0 <= self.betas[1] < 1.0:
+                raise ValueError(
+                    f"Invalid beta parameter at index 1: {self.betas[1]}"
+                )
+            if not 0.0 <= self.weight_decay:
+                raise ValueError(f"Invalid weight_decay value: {self.weight_decay}")
+            if not 0.0 <= self.weight_decay_e:
+                raise ValueError(
+                    f"Invalid weight_decay_e value: {self.weight_decay_e}"
+                )
+            if not 0.0 < self.p_scale:
+                raise ValueError(f"Invalid p_scale value: {self.p_scale}")
+            if not 0.0 < self.g_bound:
+                raise ValueError(f"Invalid g_bound value: {self.g_bound}")
+            if not 0.0 <= self.abs_clamp_floor:
+                raise ValueError(
+                    f"Invalid abs_clamp_floor value: {self.abs_clamp_floor}"
+                )
+            if not self.e_final_min < self.e_final_max:
+                raise ValueError(
+                    f"e_final_min ({self.e_final_min}) must be < "
+                    f"e_final_max ({self.e_final_max})"
+                )
+            if not 0.0 < self.de_step_cap:
+                raise ValueError(f"Invalid de_step_cap value: {self.de_step_cap}")
 
     def __init__(
         self,
-        params: Iterable[torch.nn.Parameter],
-        lr: float = 1e-3,
-        betas: Tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 0.0,
+        config: Config,
         *,
-        lr_e: float = 1e-2,
-        tie_e_to_m: bool = False,
-        weight_decay_e: float = 0.0,
-        p_scale: float = 3.0,
-        g_bound: float = 20.0,
-        abs_clamp: bool = False,
-        abs_clamp_floor: float = 0.0,
-        clip_e_final: bool = False,
-        e_final_min: float = -60.0,
-        e_final_max: float = 60.0,
-        use_de_step_cap: bool = True,
-        de_step_cap: float = 0.5,
-        maximize: bool = False,
+        params: Iterable[dict[str, Any]] | Iterable[Tensor],
     ) -> None:
-        if not 0.0 <= lr:
-            raise ValueError(f"Invalid learning rate: {lr}")
-        if not 0.0 <= lr_e:
-            raise ValueError(f"Invalid exponent learning rate: {lr_e}")
-        if not 0.0 <= eps:
-            raise ValueError(f"Invalid epsilon value: {eps}")
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
-        if not 0.0 <= weight_decay:
-            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        if not 0.0 <= weight_decay_e:
-            raise ValueError(f"Invalid weight_decay_e value: {weight_decay_e}")
-        if not 0.0 < p_scale:
-            raise ValueError(f"Invalid p_scale value: {p_scale}")
-        if not 0.0 < g_bound:
-            raise ValueError(f"Invalid g_bound value: {g_bound}")
-        if not 0.0 <= abs_clamp_floor:
-            raise ValueError(f"Invalid abs_clamp_floor value: {abs_clamp_floor}")
-        if not e_final_min < e_final_max:
-            raise ValueError(
-                f"e_final_min ({e_final_min}) must be < e_final_max ({e_final_max})"
-            )
-        if not 0.0 < de_step_cap:
-            raise ValueError(f"Invalid de_step_cap value: {de_step_cap}")
-
-        # Fixed at construction time so `tie_e_to_m=True` can recompute
-        # `lr_e = lr * lr_e_ratio` every step, automatically tracking
-        # whatever schedule an external LRScheduler applies to `lr`.
-        lr_e_ratio = lr_e / max(1e-20, lr)
-
-        defaults = dict(
-            lr=lr,
-            lr_e=lr_e,
-            lr_e_ratio=lr_e_ratio,
-            tie_e_to_m=tie_e_to_m,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
-            weight_decay_e=weight_decay_e,
-            p_scale=p_scale,
-            g_bound=g_bound,
-            abs_clamp=abs_clamp,
-            abs_clamp_floor=abs_clamp_floor,
-            clip_e_final=clip_e_final,
-            e_final_min=e_final_min,
-            e_final_max=e_final_max,
-            use_de_step_cap=use_de_step_cap,
-            de_step_cap=de_step_cap,
-            maximize=maximize,
+        super().__init__(
+            params,
+            dict(
+                lr=config.lr,
+                lr_e_ratio=config.lr_e_ratio,
+                betas=config.betas,
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+                weight_decay_e=config.weight_decay_e,
+                p_scale=config.p_scale,
+                g_bound=config.g_bound,
+                abs_clamp=config.abs_clamp,
+                abs_clamp_floor=config.abs_clamp_floor,
+                clip_e_final=config.clip_e_final,
+                e_final_min=config.e_final_min,
+                e_final_max=config.e_final_max,
+                use_de_step_cap=config.use_de_step_cap,
+                de_step_cap=config.de_step_cap,
+                maximize=config.maximize,
+            ),
         )
-        super().__init__(params, defaults)
 
     def __setstate__(self, state) -> None:
         super().__setstate__(state)
         for group in self.param_groups:
-            group.setdefault("lr_e", 1e-2)
-            group.setdefault("lr_e_ratio", group["lr_e"] / max(1e-20, group["lr"]))
-            group.setdefault("tie_e_to_m", False)
+            group.setdefault("lr_e_ratio", 1.0)
             group.setdefault("weight_decay_e", 0.0)
             group.setdefault("p_scale", 3.0)
             group.setdefault("g_bound", 20.0)
@@ -241,20 +234,17 @@ class MAdam(Optimizer):
             de_cap = group["de_step_cap"]
             maximize = group["maximize"]
 
-            # `lr`/`lr_e` are read fresh every step (rather than tracked
-            # internally) so an external LRScheduler mutating
-            # `param_group["lr"]` (and, optionally, `param_group["lr_e"]`)
-            # is all that's needed to schedule this optimizer.
+            # `lr` is read fresh every step so an external LRScheduler
+            # scales both the mantissa step and the exponent step
+            # (`lr * lr_e_ratio`).
             lr_m = group["lr"]
-            lr_e = lr_m * group["lr_e_ratio"] if group["tie_e_to_m"] else group["lr_e"]
+            lr_e = lr_m * group["lr_e_ratio"]
 
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 if p.grad.is_sparse:
-                    raise RuntimeError(
-                        "MAdam does not support sparse gradients"
-                    )
+                    raise RuntimeError("MPAdam does not support sparse gradients")
 
                 param_dtype = p.data.dtype
                 grad = p.grad.data
@@ -269,7 +259,7 @@ class MAdam(Optimizer):
                     # Momentum/variance buffers live in the parameter's own
                     # (possibly low-precision) dtype, matching the
                     # reference implementation: the low-precision rounding
-                    # of these buffers is part of what M-Adam simulates.
+                    # of these buffers is part of what MPAdam simulates.
                     state["mantissa_exp_avg"] = torch.zeros_like(
                         p.data, dtype=param_dtype
                     )
@@ -305,9 +295,9 @@ class MAdam(Optimizer):
 
                 # Defensive clamp so exp2() below can't overflow fp32
                 # regardless of clip_e_final.
-                exponent_safe = torch.clamp(
-                    exponent_used, min=-60.0, max=60.0
-                ).to(w_fp32.dtype)
+                exponent_safe = torch.clamp(exponent_used, min=-60.0, max=60.0).to(
+                    w_fp32.dtype
+                )
                 w_reconstructed = mantissa * torch.exp2(exponent_safe)
 
                 # ---- exponent update: Adam on d(loss)/de = g * w * ln2 --
@@ -318,8 +308,8 @@ class MAdam(Optimizer):
                 exponent_v_fp32.mul_(beta2).addcmul_(
                     grad_exponent, grad_exponent, value=1.0 - beta2
                 )
-                exponent_denom = (
-                    (exponent_v_fp32 / (1.0 - beta2**step)).sqrt_().clamp_(min=eps)
+                exponent_denom = (exponent_v_fp32 / (1.0 - beta2**step)).sqrt_().clamp_(
+                    min=eps
                 )
                 grad_exponent_n = (grad_exponent / exponent_denom).clamp_(
                     -g_bound, g_bound
@@ -335,9 +325,9 @@ class MAdam(Optimizer):
                 if cap_de:
                     delta_e = delta_e.clamp(min=-de_cap, max=de_cap)
 
-                exponent_new = (
-                    exponent_used.to(w_fp32.dtype) * (1.0 - lr_e * wd_e) + delta_e
-                )
+                exponent_new = exponent_used.to(w_fp32.dtype) * (
+                    1.0 - lr_e * wd_e
+                ) + delta_e
                 if clip_e:
                     exponent_new = torch.clamp(exponent_new, min=e_min, max=e_max)
                 exponent_v.copy_(exponent_v_fp32.to(param_dtype))
@@ -350,9 +340,7 @@ class MAdam(Optimizer):
                 # quantization noise a genuinely low-precision optimizer
                 # operating directly on the mantissa would.
                 exp_scale = torch.exp2(-exponent_used.to(w_fp32.dtype))
-                grad_mantissa = grad_fp32 * torch.exp2(
-                    exponent_used.to(w_fp32.dtype)
-                )
+                grad_mantissa = grad_fp32 * torch.exp2(exponent_used.to(w_fp32.dtype))
                 grad_mantissa_scaled = grad_mantissa.to(param_dtype) * exp_scale
 
                 mantissa_m.mul_(beta1).add_(grad_mantissa_scaled, alpha=1.0 - beta1)

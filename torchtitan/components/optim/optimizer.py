@@ -29,7 +29,6 @@ from torchtitan.distributed.flex_shard import (
 )
 from torchtitan.distributed.utils import build_alternative_fsdp_mesh
 
-from .madam import MAdam as _MAdam
 from .utils import (
     get_flat_optim_state_dict,
     init_optim_state,
@@ -44,7 +43,7 @@ __all__ = [
     "AdamW",
     "BaseOptimizer",
     "DistMuon",
-    "MAdam",
+    "MPAdam",
     "OptimizersContainer",
 ]
 
@@ -58,6 +57,9 @@ class BaseOptimizer(Optimizer, Configurable):
     class Config(Configurable.Config):
         pattern: str
         """Regex matched against parameter fully qualified names."""
+
+
+from .mpadam import MPAdam  # noqa: F401
 
 
 def _validate_moment_dtype(
@@ -186,57 +188,6 @@ class AdamW(torch.optim.AdamW, BaseOptimizer):
         )
         if config.moment_dtype == "bfloat16":
             _register_bfloat16_moment_hooks(self)
-
-
-class MAdam(_MAdam, BaseOptimizer):
-    """Configurable MAdam (Adam on a sign/exponent parameterization)."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(BaseOptimizer.Config):
-        lr: float = 1e-3
-        betas: tuple[float, float] = (0.9, 0.999)
-        eps: float = 1e-8
-        weight_decay: float = 0.0
-        lr_e: float = 1e-2
-        tie_e_to_m: bool = False
-        weight_decay_e: float = 0.0
-        p_scale: float = 3.0
-        g_bound: float = 20.0
-        abs_clamp: bool = False
-        abs_clamp_floor: float = 0.0
-        clip_e_final: bool = False
-        e_final_min: float = -60.0
-        e_final_max: float = 60.0
-        use_de_step_cap: bool = True
-        de_step_cap: float = 0.5
-        maximize: bool = False
-
-    def __init__(
-        self,
-        config: Config,
-        *,
-        params: Iterable[dict[str, Any]] | Iterable[Tensor],
-    ) -> None:
-        super().__init__(
-            params,
-            lr=config.lr,
-            betas=config.betas,
-            eps=config.eps,
-            weight_decay=config.weight_decay,
-            lr_e=config.lr_e,
-            tie_e_to_m=config.tie_e_to_m,
-            weight_decay_e=config.weight_decay_e,
-            p_scale=config.p_scale,
-            g_bound=config.g_bound,
-            abs_clamp=config.abs_clamp,
-            abs_clamp_floor=config.abs_clamp_floor,
-            clip_e_final=config.clip_e_final,
-            e_final_min=config.e_final_min,
-            e_final_max=config.e_final_max,
-            use_de_step_cap=config.use_de_step_cap,
-            de_step_cap=config.de_step_cap,
-            maximize=config.maximize,
-        )
 
 
 class DistMuon(FlexShardDistMuon, BaseOptimizer):
@@ -488,6 +439,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable):
             "nesterov",
             "fused",
             "foreach",
+            "lr_e_ratio",
         }
         opt_name = type(optimizer).__name__
         for group in optimizer.param_groups:

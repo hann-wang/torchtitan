@@ -12,7 +12,7 @@ from .optimizer import (
     AdamW,
     BaseOptimizer,
     DistMuon,
-    MAdam,
+    MPAdam,
     OptimizersContainer,
 )
 
@@ -24,7 +24,7 @@ __all__ = [
     "EMA",
     "GradientClipper",
     "LRSchedulersContainer",
-    "MAdam",
+    "MPAdam",
     "OptimizersContainer",
     "Optim",
 ]
