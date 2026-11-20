@@ -8,6 +8,7 @@
 
 import glob
 import json
+import logging
 import pickle
 from array import array
 from dataclasses import dataclass, field
@@ -20,6 +21,21 @@ from datasets.distributed import split_dataset_by_node
 
 from torchtitan.components.data.types import DatasetIterationPolicy
 from torchtitan.config import Configurable
+
+logger = logging.getLogger(__name__)
+
+# Failures raised while decoding one CC12M / COCO row. Matches the set scanned
+# by the Flux problematic-index script, so one bad tar member does not stop
+# the stream. UnicodeDecodeError is a ValueError; it is listed explicitly.
+CORRUPT_SAMPLE_ERRORS = (
+    UnicodeDecodeError,
+    SyntaxError,
+    OSError,
+    ZeroDivisionError,
+    ValueError,
+    TypeError,
+)
+_MAX_CONSECUTIVE_CORRUPT_SAMPLES = 1024
 
 
 @runtime_checkable
@@ -142,6 +158,8 @@ class HuggingFaceStreamingSource(Configurable):
         name: str | None = None
         revision: str | None = None
         load_dataset_kwargs: dict[str, Any] = field(default_factory=dict)
+        skip_corrupt: bool = False
+        """Skip one row when decoding it raises a corrupt-sample error."""
 
         def __post_init__(self) -> None:
             duplicated = {"split", "name", "revision", "streaming"} & (
@@ -174,6 +192,7 @@ class HuggingFaceStreamingSource(Configurable):
                 "Hugging Face streaming source does not support exact resume"
             )
         self._dataset = dataset
+        self._skip_corrupt = config.skip_corrupt
 
     def build_iter_dataset(
         self, *, dataset_iteration_policy: DatasetIterationPolicy
@@ -187,21 +206,31 @@ class HuggingFaceStreamingSource(Configurable):
             dataset,
             repeat=dataset_iteration_policy.repeat,
             shuffle=dataset_iteration_policy.shuffle,
+            skip_corrupt=self._skip_corrupt,
         )
 
 
 class _HuggingFaceIterDataset(grain.IterDataset):
     def __init__(
-        self, dataset: datasets.IterableDataset, *, repeat: bool, shuffle: bool
+        self,
+        dataset: datasets.IterableDataset,
+        *,
+        repeat: bool,
+        shuffle: bool,
+        skip_corrupt: bool,
     ) -> None:
         super().__init__()
         self._dataset = dataset
         self._repeat = repeat
         self._shuffle = shuffle
+        self._skip_corrupt = skip_corrupt
 
     def __iter__(self) -> grain.DatasetIterator:
         return _HuggingFaceCursorIterator(
-            self._dataset, repeat=self._repeat, shuffle=self._shuffle
+            self._dataset,
+            repeat=self._repeat,
+            shuffle=self._shuffle,
+            skip_corrupt=self._skip_corrupt,
         )
 
 
@@ -231,19 +260,21 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
         *,
         repeat: bool,
         shuffle: bool,
+        skip_corrupt: bool = False,
     ) -> None:
         super().__init__()
         self._dataset = dataset
         self._repeat = repeat
         self._shuffle = shuffle
+        self._skip_corrupt = skip_corrupt
         self._epoch = 0
         self._initial_state = dataset.state_dict()
         self._iterator = iter(dataset)
         self._pending_hf_state: bytes | None = None
 
-    def __next__(self) -> dict[str, Any]:
+    def _pull(self) -> dict[str, Any]:
         try:
-            row = next(self._iterator)
+            return next(self._iterator)
         except StopIteration:
             if not self._repeat:
                 raise
@@ -252,7 +283,29 @@ class _HuggingFaceCursorIterator(grain.DatasetIterator):
                 self._dataset.set_epoch(self._epoch)
             self._dataset.load_state_dict(self._initial_state)
             self._iterator = iter(self._dataset)
-            row = next(self._iterator)
+            return next(self._iterator)
+
+    def __next__(self) -> dict[str, Any]:
+        skipped = 0
+        while True:
+            try:
+                row = self._pull()
+            except CORRUPT_SAMPLE_ERRORS as exc:
+                if not self._skip_corrupt:
+                    raise
+                skipped += 1
+                if skipped > _MAX_CONSECUTIVE_CORRUPT_SAMPLES:
+                    raise RuntimeError(
+                        "Hugging Face stream skipped "
+                        f"{skipped} corrupt samples in a row"
+                    ) from exc
+                logger.warning(
+                    "Skipping corrupt Hugging Face sample (%s): %s",
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            break
         # HF has applied any restored cursor once it yields a row.
         self._pending_hf_state = None
         return row

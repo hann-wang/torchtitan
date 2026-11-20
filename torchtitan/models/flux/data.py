@@ -22,7 +22,10 @@ from torchtitan.components.data.dataset import (
     SampleProcessor,
     SingleDatasetConfig,
 )
-from torchtitan.components.data.sources import HuggingFaceStreamingSource
+from torchtitan.components.data.sources import (
+    CORRUPT_SAMPLE_ERRORS,
+    HuggingFaceStreamingSource,
+)
 from torchtitan.components.data.types import (
     DatasetBuildContext,
     DatasetIterationPolicy,
@@ -199,16 +202,27 @@ class FluxSampleProcessor(SampleProcessor):
         sample: dict[str, Any],
         rng: np.random.Generator,
     ) -> FluxSample | None:
-        # Use the dataset-specific preprocessor
-        sample_dict = self._data_processor(
-            sample,
-            self._tokenizer,
-            output_size=self.img_size,
-            rng=rng,
-        )
+        # Use the dataset-specific preprocessor. A bad tar member raises here
+        # after the row has already been yielded.
+        try:
+            sample_dict = self._data_processor(
+                sample,
+                self._tokenizer,
+                output_size=self.img_size,
+                rng=rng,
+            )
+        except CORRUPT_SAMPLE_ERRORS as exc:
+            sample_id = sample.get("__key__", "unknown")
+            logger.warning(
+                "Skipping unloadable sample %s (%s): %s",
+                sample_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
 
         # skip low quality image or image with color channel = 1
-        if sample_dict["image"] is None:
+        if sample_dict is None or sample_dict["image"] is None:
             sample_id = sample.get("__key__", "unknown")
             logger.warning(
                 f"Low quality image {sample_id} is skipped in Flux Dataloader."
@@ -300,6 +314,7 @@ DATASETS: dict[str, SingleDatasetConfig] = {
         source=HuggingFaceStreamingSource.Config(
             path="pixparse/cc12m-wds",
             split="train",
+            skip_corrupt=True,
         ),
         processor=FluxSampleProcessor.Config(
             data_processor=_cc12m_wds_data_processor,
@@ -311,6 +326,7 @@ DATASETS: dict[str, SingleDatasetConfig] = {
         source=HuggingFaceStreamingSource.Config(
             path="howard-hou/COCO-Text",
             split="validation",
+            skip_corrupt=True,
         ),
         processor=FluxSampleProcessor.Config(
             data_processor=_coco_data_processor,
